@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
 use bitcoin::secp256k1::{self, Secp256k1};
 use cdk_common::common::{LnKey, QuoteTTL};
-use cdk_common::database::{self, MintDatabase};
+use cdk_common::database::{self, MintDatabase, MintTransaction};
 use cdk_common::mint::MintKeySetInfo;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -392,14 +392,11 @@ impl Mint {
     #[instrument(skip_all)]
     pub async fn handle_internal_melt_mint(
         &self,
+        tx: &mut Box<dyn MintTransaction>,
         melt_quote: &MeltQuote,
         melt_request: &MeltBolt11Request<Uuid>,
     ) -> Result<Option<Amount>, Error> {
-        let mint_quote = match self
-            .localstore
-            .get_mint_quote_by_request(&melt_quote.request)
-            .await
-        {
+        let mint_quote = match tx.get_mint_quote_by_request(&melt_quote.request).await {
             Ok(Some(mint_quote)) => mint_quote,
             // Not an internal melt -> mint
             Ok(None) => return Ok(None),
@@ -419,8 +416,6 @@ impl Mint {
             Error::AmountOverflow
         })?;
 
-        let mut mint_quote = mint_quote;
-
         if mint_quote.amount > inputs_amount_quote_unit {
             tracing::debug!(
                 "Not enough inuts provided: {} needed {}",
@@ -430,11 +425,10 @@ impl Mint {
             return Err(Error::InsufficientFunds);
         }
 
-        mint_quote.state = MintQuoteState::Paid;
+        tx.update_mint_quote_state(&mint_quote.id, MintQuoteState::Paid)
+            .await?;
 
         let amount = melt_quote.amount;
-
-        self.update_mint_quote(mint_quote).await?;
 
         Ok(Some(amount))
     }

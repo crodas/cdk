@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 use anyhow::bail;
+use cdk_common::database::MintTransaction;
 use cdk_common::nut00::ProofsMethods;
 use cdk_common::MeltOptions;
 use lightning_invoice::Bolt11Invoice;
@@ -284,14 +285,15 @@ impl Mint {
     #[instrument(skip_all)]
     pub async fn verify_melt_request(
         &self,
+        tx: &mut Box<dyn MintTransaction>,
         melt_request: &MeltBolt11Request<Uuid>,
     ) -> Result<MeltQuote, Error> {
-        let state = self
-            .localstore
-            .update_melt_quote_state(&melt_request.quote, MeltQuoteState::Pending)
-            .await?;
+        let quote = tx
+            .get_melt_quote(&melt_request.quote)
+            .await?
+            .ok_or(Error::UnknownQuote)?;
 
-        match state {
+        match quote.state {
             MeltQuoteState::Unpaid | MeltQuoteState::Failed => Ok(()),
             MeltQuoteState::Pending => Err(Error::PendingQuote),
             MeltQuoteState::Paid => Err(Error::PaidQuote),
@@ -305,20 +307,14 @@ impl Mint {
             return Err(Error::DuplicateProofs);
         }
 
-        self.localstore
-            .add_proofs(melt_request.inputs.clone(), Some(melt_request.quote))
+        tx.add_proofs(melt_request.inputs.clone(), Some(melt_request.quote))
             .await?;
-        self.check_ys_spendable(&ys, State::Pending).await?;
+
+        self.check_ys_spendable(tx, &ys, State::Pending).await?;
 
         for proof in &melt_request.inputs {
             self.verify_proof(proof).await?;
         }
-
-        let quote = self
-            .localstore
-            .get_melt_quote(&melt_request.quote)
-            .await?
-            .ok_or(Error::UnknownQuote)?;
 
         let proofs_total = melt_request.proofs_amount()?;
 
@@ -395,38 +391,6 @@ impl Mint {
         Ok(quote)
     }
 
-    /// Process unpaid melt request
-    /// In the event that a melt request fails and the lighthing payment is not
-    /// made The [`Proofs`] should be returned to an unspent state and the
-    /// quote should be unpaid
-    #[instrument(skip_all)]
-    pub async fn process_unpaid_melt(
-        &self,
-        melt_request: &MeltBolt11Request<Uuid>,
-    ) -> Result<(), Error> {
-        let input_ys = melt_request.inputs.ys()?;
-
-        self.localstore
-            .remove_proofs(&input_ys, Some(melt_request.quote))
-            .await?;
-
-        self.localstore
-            .update_melt_quote_state(&melt_request.quote, MeltQuoteState::Unpaid)
-            .await?;
-
-        if let Ok(Some(quote)) = self.localstore.get_melt_quote(&melt_request.quote).await {
-            self.pubsub_manager
-                .melt_quote_status(&quote, None, None, MeltQuoteState::Unpaid);
-        }
-
-        for public_key in input_ys {
-            self.pubsub_manager
-                .proof_state((public_key, State::Unspent));
-        }
-
-        Ok(())
-    }
-
     /// Melt Bolt11
     #[instrument(skip_all)]
     pub async fn melt_bolt11(
@@ -455,37 +419,12 @@ impl Mint {
             }
         }
 
-        let quote = match self.verify_melt_request(melt_request).await {
-            Ok(quote) => quote,
-            Err(err) => {
-                tracing::debug!("Error attempting to verify melt quote: {}", err);
+        let mut tx = self.localstore.begin_transaction().await?;
 
-                if let Err(err) = self.process_unpaid_melt(melt_request).await {
-                    tracing::error!(
-                        "Could not reset melt quote {} state: {}",
-                        melt_request.quote,
-                        err
-                    );
-                }
-                return Err(err);
-            }
-        };
-
-        let settled_internally_amount =
-            match self.handle_internal_melt_mint(&quote, melt_request).await {
-                Ok(amount) => amount,
-                Err(err) => {
-                    tracing::error!("Attempting to settle internally failed");
-                    if let Err(err) = self.process_unpaid_melt(melt_request).await {
-                        tracing::error!(
-                            "Could not reset melt quote {} state: {}",
-                            melt_request.quote,
-                            err
-                        );
-                    }
-                    return Err(err);
-                }
-            };
+        let quote = self.verify_melt_request(&mut tx, melt_request).await?;
+        let settled_internally_amount = self
+            .handle_internal_melt_mint(&mut tx, &quote, melt_request)
+            .await?;
 
         let (preimage, amount_spent_quote_unit) = match settled_internally_amount {
             Some(amount_spent) => (None, amount_spent),
@@ -504,9 +443,6 @@ impl Mint {
                             Ok(amount) => amount,
                             Err(err) => {
                                 tracing::error!("Fee is not expected: {}", err);
-                                if let Err(err) = self.process_unpaid_melt(melt_request).await {
-                                    tracing::error!("Could not reset melt quote state: {}", err);
-                                }
                                 return Err(Error::Internal);
                             }
                         }
@@ -521,10 +457,6 @@ impl Mint {
                     Some(ln) => ln,
                     None => {
                         tracing::info!("Could not get ln backend for {}, bolt11 ", quote.unit);
-                        if let Err(err) = self.process_unpaid_melt(melt_request).await {
-                            tracing::error!("Could not reset melt quote state: {}", err);
-                        }
-
                         return Err(Error::UnsupportedUnit);
                     }
                 };
@@ -555,9 +487,6 @@ impl Mint {
                         // hold the proofs as pending to we reset them  and return an error.
                         if matches!(err, cdk_lightning::Error::InvoiceAlreadyPaid) {
                             tracing::debug!("Invoice already paid, resetting melt quote");
-                            if let Err(err) = self.process_unpaid_melt(melt_request).await {
-                                tracing::error!("Could not reset melt quote state: {}", err);
-                            }
                             return Err(Error::RequestAlreadyPaid);
                         }
 
@@ -583,9 +512,6 @@ impl Mint {
                             "Lightning payment for quote {} failed.",
                             melt_request.quote
                         );
-                        if let Err(err) = self.process_unpaid_melt(melt_request).await {
-                            tracing::error!("Could not reset melt quote state: {}", err);
-                        }
                         return Err(Error::PaymentFailed);
                     }
                     MeltQuoteState::Pending => {
@@ -627,12 +553,14 @@ impl Mint {
         // If we made it here the payment has been made.
         // We process the melt burning the inputs and returning change
         let res = self
-            .process_melt_request(melt_request, preimage, amount_spent_quote_unit)
+            .process_melt_request(&mut tx, melt_request, preimage, amount_spent_quote_unit)
             .await
             .map_err(|err| {
                 tracing::error!("Could not process melt request: {}", err);
                 err
             })?;
+
+        tx.commit().await?;
 
         Ok(res)
     }
@@ -642,38 +570,23 @@ impl Mint {
     #[instrument(skip_all)]
     pub async fn process_melt_request(
         &self,
+        tx: &mut Box<dyn MintTransaction>,
         melt_request: &MeltBolt11Request<Uuid>,
         payment_preimage: Option<String>,
         total_spent: Amount,
     ) -> Result<MeltQuoteBolt11Response<Uuid>, Error> {
         tracing::debug!("Processing melt quote: {}", melt_request.quote);
 
-        let quote = self
-            .localstore
+        let quote = tx
             .get_melt_quote(&melt_request.quote)
             .await?
             .ok_or(Error::UnknownQuote)?;
 
         let input_ys = melt_request.inputs.ys()?;
 
-        self.localstore
-            .update_proofs_states(&input_ys, State::Spent)
+        tx.update_proofs_states(&input_ys, State::Spent).await?;
+        tx.update_melt_quote_state(&melt_request.quote, MeltQuoteState::Paid)
             .await?;
-
-        self.localstore
-            .update_melt_quote_state(&melt_request.quote, MeltQuoteState::Paid)
-            .await?;
-
-        self.pubsub_manager.melt_quote_status(
-            &quote,
-            payment_preimage.clone(),
-            None,
-            MeltQuoteState::Paid,
-        );
-
-        for public_key in input_ys {
-            self.pubsub_manager.proof_state((public_key, State::Spent));
-        }
 
         let mut change = None;
 
@@ -724,19 +637,29 @@ impl Mint {
                     change_sigs.push(blinded_signature)
                 }
 
-                self.localstore
-                    .add_blind_signatures(
-                        &outputs[0..change_sigs.len()]
-                            .iter()
-                            .map(|o| o.blinded_secret)
-                            .collect::<Vec<PublicKey>>(),
-                        &change_sigs,
-                        Some(quote.id),
-                    )
-                    .await?;
+                tx.add_blind_signatures(
+                    &outputs[0..change_sigs.len()]
+                        .iter()
+                        .map(|o| o.blinded_secret)
+                        .collect::<Vec<PublicKey>>(),
+                    &change_sigs,
+                    Some(quote.id),
+                )
+                .await?;
 
                 change = Some(change_sigs);
             }
+        }
+
+        self.pubsub_manager.melt_quote_status(
+            &quote,
+            payment_preimage.clone(),
+            None,
+            MeltQuoteState::Paid,
+        );
+
+        for public_key in input_ys {
+            self.pubsub_manager.proof_state((public_key, State::Spent));
         }
 
         Ok(MeltQuoteBolt11Response {

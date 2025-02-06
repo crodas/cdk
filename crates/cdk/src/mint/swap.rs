@@ -20,8 +20,9 @@ impl Mint {
             .map(|b| b.blinded_secret)
             .collect();
 
-        if self
-            .localstore
+        let mut tx = self.localstore.begin_transaction().await?;
+
+        if tx
             .get_blind_signatures(&blinded_messages)
             .await?
             .iter()
@@ -60,10 +61,10 @@ impl Mint {
 
         let input_ys = swap_request.inputs.ys()?;
 
-        self.localstore
-            .add_proofs(swap_request.inputs.clone(), None)
+        tx.add_proofs(swap_request.inputs.clone(), None).await?;
+
+        self.check_ys_spendable(&mut tx, &input_ys, State::Pending)
             .await?;
-        self.check_ys_spendable(&input_ys, State::Pending).await?;
 
         // Check that there are no duplicate proofs in request
         if input_ys
@@ -72,14 +73,12 @@ impl Mint {
             .len()
             .ne(&proof_count)
         {
-            self.localstore.remove_proofs(&input_ys, None).await?;
             return Err(Error::DuplicateProofs);
         }
 
         for proof in &swap_request.inputs {
             if let Err(err) = self.verify_proof(proof).await {
                 tracing::info!("Error verifying proof in swap");
-                self.localstore.remove_proofs(&input_ys, None).await?;
                 return Err(err);
             }
         }
@@ -96,7 +95,7 @@ impl Mint {
                 }
                 None => {
                     tracing::info!("Swap request with unknown keyset in inputs");
-                    self.localstore.remove_proofs(&input_ys, None).await?;
+                    return Err(Error::UnknownKeySet);
                 }
             }
         }
@@ -111,7 +110,7 @@ impl Mint {
                 }
                 None => {
                     tracing::info!("Swap request with unknown keyset in outputs");
-                    self.localstore.remove_proofs(&input_ys, None).await?;
+                    return Err(Error::UnknownKeySet);
                 }
             }
         }
@@ -121,7 +120,6 @@ impl Mint {
         // now
         if keyset_units.len().gt(&1) {
             tracing::error!("Only one unit is allowed in request: {:?}", keyset_units);
-            self.localstore.remove_proofs(&input_ys, None).await?;
             return Err(Error::UnsupportedUnit);
         }
 
@@ -136,7 +134,6 @@ impl Mint {
             for blinded_message in &swap_request.outputs {
                 if let Err(err) = blinded_message.verify_p2pk(&pubkeys, sigs_required) {
                     tracing::info!("Could not verify p2pk in swap request");
-                    self.localstore.remove_proofs(&input_ys, None).await?;
                     return Err(err.into());
                 }
             }
@@ -149,25 +146,24 @@ impl Mint {
             promises.push(blinded_signature);
         }
 
-        self.localstore
-            .update_proofs_states(&input_ys, State::Spent)
-            .await?;
+        tx.update_proofs_states(&input_ys, State::Spent).await?;
+
+        tx.add_blind_signatures(
+            &swap_request
+                .outputs
+                .iter()
+                .map(|o| o.blinded_secret)
+                .collect::<Vec<PublicKey>>(),
+            &promises,
+            None,
+        )
+        .await?;
+
+        tx.commit().await?;
 
         for pub_key in input_ys {
             self.pubsub_manager.proof_state((pub_key, State::Spent));
         }
-
-        self.localstore
-            .add_blind_signatures(
-                &swap_request
-                    .outputs
-                    .iter()
-                    .map(|o| o.blinded_secret)
-                    .collect::<Vec<PublicKey>>(),
-                &promises,
-                None,
-            )
-            .await?;
 
         Ok(SwapResponse::new(promises))
     }

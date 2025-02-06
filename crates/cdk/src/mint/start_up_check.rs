@@ -19,6 +19,8 @@ impl Mint {
 
         unpaid_quotes.append(&mut pending_quotes);
 
+        let mut tx = self.localstore.begin_transaction().await?;
+
         for ln in self.ln.values() {
             for quote in unpaid_quotes.iter() {
                 tracing::debug!("Checking status of mint quote: {}", quote.id);
@@ -27,9 +29,7 @@ impl Mint {
                     Ok(state) => {
                         if state != quote.state {
                             tracing::trace!("Mint quote status changed: {}", quote.id);
-                            self.localstore
-                                .update_mint_quote_state(&quote.id, state)
-                                .await?;
+                            tx.update_mint_quote_state(&quote.id, state).await?;
                         }
                     }
 
@@ -40,6 +40,9 @@ impl Mint {
                 }
             }
         }
+
+        tx.commit().await?;
+
         Ok(())
     }
 
@@ -54,7 +57,8 @@ impl Mint {
 
         for pending_quote in pending_quotes {
             tracing::debug!("Checking status for melt quote {}.", pending_quote.id);
-            let melt_request_ln_key = self.localstore.get_melt_request(&pending_quote.id).await?;
+            let mut tx = self.localstore.begin_transaction().await?;
+            let melt_request_ln_key = tx.get_melt_request(&pending_quote.id).await?;
 
             let (melt_request, ln_key) = match melt_request_ln_key {
                 None => {
@@ -86,6 +90,7 @@ impl Mint {
                         MeltQuoteState::Paid => {
                             if let Err(err) = self
                                 .process_melt_request(
+                                    &mut tx,
                                     &melt_request,
                                     pay_invoice_response.payment_preimage,
                                     pay_invoice_response.total_spent,
@@ -107,9 +112,8 @@ impl Mint {
                                 "Lightning payment for quote {} failed.",
                                 pending_quote.id
                             );
-                            if let Err(err) = self.process_unpaid_melt(&melt_request).await {
-                                tracing::error!("Could not reset melt quote state: {}", err);
-                            }
+
+                            tx.rollback().await?;
                         }
                         MeltQuoteState::Pending => {
                             tracing::warn!(
@@ -127,9 +131,9 @@ impl Mint {
                         pending_quote.id
                     );
 
-                    self.localstore
-                        .update_melt_quote_state(&pending_quote.id, pay_invoice_response.status)
+                    tx.update_melt_quote_state(&pending_quote.id, pay_invoice_response.status)
                         .await?;
+                    tx.commit().await?;
                 }
             };
         }

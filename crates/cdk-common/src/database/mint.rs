@@ -14,29 +14,113 @@ use crate::nuts::{
     Proofs, PublicKey, State,
 };
 
+/// Database Writer
+///
+/// This trait is the only way to update the database, in a atomic way, from the Rust side, making
+/// sure that on commit all changes happen or none.
+///
+/// Every record read or updated by this Writer should be locked exclusively until the Writer is
+/// consumed, either by commit or rollback.
+///
+/// On Drop, if unless commit() was called explicitly, the changes are expected to be rolled back.
+#[async_trait]
+pub trait Transaction: Send + Sync {
+    /// Add [`MintMintQuote`]
+    async fn add_mint_quote(&mut self, quote: MintMintQuote) -> Result<(), Error>;
+
+    /// Get [`MintMintQuote`]
+    ///
+    /// While this Writer object is in scope the quote should be locked exclusively
+    async fn get_mint_quote(&mut self, quote_id: &Uuid) -> Result<Option<MintMintQuote>, Error>;
+
+    /// Get all [`MintMintQuote`]s
+    async fn get_mint_quote_by_request(
+        &self,
+        request: &str,
+    ) -> Result<Option<MintMintQuote>, Error>;
+
+    /// Get all [`MintMintQuote`]s
+    async fn get_mint_quote_by_request_lookup_id(
+        &mut self,
+        request_lookup_id: &str,
+    ) -> Result<Option<MintMintQuote>, Error>;
+
+    /// Update state of [`MintMintQuote`]
+    async fn update_mint_quote_state(
+        &mut self,
+        quote_id: &Uuid,
+        state: MintQuoteState,
+    ) -> Result<MintQuoteState, Error>;
+
+    /// Add  [`Proofs`]
+    async fn add_proofs(&mut self, proof: Proofs, quote_id: Option<Uuid>) -> Result<(), Error>;
+
+    /// Get [`Proofs`] state
+    async fn update_proofs_states(
+        &mut self,
+        ys: &[PublicKey],
+        proofs_state: State,
+    ) -> Result<Vec<Option<State>>, Error>;
+
+    /// Get [`BlindSignature`]s and lock them exclusively until the Writer is dropped
+    async fn get_blind_signatures(
+        &mut self,
+        blinded_messages: &[PublicKey],
+    ) -> Result<Vec<Option<BlindSignature>>, Error>;
+
+    /// Add [`BlindSignature`]
+    async fn add_blind_signatures(
+        &mut self,
+        blinded_messages: &[PublicKey],
+        blind_signatures: &[BlindSignature],
+        quote_id: Option<Uuid>,
+    ) -> Result<(), Error>;
+
+    /// Get melt request
+    async fn get_melt_request(
+        &mut self,
+        quote_id: &Uuid,
+    ) -> Result<Option<(MeltBolt11Request<Uuid>, LnKey)>, Error>;
+
+    /// Get [`mint::MeltQuote`]
+    ///
+    /// While this Writer object is in scope the quote should be locked exclusively
+    async fn get_melt_quote(&mut self, quote_id: &Uuid) -> Result<Option<mint::MeltQuote>, Error>;
+
+    /// Update [`mint::MeltQuote`] state
+    async fn update_melt_quote_state(
+        &mut self,
+        quote_id: &Uuid,
+        state: MeltQuoteState,
+    ) -> Result<MeltQuoteState, Error>;
+
+    /// Consumes the Writer and commit the changes
+    async fn commit(self: Box<Self>) -> Result<(), Error>;
+
+    /// Consumes the Writer and rollback the changes
+    async fn rollback(self: Box<Self>) -> Result<(), Error>;
+}
+
 /// Mint Database trait
 #[async_trait]
 pub trait Database {
     /// Mint Database Error
     type Err: Into<Error> + From<Error>;
 
+    /// Get a Database Writer
+    async fn begin_transaction(&self) -> Result<Box<dyn Transaction>, Self::Err>;
+
     /// Add Active Keyset
     async fn set_active_keyset(&self, unit: CurrencyUnit, id: Id) -> Result<(), Self::Err>;
     /// Get Active Keyset
+    ///
+    /// TODO: Refactor code to use `SignatoryManager` instead of the database
     async fn get_active_keyset_id(&self, unit: &CurrencyUnit) -> Result<Option<Id>, Self::Err>;
     /// Get all Active Keyset
     async fn get_active_keysets(&self) -> Result<HashMap<CurrencyUnit, Id>, Self::Err>;
 
-    /// Add [`MintMintQuote`]
-    async fn add_mint_quote(&self, quote: MintMintQuote) -> Result<(), Self::Err>;
     /// Get [`MintMintQuote`]
     async fn get_mint_quote(&self, quote_id: &Uuid) -> Result<Option<MintMintQuote>, Self::Err>;
-    /// Update state of [`MintMintQuote`]
-    async fn update_mint_quote_state(
-        &self,
-        quote_id: &Uuid,
-        state: MintQuoteState,
-    ) -> Result<MintQuoteState, Self::Err>;
     /// Get all [`MintMintQuote`]s
     async fn get_mint_quote_by_request(
         &self,
@@ -49,6 +133,7 @@ pub trait Database {
     ) -> Result<Option<MintMintQuote>, Self::Err>;
     /// Get Mint Quotes
     async fn get_mint_quotes(&self) -> Result<Vec<MintMintQuote>, Self::Err>;
+
     /// Remove [`MintMintQuote`]
     async fn remove_mint_quote(&self, quote_id: &Uuid) -> Result<(), Self::Err>;
 
@@ -56,12 +141,6 @@ pub trait Database {
     async fn add_melt_quote(&self, quote: mint::MeltQuote) -> Result<(), Self::Err>;
     /// Get [`mint::MeltQuote`]
     async fn get_melt_quote(&self, quote_id: &Uuid) -> Result<Option<mint::MeltQuote>, Self::Err>;
-    /// Update [`mint::MeltQuote`] state
-    async fn update_melt_quote_state(
-        &self,
-        quote_id: &Uuid,
-        state: MeltQuoteState,
-    ) -> Result<MeltQuoteState, Self::Err>;
     /// Get all [`mint::MeltQuote`]s
     async fn get_melt_quotes(&self) -> Result<Vec<mint::MeltQuote>, Self::Err>;
     /// Remove [`mint::MeltQuote`]
@@ -82,43 +161,24 @@ pub trait Database {
     /// Add [`MintKeySetInfo`]
     async fn add_keyset_info(&self, keyset: MintKeySetInfo) -> Result<(), Self::Err>;
     /// Get [`MintKeySetInfo`]
+    /// TODO: Refactor code to use `SignatoryManager` instead of the database
     async fn get_keyset_info(&self, id: &Id) -> Result<Option<MintKeySetInfo>, Self::Err>;
     /// Get [`MintKeySetInfo`]s
+    /// TODO: Refactor code to use `SignatoryManager` instead of the database
     async fn get_keyset_infos(&self) -> Result<Vec<MintKeySetInfo>, Self::Err>;
 
-    /// Add  [`Proofs`]
-    async fn add_proofs(&self, proof: Proofs, quote_id: Option<Uuid>) -> Result<(), Self::Err>;
-    /// Remove [`Proofs`]
-    async fn remove_proofs(
-        &self,
-        ys: &[PublicKey],
-        quote_id: Option<Uuid>,
-    ) -> Result<(), Self::Err>;
     /// Get [`Proofs`] by ys
     async fn get_proofs_by_ys(&self, ys: &[PublicKey]) -> Result<Vec<Option<Proof>>, Self::Err>;
     /// Get ys by quote id
     async fn get_proof_ys_by_quote_id(&self, quote_id: &Uuid) -> Result<Vec<PublicKey>, Self::Err>;
     /// Get [`Proofs`] state
     async fn get_proofs_states(&self, ys: &[PublicKey]) -> Result<Vec<Option<State>>, Self::Err>;
-    /// Get [`Proofs`] state
-    async fn update_proofs_states(
-        &self,
-        ys: &[PublicKey],
-        proofs_state: State,
-    ) -> Result<Vec<Option<State>>, Self::Err>;
     /// Get [`Proofs`] by state
     async fn get_proofs_by_keyset_id(
         &self,
         keyset_id: &Id,
     ) -> Result<(Proofs, Vec<Option<State>>), Self::Err>;
 
-    /// Add [`BlindSignature`]
-    async fn add_blind_signatures(
-        &self,
-        blinded_messages: &[PublicKey],
-        blind_signatures: &[BlindSignature],
-        quote_id: Option<Uuid>,
-    ) -> Result<(), Self::Err>;
     /// Get [`BlindSignature`]s
     async fn get_blind_signatures(
         &self,

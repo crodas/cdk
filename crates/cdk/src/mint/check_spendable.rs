@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use cdk_common::database::MintTransaction;
 use tracing::instrument;
 
 use super::{CheckStateRequest, CheckStateResponse, Mint, ProofState, PublicKey, State};
@@ -38,13 +39,11 @@ impl Mint {
     #[instrument(skip_all)]
     pub async fn check_ys_spendable(
         &self,
+        tx: &mut Box<dyn MintTransaction>,
         ys: &[PublicKey],
         proof_state: State,
     ) -> Result<(), Error> {
-        let proofs_state = self
-            .localstore
-            .update_proofs_states(ys, proof_state)
-            .await?;
+        let proofs_state = tx.update_proofs_states(ys, proof_state).await?;
 
         let proofs_state = proofs_state.iter().flatten().collect::<HashSet<&State>>();
 

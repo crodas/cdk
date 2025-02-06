@@ -6,7 +6,7 @@ mod mint;
 mod wallet;
 
 #[cfg(feature = "mint")]
-pub use mint::Database as MintDatabase;
+pub use mint::{Database as MintDatabase, Transaction as MintTransaction};
 #[cfg(feature = "wallet")]
 pub use wallet::Database as WalletDatabase;
 
