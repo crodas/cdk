@@ -178,6 +178,8 @@ where
                         pool: self.clone(),
                     });
                 }
+
+                RM::drop(resource);
             }
 
             if self.in_use.load(Ordering::Relaxed) < self.max_size {

@@ -6,6 +6,7 @@ use std::time::Duration;
 use cdk_sql_common::pool::{self, DatabasePool};
 use cdk_sql_common::value::Value;
 use rusqlite::Connection;
+use tokio::time::sleep;
 
 use crate::async_sqlite;
 
@@ -43,10 +44,16 @@ impl DatabasePool for SqliteConnectionManager {
 
     fn new_resource(
         config: &Self::Config,
-        _stale: Arc<AtomicBool>,
+        stale: Arc<AtomicBool>,
         _timeout: Duration,
     ) -> Result<Self::Connection, pool::Error<Self::Error>> {
         let conn = if let Some(path) = config.path.as_ref() {
+            tokio::spawn(async move {
+                // Release the SQLite connection after 5 minutes to clean up memory if it is
+                // persisted
+                sleep(Duration::from_secs(300)).await;
+                stale.store(true, std::sync::atomic::Ordering::Release);
+            });
             Connection::open(path)?
         } else {
             Connection::open_in_memory()?
