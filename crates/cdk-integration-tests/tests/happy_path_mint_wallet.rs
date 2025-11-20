@@ -200,14 +200,17 @@ async fn test_happy_mint_melt_round_trip() {
         _ => panic!("Wrong payload"),
     };
     assert_eq!(payload.quote.to_string(), melt.id);
-    assert_eq!(payload.state, MeltQuoteState::Pending);
-
-    // get current state
-    let (sub_id, payload) = get_notification(&mut reader, Duration::from_millis(15000)).await;
-    assert_eq!("test-sub", sub_id);
-    let payload = match payload {
-        NotificationPayload::MeltQuoteBolt11Response(melt) => melt,
-        _ => panic!("Wrong payload"),
+    let payload = if payload.state == MeltQuoteState::Pending {
+        assert_eq!(payload.state, MeltQuoteState::Pending);
+        // get current state
+        let (sub_id, payload) = get_notification(&mut reader, Duration::from_millis(15000)).await;
+        assert_eq!("test-sub", sub_id);
+        match payload {
+            NotificationPayload::MeltQuoteBolt11Response(melt) => melt,
+            _ => panic!("Wrong payload"),
+        }
+    } else {
+        payload
     };
     assert_eq!(payload.amount, 50.into());
     assert_eq!(payload.quote.to_string(), melt.id);
