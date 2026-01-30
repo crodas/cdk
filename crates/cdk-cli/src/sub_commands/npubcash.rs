@@ -5,7 +5,7 @@ use anyhow::{bail, Result};
 use cdk::amount::SplitTarget;
 use cdk::mint_url::MintUrl;
 use cdk::nuts::nut00::ProofsMethods;
-use cdk::wallet::{MultiMintWallet, Wallet};
+use cdk::wallet::{MultiMintWallet, Wallet, WalletBalance};
 use cdk::StreamExt;
 use clap::Subcommand;
 use nostr_sdk::ToBech32;

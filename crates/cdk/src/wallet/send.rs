@@ -3,6 +3,7 @@ use std::fmt::Debug;
 
 use cdk_common::nut02::KeySetInfosMethods;
 use cdk_common::util::unix_time;
+use cdk_common::wallet::traits::WalletMintInfo;
 use cdk_common::wallet::{Transaction, TransactionDirection};
 use cdk_common::Id;
 use tracing::instrument;

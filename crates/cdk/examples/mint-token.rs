@@ -4,7 +4,7 @@ use std::time::Duration;
 use cdk::error::Error;
 use cdk::nuts::nut00::ProofsMethods;
 use cdk::nuts::CurrencyUnit;
-use cdk::wallet::{SendOptions, Wallet};
+use cdk::wallet::{SendOptions, Wallet, WalletMint};
 use cdk::Amount;
 use cdk_sqlite::wallet::memory;
 use rand::random;

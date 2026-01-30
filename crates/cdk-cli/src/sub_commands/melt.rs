@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use cdk::amount::{amount_for_offer, Amount, MSAT_IN_SAT};
 use cdk::mint_url::MintUrl;
 use cdk::nuts::{CurrencyUnit, MeltOptions};
-use cdk::wallet::MultiMintWallet;
+use cdk::wallet::{MultiMintWallet, WalletMelt};
 use cdk::Bolt11Invoice;
 use clap::{Args, ValueEnum};
 use lightning::offers::offer::Offer;

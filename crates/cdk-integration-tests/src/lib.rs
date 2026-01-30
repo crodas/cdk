@@ -23,6 +23,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Result};
 use cashu::Bolt11Invoice;
 use cdk::amount::{Amount, SplitTarget};
+use cdk::wallet::WalletMint;
 use cdk::{StreamExt, Wallet};
 use cdk_fake_wallet::create_fake_invoice;
 use init_regtest::{get_lnd_dir, LND_RPC_ADDR};

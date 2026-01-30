@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use cdk_common::nut00::KnownMethod;
-use cdk_common::nut04::MintMethodOptions;
 use cdk_common::wallet::{MintQuote, Transaction, TransactionDirection};
 use cdk_common::PaymentMethod;
 use tracing::instrument;
@@ -10,8 +9,7 @@ use crate::amount::SplitTarget;
 use crate::dhke::construct_proofs;
 use crate::nuts::nut00::ProofsMethods;
 use crate::nuts::{
-    nut12, MintQuoteBolt11Request, MintQuoteBolt11Response, MintRequest, PreMintSecrets, Proofs,
-    SecretKey, SpendingConditions, State,
+    nut12, MintQuoteBolt11Response, MintRequest, PreMintSecrets, Proofs, SpendingConditions, State,
 };
 use crate::types::ProofInfo;
 use crate::util::unix_time;
@@ -19,86 +17,6 @@ use crate::wallet::MintQuoteState;
 use crate::{Amount, Error, Wallet};
 
 impl Wallet {
-    /// Mint Quote
-    /// # Synopsis
-    /// ```rust,no_run
-    /// use std::sync::Arc;
-    ///
-    /// use cdk::amount::Amount;
-    /// use cdk::nuts::CurrencyUnit;
-    /// use cdk::wallet::Wallet;
-    /// use cdk_sqlite::wallet::memory;
-    /// use rand::random;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> anyhow::Result<()> {
-    ///     let seed = random::<[u8; 64]>();
-    ///     let mint_url = "https://fake.thesimplekid.dev";
-    ///     let unit = CurrencyUnit::Sat;
-    ///
-    ///     let localstore = memory::empty().await?;
-    ///     let wallet = Wallet::new(mint_url, unit, Arc::new(localstore), seed, None)?;
-    ///     let amount = Amount::from(100);
-    ///
-    ///     let quote = wallet.mint_quote(amount, None).await?;
-    ///     Ok(())
-    /// }
-    /// ```
-    #[instrument(skip(self))]
-    pub async fn mint_quote(
-        &self,
-        amount: Amount,
-        description: Option<String>,
-    ) -> Result<MintQuote, Error> {
-        let mint_info = self.load_mint_info().await?;
-
-        let mint_url = self.mint_url.clone();
-        let unit = self.unit.clone();
-
-        // If we have a description, we check that the mint supports it.
-        if description.is_some() {
-            let settings = mint_info
-                .nuts
-                .nut04
-                .get_settings(
-                    &unit,
-                    &crate::nuts::PaymentMethod::Known(KnownMethod::Bolt11),
-                )
-                .ok_or(Error::UnsupportedUnit)?;
-
-            match settings.options {
-                Some(MintMethodOptions::Bolt11 { description }) if description => (),
-                _ => return Err(Error::InvoiceDescriptionUnsupported),
-            }
-        }
-
-        let secret_key = SecretKey::generate();
-
-        let request = MintQuoteBolt11Request {
-            amount,
-            unit: unit.clone(),
-            description,
-            pubkey: Some(secret_key.public_key()),
-        };
-
-        let quote_res = self.client.post_mint_quote(request).await?;
-
-        let quote = MintQuote::new(
-            quote_res.quote,
-            mint_url,
-            PaymentMethod::Known(KnownMethod::Bolt11),
-            Some(amount),
-            unit,
-            quote_res.request,
-            quote_res.expiry.unwrap_or(0),
-            Some(secret_key),
-        );
-
-        self.localstore.add_mint_quote(quote.clone()).await?;
-
-        Ok(quote)
-    }
-
     /// Check mint quote status
     #[instrument(skip(self, quote_id))]
     pub async fn mint_quote_state(
@@ -192,7 +110,7 @@ impl Wallet {
     /// use cdk::amount::{Amount, SplitTarget};
     /// use cdk::nuts::nut00::ProofsMethods;
     /// use cdk::nuts::CurrencyUnit;
-    /// use cdk::wallet::Wallet;
+    /// use cdk::wallet::{Wallet, WalletMint};
     /// use cdk_sqlite::wallet::memory;
     /// use rand::random;
     ///

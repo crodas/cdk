@@ -5,6 +5,7 @@ use bitcoin::hashes::sha256::Hash as Sha256Hash;
 use bitcoin::hashes::Hash;
 use bitcoin::XOnlyPublicKey;
 use cdk_common::util::unix_time;
+use cdk_common::wallet::traits::WalletMintInfo;
 use cdk_common::wallet::{Transaction, TransactionDirection};
 use tracing::instrument;
 

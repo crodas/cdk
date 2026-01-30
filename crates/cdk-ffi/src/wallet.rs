@@ -22,6 +22,11 @@ impl Wallet {
     pub(crate) fn from_inner(inner: Arc<CdkWallet>) -> Self {
         Self { inner }
     }
+
+    /// Access the inner CDK wallet (internal use only)
+    pub(crate) fn inner(&self) -> &Arc<CdkWallet> {
+        &self.inner
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -92,38 +97,6 @@ impl Wallet {
         self.inner.set_metadata_cache_ttl(ttl);
     }
 
-    /// Get total balance
-    pub async fn total_balance(&self) -> Result<Amount, FfiError> {
-        let balance = self.inner.total_balance().await?;
-        Ok(balance.into())
-    }
-
-    /// Get total pending balance
-    pub async fn total_pending_balance(&self) -> Result<Amount, FfiError> {
-        let balance = self.inner.total_pending_balance().await?;
-        Ok(balance.into())
-    }
-
-    /// Get total reserved balance
-    pub async fn total_reserved_balance(&self) -> Result<Amount, FfiError> {
-        let balance = self.inner.total_reserved_balance().await?;
-        Ok(balance.into())
-    }
-
-    /// Get mint info from mint
-    pub async fn fetch_mint_info(&self) -> Result<Option<MintInfo>, FfiError> {
-        let info = self.inner.fetch_mint_info().await?;
-        Ok(info.map(Into::into))
-    }
-
-    /// Load mint info
-    ///
-    /// This will get mint info from cache if it is fresh
-    pub async fn load_mint_info(&self) -> Result<MintInfo, FfiError> {
-        let info = self.inner.load_mint_info().await?;
-        Ok(info.into())
-    }
-
     /// Receive tokens
     pub async fn receive(
         &self,
@@ -181,16 +154,6 @@ impl Wallet {
         Ok(std::sync::Arc::new(prepared.into()))
     }
 
-    /// Get a mint quote
-    pub async fn mint_quote(
-        &self,
-        amount: Amount,
-        description: Option<String>,
-    ) -> Result<MintQuote, FfiError> {
-        let quote = self.inner.mint_quote(amount.into(), description).await?;
-        Ok(quote.into())
-    }
-
     /// Check a specific mint quote status
     pub async fn check_mint_quote(
         &self,
@@ -226,12 +189,6 @@ impl Wallet {
         let cdk_options = options.map(Into::into);
         let quote = self.inner.melt_quote(request, cdk_options).await?;
         Ok(quote.into())
-    }
-
-    /// Melt tokens
-    pub async fn melt(&self, quote_id: String) -> Result<Melted, FfiError> {
-        let melted = self.inner.melt(&quote_id).await?;
-        Ok(melted.into())
     }
 
     /// Melt specific proofs
@@ -433,26 +390,6 @@ impl Wallet {
         Ok(all_proofs)
     }
 
-    /// Check if proofs are spent
-    pub async fn check_proofs_spent(&self, proofs: Proofs) -> Result<Vec<bool>, FfiError> {
-        let cdk_proofs: Result<Vec<cdk::nuts::Proof>, _> =
-            proofs.into_iter().map(|p| p.try_into()).collect();
-        let cdk_proofs = cdk_proofs?;
-
-        let proof_states = self.inner.check_proofs_spent(cdk_proofs).await?;
-        // Convert ProofState to bool (spent = true, unspent = false)
-        let spent_bools = proof_states
-            .into_iter()
-            .map(|proof_state| {
-                matches!(
-                    proof_state.state,
-                    cdk::nuts::State::Spent | cdk::nuts::State::PendingSpent
-                )
-            })
-            .collect();
-        Ok(spent_bools)
-    }
-
     /// List transactions
     pub async fn list_transactions(
         &self,
@@ -506,18 +443,6 @@ impl Wallet {
         )))
     }
 
-    /// Refresh keysets from the mint
-    pub async fn refresh_keysets(&self) -> Result<Vec<KeySetInfo>, FfiError> {
-        let keysets = self.inner.refresh_keysets().await?;
-        Ok(keysets.into_iter().map(Into::into).collect())
-    }
-
-    /// Get the active keyset for the wallet's unit
-    pub async fn get_active_keyset(&self) -> Result<KeySetInfo, FfiError> {
-        let keyset = self.inner.get_active_keyset().await?;
-        Ok(keyset.into())
-    }
-
     /// Get fees for a specific keyset ID
     pub async fn get_keyset_fees_by_id(&self, keyset_id: String) -> Result<u64, FfiError> {
         let id = cdk::nuts::Id::from_str(&keyset_id).map_err(FfiError::internal)?;
@@ -526,15 +451,6 @@ impl Wallet {
             .get_keyset_fees_and_amounts_by_id(id)
             .await?
             .fee())
-    }
-
-    /// Reclaim unspent proofs (mark them as unspent in the database)
-    pub async fn reclaim_unspent(&self, proofs: Proofs) -> Result<(), FfiError> {
-        let cdk_proofs: Result<Vec<cdk::nuts::Proof>, _> =
-            proofs.iter().map(|p| p.clone().try_into()).collect();
-        let cdk_proofs = cdk_proofs?;
-        self.inner.reclaim_unspent(cdk_proofs).await?;
-        Ok(())
     }
 
     /// Check all pending proofs and return the total amount reclaimed

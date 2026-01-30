@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use cdk_common::nut04::MintMethodOptions;
+use cdk_common::wallet::traits::WalletMintInfo;
 use cdk_common::wallet::{MintQuote, Transaction, TransactionDirection};
 use cdk_common::{MintQuoteState, Proofs, SecretKey};
 use tracing::instrument;

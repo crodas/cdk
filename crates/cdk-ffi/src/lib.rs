@@ -20,6 +20,9 @@ pub mod types;
 pub mod wallet;
 mod wallet_traits;
 
+pub use cdk_common::wallet::traits::{
+    WalletBalance, WalletMelt, WalletMint, WalletMintInfo, WalletProofs, WalletReceive, WalletTypes,
+};
 pub use database::*;
 pub use error::*;
 pub use logging::*;

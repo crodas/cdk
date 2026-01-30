@@ -17,6 +17,7 @@ use cashu::dhke::construct_proofs;
 use cashu::{CurrencyUnit, Id, PreMintSecrets, SecretKey, SpendingConditions, State, SwapRequest};
 use cdk::mint::Mint;
 use cdk::nuts::nut00::ProofsMethods;
+use cdk::wallet::{WalletBalance, WalletMelt, WalletMintInfo};
 use cdk::Amount;
 use cdk_fake_wallet::create_fake_invoice;
 use cdk_integration_tests::init_pure_tests::*;

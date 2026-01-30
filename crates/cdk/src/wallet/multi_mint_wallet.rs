@@ -11,6 +11,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use cdk_common::database::WalletDatabase;
 use cdk_common::task::spawn;
+use cdk_common::wallet::traits::{WalletBalance, WalletMelt, WalletMint, WalletMintInfo};
 use cdk_common::wallet::{MeltQuote, Transaction, TransactionDirection, TransactionId};
 use cdk_common::{database, KeySetInfo};
 use tokio::sync::RwLock;

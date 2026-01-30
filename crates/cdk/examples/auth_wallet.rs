@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use cdk::error::Error;
 use cdk::nuts::CurrencyUnit;
-use cdk::wallet::{SendOptions, Wallet};
+use cdk::wallet::{SendOptions, Wallet, WalletBalance, WalletMint, WalletMintInfo};
 use cdk::{Amount, OidcClient};
 use cdk_common::amount::SplitTarget;
 use cdk_common::{MintInfo, ProofsMethods};

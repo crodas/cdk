@@ -1,3 +1,4 @@
+use cdk_common::wallet::traits::WalletProofs;
 use cdk_common::wallet::{Transaction, TransactionDirection, TransactionId};
 use cdk_common::Proofs;
 

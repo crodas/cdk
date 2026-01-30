@@ -1,11 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use cdk_common::amount::KeysetFeeAndAmounts;
-use cdk_common::wallet::TransactionId;
 use cdk_common::Id;
 use tracing::instrument;
 
-use crate::amount::SplitTarget;
 use crate::fees::calculate_fee;
 use crate::nuts::nut00::ProofsMethods;
 use crate::nuts::{
@@ -67,41 +65,6 @@ impl Wallet {
         self.localstore
             .update_proofs_state(ys, State::Unspent)
             .await?;
-        Ok(())
-    }
-
-    /// Reclaim unspent proofs
-    ///
-    /// Checks the stats of [`Proofs`] swapping for a new [`Proof`] if unspent
-    #[instrument(skip(self, proofs))]
-    pub async fn reclaim_unspent(&self, proofs: Proofs) -> Result<(), Error> {
-        let proof_ys = proofs.ys()?;
-
-        let transaction_id = TransactionId::new(proof_ys.clone());
-
-        let spendable = self
-            .client
-            .post_check_state(CheckStateRequest { ys: proof_ys })
-            .await?
-            .states;
-
-        let unspent: Proofs = proofs
-            .into_iter()
-            .zip(spendable)
-            .filter_map(|(p, s)| (s.state == State::Unspent).then_some(p))
-            .collect();
-
-        self.swap(None, SplitTarget::default(), unspent, None, false)
-            .await?;
-
-        let _ = self
-            .localstore
-            .remove_transaction(transaction_id)
-            .await
-            .inspect_err(|err| {
-                tracing::warn!("Failed to remove transaction: {:?}", err);
-            });
-
         Ok(())
     }
 

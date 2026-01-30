@@ -58,6 +58,8 @@ use cdk::nuts::{CurrencyUnit, MintQuoteState};
 use cdk::wallet::Wallet;
 #[cfg(feature = "wallet")]
 use cdk::wallet::SendOptions;
+#[cfg(feature = "wallet")]
+use cdk::wallet::WalletMint;
 use cdk::Amount;
 use rand::random;
 use tokio::time::sleep;

@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use cdk_common::amount::SplitTarget;
 use cdk_common::nut00::KnownMethod;
+use cdk_common::wallet::traits::WalletMintInfo;
 use cdk_common::wallet::{Transaction, TransactionDirection};
 use cdk_common::PaymentMethod;
 use lightning_invoice::Bolt11Invoice;
@@ -304,37 +305,6 @@ impl Wallet {
             .await?;
 
         Ok(melted)
-    }
-
-    /// Melt
-    /// # Synopsis
-    /// ```rust, no_run
-    ///  use std::sync::Arc;
-    ///
-    ///  use cdk_sqlite::wallet::memory;
-    ///  use cdk::nuts::CurrencyUnit;
-    ///  use cdk::wallet::Wallet;
-    ///  use rand::random;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> anyhow::Result<()> {
-    ///  let seed = random::<[u8; 64]>();
-    ///  let mint_url = "https://fake.thesimplekid.dev";
-    ///  let unit = CurrencyUnit::Sat;
-    ///
-    ///  let localstore = memory::empty().await?;
-    ///  let wallet = Wallet::new(mint_url, unit, Arc::new(localstore), seed, None).unwrap();
-    ///  let bolt11 = "lnbc100n1pnvpufspp5djn8hrq49r8cghwye9kqw752qjncwyfnrprhprpqk43mwcy4yfsqdq5g9kxy7fqd9h8vmmfvdjscqzzsxqyz5vqsp5uhpjt36rj75pl7jq2sshaukzfkt7uulj456s4mh7uy7l6vx7lvxs9qxpqysgqedwz08acmqwtk8g4vkwm2w78suwt2qyzz6jkkwcgrjm3r3hs6fskyhvud4fan3keru7emjm8ygqpcrwtlmhfjfmer3afs5hhwamgr4cqtactdq".to_string();
-    ///  let quote = wallet.melt_quote(bolt11, None).await?;
-    ///  let quote_id = quote.id;
-    ///
-    ///  let _ = wallet.melt(&quote_id).await?;
-    ///
-    ///  Ok(())
-    /// }
-    #[instrument(skip(self))]
-    pub async fn melt(&self, quote_id: &str) -> Result<Melted, Error> {
-        self.melt_with_metadata(quote_id, HashMap::new()).await
     }
 
     /// Melt with additional metadata to be saved locally with the transaction

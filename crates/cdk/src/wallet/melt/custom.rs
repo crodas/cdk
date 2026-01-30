@@ -1,3 +1,4 @@
+use cdk_common::wallet::traits::WalletMintInfo;
 use cdk_common::wallet::MeltQuote;
 use cdk_common::PaymentMethod;
 use tracing::instrument;

@@ -24,7 +24,9 @@ use cdk::nuts::{
     CurrencyUnit, MeltOptions, MeltQuoteState, MintQuoteState, MintRequest, Mpp,
     NotificationPayload, PaymentMethod, PreMintSecrets,
 };
-use cdk::wallet::{HttpClient, MintConnector, Wallet, WalletSubscription};
+use cdk::wallet::{
+    HttpClient, MintConnector, Wallet, WalletBalance, WalletMelt, WalletMint, WalletSubscription,
+};
 use cdk_integration_tests::{get_mint_url_from_env, get_second_mint_url_from_env, get_test_client};
 use cdk_sqlite::wallet::{self, memory};
 use futures::join;

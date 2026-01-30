@@ -26,7 +26,9 @@ use cdk::nuts::{
     SecretKey, State, SwapRequest,
 };
 use cdk::wallet::types::TransactionDirection;
-use cdk::wallet::{HttpClient, MintConnector, Wallet};
+use cdk::wallet::{
+    HttpClient, MintConnector, Wallet, WalletBalance, WalletMelt, WalletMint, WalletMintInfo,
+};
 use cdk::StreamExt;
 use cdk_fake_wallet::{create_fake_invoice, FakeInvoiceDescription};
 use cdk_sqlite::wallet::memory;

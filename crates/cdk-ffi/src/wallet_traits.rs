@@ -1,10 +1,14 @@
 //! Wallet trait implementations for FFI Wallet
 //!
 //! This module implements the wallet traits from `cdk_common::wallet::traits`
-//! for the FFI Wallet struct.
+//! for the FFI Wallet struct. All trait methods call through to the inner
+//! CdkWallet directly (with type conversion). The `#[uniffi::export]` inherent
+//! methods in `wallet.rs` delegate to these trait impls.
 
-use std::str::FromStr;
-
+use cdk::wallet::{
+    WalletBalance as CdkWalletBalance, WalletMelt as CdkWalletMelt, WalletMint as CdkWalletMint,
+    WalletMintInfo as CdkWalletMintInfo,
+};
 use cdk_common::wallet::traits::{
     WalletBalance, WalletMelt, WalletMint, WalletMintInfo, WalletProofs, WalletReceive, WalletTypes,
 };
@@ -31,45 +35,65 @@ impl WalletTypes for Wallet {
     type Error = FfiError;
 
     fn mint_url(&self) -> Self::MintUrl {
-        self.mint_url()
+        self.inner().mint_url.clone().into()
     }
 
     fn unit(&self) -> Self::CurrencyUnit {
-        self.unit()
+        self.inner().unit.clone().into()
     }
 }
 
 #[async_trait::async_trait]
 impl WalletBalance for Wallet {
     async fn total_balance(&self) -> Result<Self::Amount, Self::Error> {
-        self.total_balance().await
+        Ok(CdkWalletBalance::total_balance(self.inner().as_ref())
+            .await?
+            .into())
     }
 
     async fn total_pending_balance(&self) -> Result<Self::Amount, Self::Error> {
-        self.total_pending_balance().await
+        Ok(
+            CdkWalletBalance::total_pending_balance(self.inner().as_ref())
+                .await?
+                .into(),
+        )
     }
 
     async fn total_reserved_balance(&self) -> Result<Self::Amount, Self::Error> {
-        self.total_reserved_balance().await
+        Ok(
+            CdkWalletBalance::total_reserved_balance(self.inner().as_ref())
+                .await?
+                .into(),
+        )
     }
 }
 
 #[async_trait::async_trait]
 impl WalletMintInfo for Wallet {
     async fn fetch_mint_info(&self) -> Result<Option<Self::MintInfo>, Self::Error> {
-        self.fetch_mint_info().await
+        Ok(CdkWalletMintInfo::fetch_mint_info(self.inner().as_ref())
+            .await?
+            .map(Into::into))
     }
 
     async fn load_mint_info(&self) -> Result<Self::MintInfo, Self::Error> {
-        self.load_mint_info().await
+        Ok(CdkWalletMintInfo::load_mint_info(self.inner().as_ref())
+            .await?
+            .into())
     }
 
     async fn get_active_keyset(&self) -> Result<Self::KeySetInfo, Self::Error> {
-        self.get_active_keyset().await
+        Ok(CdkWalletMintInfo::get_active_keyset(self.inner().as_ref())
+            .await?
+            .into())
     }
 
     async fn refresh_keysets(&self) -> Result<Vec<Self::KeySetInfo>, Self::Error> {
-        self.refresh_keysets().await
+        Ok(CdkWalletMintInfo::refresh_keysets(self.inner().as_ref())
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 }
 
@@ -80,12 +104,19 @@ impl WalletMint for Wallet {
         amount: Self::Amount,
         description: Option<String>,
     ) -> Result<Self::MintQuote, Self::Error> {
-        self.mint_quote(amount, description).await
+        Ok(
+            CdkWalletMint::mint_quote(self.inner().as_ref(), amount.into(), description)
+                .await?
+                .into(),
+        )
     }
 
     async fn mint(&self, quote_id: &str) -> Result<Self::Proofs, Self::Error> {
-        self.mint(quote_id.to_string(), crate::types::SplitTarget::None, None)
-            .await
+        let proofs = self
+            .inner()
+            .mint(quote_id, Default::default(), None)
+            .await?;
+        Ok(proofs.into_iter().map(|p| p.into()).collect())
     }
 }
 
@@ -94,31 +125,51 @@ impl WalletMelt for Wallet {
     type MeltResult = Melted;
 
     async fn melt_quote(&self, request: String) -> Result<Self::MeltQuote, Self::Error> {
-        self.melt_quote(request, None).await
+        Ok(self.inner().melt_quote(request, None).await?.into())
     }
 
     async fn melt(&self, quote_id: &str) -> Result<Self::MeltResult, Self::Error> {
-        self.melt(quote_id.to_string()).await
+        Ok(CdkWalletMelt::melt(self.inner().as_ref(), quote_id)
+            .await?
+            .into())
     }
 }
 
 #[async_trait::async_trait]
 impl WalletReceive for Wallet {
     async fn receive(&self, encoded_token: &str) -> Result<Self::Amount, Self::Error> {
-        // Parse the token string into a Token
-        let token = std::sync::Arc::new(Token::from_str(encoded_token)?);
-        self.receive(token, crate::types::ReceiveOptions::default())
-            .await
+        Ok(self
+            .inner()
+            .receive(encoded_token, cdk::wallet::ReceiveOptions::default())
+            .await?
+            .into())
     }
 }
 
 #[async_trait::async_trait]
 impl WalletProofs for Wallet {
     async fn check_proofs_spent(&self, proofs: Self::Proofs) -> Result<Vec<bool>, Self::Error> {
-        self.check_proofs_spent(proofs).await
+        let cdk_proofs: Result<Vec<cdk::nuts::Proof>, _> =
+            proofs.into_iter().map(|p| p.try_into()).collect();
+        let cdk_proofs = cdk_proofs?;
+
+        let proof_states = self.inner().check_proofs_spent(cdk_proofs).await?;
+        Ok(proof_states
+            .into_iter()
+            .map(|proof_state| {
+                matches!(
+                    proof_state.state,
+                    cdk::nuts::State::Spent | cdk::nuts::State::PendingSpent
+                )
+            })
+            .collect())
     }
 
     async fn reclaim_unspent(&self, proofs: Self::Proofs) -> Result<(), Self::Error> {
-        self.reclaim_unspent(proofs).await
+        let cdk_proofs: Result<Vec<cdk::nuts::Proof>, _> =
+            proofs.iter().map(|p| p.clone().try_into()).collect();
+        let cdk_proofs = cdk_proofs?;
+        self.inner().reclaim_unspent(cdk_proofs).await?;
+        Ok(())
     }
 }

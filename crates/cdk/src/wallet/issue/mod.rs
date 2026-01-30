@@ -2,6 +2,7 @@ mod bolt11;
 mod bolt12;
 mod custom;
 
+use cdk_common::wallet::traits::WalletMint;
 use cdk_common::PaymentMethod;
 
 use crate::amount::SplitTarget;
