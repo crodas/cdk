@@ -64,14 +64,26 @@ fi
 
 # Build for iOS device (arm64)
 echo "🍎 Building for iOS device (arm64)..."
-env -u MACOSX_DEPLOYMENT_TARGET SDKROOT="$IOS_SDK" cargo build --release --target aarch64-apple-ios
+if [[ "$(uname)" == "Linux" ]]; then
+    env -u MACOSX_DEPLOYMENT_TARGET SDKROOT="$IOS_SDK" cargo build --release --target aarch64-apple-ios
+else
+    env -u MACOSX_DEPLOYMENT_TARGET -u SDKROOT cargo build --release --target aarch64-apple-ios
+fi
 
 # Build for iOS simulator (arm64 + x86_64)
 echo "📱 Building for iOS simulator (arm64)..."
-env -u MACOSX_DEPLOYMENT_TARGET SDKROOT="$IOS_SIM_SDK" cargo build --release --target aarch64-apple-ios-sim
+if [[ "$(uname)" == "Linux" ]]; then
+    env -u MACOSX_DEPLOYMENT_TARGET SDKROOT="$IOS_SIM_SDK" cargo build --release --target aarch64-apple-ios-sim
+else
+    env -u MACOSX_DEPLOYMENT_TARGET -u SDKROOT cargo build --release --target aarch64-apple-ios-sim
+fi
 
 echo "📱 Building for iOS simulator (x86_64)..."
-env -u MACOSX_DEPLOYMENT_TARGET SDKROOT="$IOS_SIM_SDK" cargo build --release --target x86_64-apple-ios
+if [[ "$(uname)" == "Linux" ]]; then
+    env -u MACOSX_DEPLOYMENT_TARGET SDKROOT="$IOS_SIM_SDK" cargo build --release --target x86_64-apple-ios
+else
+    env -u MACOSX_DEPLOYMENT_TARGET -u SDKROOT cargo build --release --target x86_64-apple-ios
+fi
 
 # Build for macOS (arm64 + x86_64)
 echo "💻 Building for macOS (arm64)..."
