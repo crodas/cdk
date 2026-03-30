@@ -80,6 +80,10 @@
         # Dependencies
         pkgs = import nixpkgs {
           inherit system overlays;
+          config = {
+            android_sdk.accept_license = true;
+            allowUnfree = true;
+          };
         };
 
         pkgsUnstable = import nixpkgs-unstable {
@@ -88,6 +92,14 @@
 
         # Dart SDK from dart-overlay
         dartpkgs = dart-overlay.packages.${system};
+
+        # Android SDK/NDK for React Native builds
+        androidSdk = pkgs.androidenv.composeAndroidPackages {
+          includeNDK = true;
+          ndkVersions = [ "27.0.12077973" ];
+          platformVersions = [ "34" ];
+          buildToolsVersions = [ "34.0.0" ];
+        };
 
         # Static/musl packages for fully static binary builds (Linux only)
         pkgsMusl =
@@ -113,6 +125,11 @@
             "aarch64-apple-ios-sim"
             "aarch64-apple-darwin"
             "x86_64-apple-darwin"
+            # Android (React Native)
+            "aarch64-linux-android"
+            "armv7-linux-androideabi"
+            "x86_64-linux-android"
+            "i686-linux-android"
           ];
           extensions = [
             "rustfmt"
@@ -1199,7 +1216,7 @@
               // envVars
             );
 
-            # Shell for bindings development (Dart + Swift FFI)
+            # Shell for bindings development (Dart + Swift + React Native FFI)
             bindings = pkgs.mkShell (
               {
                 shellHook = commonShellHook;
@@ -1208,13 +1225,15 @@
                   rustupShim
                   dartpkgs.default
                   pkgs.openssl
+                  # React Native
+                  pkgs.nodejs
+                  pkgs.cargo-ndk
+                  androidSdk.androidsdk
                 ];
                 nativeBuildInputs = [
                   pkgs.pkg-config
                 ];
-                OPENSSL_DIR = "${pkgs.openssl.dev}";
-                OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
-                OPENSSL_INCLUDE_DIR = "${pkgs.openssl.dev}/include";
+                ANDROID_NDK_HOME = "${androidSdk.androidsdk}/libexec/android-sdk/ndk/27.0.12077973";
               }
               // envVars
             );

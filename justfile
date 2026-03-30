@@ -877,3 +877,18 @@ test-swift:
   else
     swift test
   fi
+
+# Generate React Native FFI bindings
+binding-react-native:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}/bindings/react-native"
+  ./generate-bindings.sh
+
+# Run React Native binding tests
+test-react-native:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}/bindings/react-native"
+  npm install --ignore-scripts
+  npx jest

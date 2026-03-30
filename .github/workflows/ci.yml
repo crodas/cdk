@@ -524,3 +524,22 @@ jobs:
             SDKROOT="$(/usr/bin/xcrun --sdk macosx --show-sdk-path)" \
             DEVELOPER_DIR="$(/usr/bin/xcode-select -p)" \
             /usr/bin/swift test
+
+  react-native-binding-tests:
+    name: "React Native binding tests"
+    runs-on: self-hosted
+    timeout-minutes: 30
+    needs: pre-commit-checks
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - uses: cachix/cachix-action@v16
+        with:
+          name: cashudevkit
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+        continue-on-error: true
+      - name: Install dependencies
+        run: nix develop -L .#bindings --command just binding-react-native
+      - name: Run test
+        run: nix develop -L .#bindings --command just test-react-native

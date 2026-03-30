@@ -1415,6 +1415,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdk-ffi-react-native"
+version = "0.16.0-rc.2"
+dependencies = [
+ "cdk-ffi",
+ "uniffi",
+]
+
+[[package]]
 name = "cdk-ffi-swift"
 version = "0.16.0-rc.2"
 dependencies = [
