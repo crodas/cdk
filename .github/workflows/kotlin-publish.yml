@@ -90,6 +90,7 @@ jobs:
 
           # Resolve workspace dependency references
           sed -i \
+            -e "s/^cdk-ffi\.workspace = true/cdk-ffi = { version = \"=${CDK_VER}\", default-features = false }/" \
             -e "s/cdk-ffi = { workspace = true/cdk-ffi = { version = \"=${CDK_VER}\", default-features = false/" \
             -e "s/uniffi = { workspace = true/uniffi = { version = \"${WS_UNIFFI_VER}\"/" \
             cdk-kotlin/rust/Cargo.toml
@@ -203,9 +204,11 @@ jobs:
         working-directory: cdk-kotlin/rust
         run: |
           mkdir -p ../generated-bindings
-          cargo run --release --bin uniffi-bindgen -- \
-            target/${{ matrix.target }}/release/${{ matrix.artifact }} \
-            --out-dir ../generated-bindings
+          cargo run --release --bin uniffi-bindgen -- generate \
+            --library "target/${{ matrix.target }}/release/${{ matrix.artifact }}" \
+            --language kotlin \
+            --out-dir ../generated-bindings \
+            --no-format
 
       - name: Upload generated bindings
         if: matrix.target == 'aarch64-apple-darwin'
@@ -256,25 +259,9 @@ jobs:
           pattern: kotlin-native-*
           merge-multiple: true
 
-      - name: Organize prebuilt binaries
+      - name: Distribute native libraries to modules
         run: |
-          mkdir -p cdk-kotlin/prebuilt
-
-          for f in artifacts/*; do
-            filename=$(basename "$f")
-            for suffix in libcdk_ffi_kotlin.so libcdk_ffi_kotlin.dylib libcdk_ffi_kotlin.a cdk_ffi_kotlin.dll; do
-              if [[ "$filename" == *"-${suffix}" ]]; then
-                target="${filename%-${suffix}}"
-                mkdir -p "cdk-kotlin/prebuilt/${target}"
-                cp "$f" "cdk-kotlin/prebuilt/${target}/${suffix}"
-                break
-              fi
-            done
-          done
-
-      - name: Populate JNA native resources for Maven JARs
-        run: |
-          # Map Rust targets to JNA platform directories
+          # Map Rust targets to JNA platform directories (cdk-jvm-natives)
           declare -A JNA_MAP=(
             ["x86_64-unknown-linux-gnu"]="linux-x86-64"
             ["aarch64-unknown-linux-gnu"]="linux-aarch64"
@@ -282,33 +269,55 @@ jobs:
             ["x86_64-pc-windows-msvc"]="win32-x86-64"
           )
 
-          for rust_target in "${!JNA_MAP[@]}"; do
-            jna="${JNA_MAP[$rust_target]}"
-            src="cdk-kotlin/prebuilt/${rust_target}"
-            dst="cdk-kotlin/cdk-jvm-natives/src/main/resources/${jna}"
-            if [ -d "$src" ]; then
-              mkdir -p "$dst"
-              cp "$src"/* "$dst/"
-              echo "Copied ${rust_target} → ${jna}"
-            fi
-          done
-
-      - name: Populate Android jniLibs
-        run: |
+          # Map Rust targets to Android ABIs (cdk-android)
           declare -A ANDROID_ABI=(
             ["aarch64-linux-android"]="arm64-v8a"
             ["armv7-linux-androideabi"]="armeabi-v7a"
             ["x86_64-linux-android"]="x86_64"
           )
-          for rust_target in "${!ANDROID_ABI[@]}"; do
-            abi="${ANDROID_ABI[$rust_target]}"
-            src="cdk-kotlin/prebuilt/${rust_target}"
-            dst="cdk-kotlin/cdk-android/src/main/jniLibs/${abi}"
-            if [ -d "$src" ]; then
-              mkdir -p "$dst"
-              cp "$src"/* "$dst/"
-              echo "Copied ${rust_target} → ${abi}"
-            fi
+
+          # Map Rust targets to iOS platforms (cdk-ios)
+          declare -A IOS_MAP=(
+            ["aarch64-apple-ios"]="ios-arm64"
+          )
+
+          for f in artifacts/*; do
+            filename=$(basename "$f")
+            # Extract rust target from artifact filename (e.g. "aarch64-apple-darwin-libcdk_ffi_kotlin.dylib")
+            for suffix in libcdk_ffi_kotlin.so libcdk_ffi_kotlin.dylib libcdk_ffi_kotlin.a cdk_ffi_kotlin.dll; do
+              if [[ "$filename" == *"-${suffix}" ]]; then
+                rust_target="${filename%-${suffix}}"
+
+                # JVM natives
+                if [[ -n "${JNA_MAP[$rust_target]+x}" ]]; then
+                  jna="${JNA_MAP[$rust_target]}"
+                  dst="cdk-kotlin/cdk-jvm-natives/src/main/resources/${jna}"
+                  mkdir -p "$dst"
+                  cp "$f" "$dst/${suffix}"
+                  echo "jvm-natives: ${rust_target} → ${jna}"
+                fi
+
+                # Android
+                if [[ -n "${ANDROID_ABI[$rust_target]+x}" ]]; then
+                  abi="${ANDROID_ABI[$rust_target]}"
+                  dst="cdk-kotlin/cdk-android/src/main/jniLibs/${abi}"
+                  mkdir -p "$dst"
+                  cp "$f" "$dst/${suffix}"
+                  echo "android: ${rust_target} → ${abi}"
+                fi
+
+                # iOS
+                if [[ -n "${IOS_MAP[$rust_target]+x}" ]]; then
+                  platform="${IOS_MAP[$rust_target]}"
+                  dst="cdk-kotlin/cdk-ios/src/main/resources/${platform}"
+                  mkdir -p "$dst"
+                  cp "$f" "$dst/${suffix}"
+                  echo "ios: ${rust_target} → ${platform}"
+                fi
+
+                break
+              fi
+            done
           done
 
       - name: Download generated bindings
@@ -349,29 +358,6 @@ jobs:
           git push origin "${DEFAULT_BRANCH}" --tags
           git push origin --delete "${RELEASE_BRANCH}"
 
-      - name: Create per-platform release archives
-        run: |
-          mkdir -p release-archives
-
-          # Copy source without prebuilt dir and .git
-          rsync -a --exclude='.git' --exclude='prebuilt' cdk-kotlin/ staging/
-
-          for dir in cdk-kotlin/prebuilt/*/; do
-            target=$(basename "$dir")
-            # Add only this platform's prebuilt
-            mkdir -p "staging/prebuilt/${target}"
-            cp -r "$dir"* "staging/prebuilt/${target}/"
-            # Archive
-            if [[ "$target" == *windows* ]]; then
-              (cd staging && zip -qr "../release-archives/${target}.zip" .)
-            else
-              tar -czf "release-archives/${target}.tar.gz" -C staging .
-            fi
-            # Clean up for next platform
-            rm -rf staging/prebuilt
-          done
-          ls -lh release-archives/
-
       - name: Publish to Maven Central
         working-directory: cdk-kotlin
         env:
@@ -384,6 +370,7 @@ jobs:
             :cdk-jvm:publishMavenPublicationToSonatypeRepository \
             :cdk-jvm-natives:publishAllPublicationsToSonatypeRepository \
             :cdk-android:publishReleasePublicationToSonatypeRepository \
+            :cdk-ios:publishAllPublicationsToSonatypeRepository \
             closeAndReleaseSonatypeStagingRepository
 
       - name: Create release on cdk-kotlin
@@ -393,5 +380,4 @@ jobs:
           gh release create "${{ inputs.release_tag }}" \
             --repo ${{ vars.CDK_KOTLIN_REPO }} \
             --title "Release ${{ inputs.release_tag }}" \
-            --generate-notes \
-            release-archives/*
+            --generate-notes
