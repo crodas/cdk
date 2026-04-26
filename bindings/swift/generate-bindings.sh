@@ -206,6 +206,11 @@ cargo run --bin uniffi-bindgen-swift -- \
     "$SOURCES_DIR" \
     --swift-sources
 
+# Fix FFI module import to match the XCFramework module name.
+# Use perl for portable in-place editing (nix provides GNU sed where -i '' behaves differently).
+perl -pi -e 's/canImport\(cdk_ffiFFI\)/canImport(CashuDevKitFFI)/g' "$SOURCES_DIR"/*.swift
+perl -pi -e 's/import cdk_ffiFFI/import CashuDevKitFFI/g' "$SOURCES_DIR"/*.swift
+
 # Re-sign the macOS framework. lipo invalidates the per-arch linker signatures,
 # and macOS will SIGKILL the process if the signature is invalid.
 # Sign the entire framework bundle so CodeResources is properly generated.
