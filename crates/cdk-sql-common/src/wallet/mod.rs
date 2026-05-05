@@ -583,21 +583,18 @@ where
         }
 
         let balance = q
-            .pluck(&*conn)
+            .fetch_all(&*conn)
             .await?
-            .map(|n| {
+            .into_iter()
+            .map(|row| {
                 // SQLite SUM returns INTEGER which we need to convert to u64
-                match n {
-                    crate::stmt::Column::Integer(i) => Ok(i as u64),
-                    crate::stmt::Column::Real(f) => Ok(f as u64),
-                    _ => Err(Error::Database(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Invalid balance type",
-                    )))),
-                }
+                unpack_into!(let (amount)  = row);
+                let r: u64 = column_as_number!(amount);
+                Ok::<_, Error>(r)
             })
-            .transpose()?
-            .unwrap_or(0);
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum();
 
         Ok(balance)
     }
