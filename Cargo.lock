@@ -1640,6 +1640,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdk-nitro"
+version = "0.1.0"
+dependencies = [
+ "cashu",
+ "cdk",
+ "serde_json",
+]
+
+[[package]]
 name = "cdk-npubcash"
 version = "0.16.0"
 dependencies = [

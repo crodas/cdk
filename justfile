@@ -935,3 +935,20 @@ test-swift:
   else
     swift test
   fi
+
+# Run React Native Nitro Rust unit tests
+test-nitro:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  cargo test -p cdk-nitro
+
+# Run React Native Nitro Node.js FFI tests
+test-nitro-node:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  cargo build -p cdk-nitro
+  cd bindings/react-native/test
+  npm install
+  npm test
