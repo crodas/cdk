@@ -1352,6 +1352,7 @@
                   dartpkgs.default
                   pkgs.openssl
                   pkgs.jdk17
+                  pkgs.nodejs
                 ];
                 nativeBuildInputs = [
                   pkgs.pkg-config
