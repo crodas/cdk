@@ -38,7 +38,6 @@ jobs:
             --exclude='node_modules' \
             --exclude='lib' \
             bindings/react-native/ cdk-nitro/
-          cp rust-toolchain.toml cdk-nitro/
 
       - name: Update versions and resolve workspace references
         run: |
@@ -164,10 +163,12 @@ jobs:
       - name: Build (Nix)
         working-directory: cdk-nitro/rust
         run: |
+          # Remove rust-toolchain.toml so it doesn't override the Nix-provided toolchain
+          rm -f ../rust-toolchain.toml rust-toolchain.toml
           if [[ "${{ matrix.target }}" == *apple-ios* ]]; then
             XCODE_DEV_DIR=$(/usr/bin/xcrun xcode-select -p 2>/dev/null \
               || echo "/Applications/Xcode.app/Contents/Developer")
-            nix develop -L ../../cdk#bindings --command \
+            nix develop -L ../../cdk#cross-build --command \
               env -u MACOSX_DEPLOYMENT_TARGET -u SDKROOT \
                 DEVELOPER_DIR="$XCODE_DEV_DIR" \
                 CC_aarch64_apple_ios=/usr/bin/clang \
@@ -176,7 +177,7 @@ jobs:
                 CARGO_TARGET_AARCH64_APPLE_IOS_SIM_LINKER=/usr/bin/clang \
                 cargo build --release --target ${{ matrix.target }}
           else
-            nix develop -L ../../cdk#bindings --command \
+            nix develop -L ../../cdk#cross-build --command \
               cargo build --release --target ${{ matrix.target }}
           fi
 
@@ -187,7 +188,7 @@ jobs:
           FILE="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
           case "${{ matrix.target }}" in
             *apple*)    strip -S "$FILE" ;;
-            *android*)  nix develop -L ../../cdk#bindings --command \
+            *android*)  nix develop -L ../../cdk#cross-build --command \
                           bash -c '"$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-all '"$FILE" ;;
             *)          strip --strip-all "$FILE" ;;
           esac
@@ -205,10 +206,54 @@ jobs:
           name: nitro-native-${{ matrix.target }}
           path: dist/
 
+  nitro-package-ios:
+    name: "nitro: Create XCFramework"
+    runs-on: macos-14
+    needs: [nitro-build-native]
+    steps:
+      - name: Clone cdk-nitro (for headers)
+        run: |
+          TAG="${{ inputs.release_tag }}"
+          RELEASE_BRANCH="release/v${TAG#v}"
+          git clone --branch "${RELEASE_BRANCH}" \
+            https://x-access-token:${{ secrets.FFI_DEPLOY_KEY }}@github.com/${{ vars.CDK_NITRO_REPO }}.git cdk-nitro
+
+      - name: Download iOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          pattern: nitro-native-*apple-ios*
+          merge-multiple: true
+
+      - name: Create XCFramework
+        run: |
+          mkdir -p device/Headers simulator/Headers
+
+          cp artifacts/aarch64-apple-ios-libcdk_nitro.a device/libcdk_nitro.a
+          cp artifacts/aarch64-apple-ios-sim-libcdk_nitro.a simulator/libcdk_nitro.a
+          cp cdk-nitro/cpp/cdk_nitro.h device/Headers/
+          cp cdk-nitro/cpp/cdk_nitro.h simulator/Headers/
+
+          xcodebuild -create-xcframework \
+            -library device/libcdk_nitro.a \
+            -headers device/Headers \
+            -library simulator/libcdk_nitro.a \
+            -headers simulator/Headers \
+            -output CdkNitro.xcframework
+
+          echo "Created XCFramework:"
+          ls -la CdkNitro.xcframework/
+
+      - name: Upload XCFramework
+        uses: actions/upload-artifact@v4
+        with:
+          name: nitro-xcframework
+          path: CdkNitro.xcframework/
+
   nitro-publish:
     name: "nitro: Publish to cdk-nitro"
     runs-on: ubuntu-latest
-    needs: [nitro-build-native]
+    needs: [nitro-build-native, nitro-package-ios]
     steps:
       - name: Clone cdk-nitro
         run: |
@@ -217,36 +262,33 @@ jobs:
           git clone --branch "${RELEASE_BRANCH}" \
             https://x-access-token:${{ secrets.FFI_DEPLOY_KEY }}@github.com/${{ vars.CDK_NITRO_REPO }}.git cdk-nitro
 
-      - name: Download all native artifacts
+      - name: Download Android artifacts
         uses: actions/download-artifact@v4
         with:
           path: ./artifacts
-          pattern: nitro-native-*
+          pattern: nitro-native-*linux-android*
           merge-multiple: true
+
+      - name: Download XCFramework
+        uses: actions/download-artifact@v4
+        with:
+          name: nitro-xcframework
+          path: ./xcframework
 
       - name: Distribute native libraries
         run: |
-          # Map Rust targets to Android ABIs
+          # Android: place .so files in jniLibs
           declare -A ANDROID_ABI=(
             ["aarch64-linux-android"]="arm64-v8a"
             ["armv7-linux-androideabi"]="armeabi-v7a"
             ["x86_64-linux-android"]="x86_64"
           )
 
-          # Map Rust targets to iOS platforms
-          declare -A IOS_MAP=(
-            ["aarch64-apple-ios"]="device"
-            ["aarch64-apple-ios-sim"]="simulator"
-          )
-
           for f in artifacts/*; do
             filename=$(basename "$f")
-
-            for suffix in libcdk_nitro.so libcdk_nitro.a; do
+            for suffix in libcdk_nitro.so; do
               if [[ "$filename" == *"-${suffix}" ]]; then
                 rust_target="${filename%-${suffix}}"
-
-                # Android
                 if [[ -n "${ANDROID_ABI[$rust_target]+x}" ]]; then
                   abi="${ANDROID_ABI[$rust_target]}"
                   dst="cdk-nitro/android/src/main/jniLibs/${abi}"
@@ -254,43 +296,22 @@ jobs:
                   cp "$f" "$dst/${suffix}"
                   echo "android: ${rust_target} → ${abi}"
                 fi
-
-                # iOS
-                if [[ -n "${IOS_MAP[$rust_target]+x}" ]]; then
-                  platform="${IOS_MAP[$rust_target]}"
-                  dst="cdk-nitro/ios/Frameworks/${platform}"
-                  mkdir -p "$dst"
-                  cp "$f" "$dst/${suffix}"
-                  echo "ios: ${rust_target} → ${platform}"
-                fi
-
                 break
               fi
             done
           done
 
-          # Create XCFramework from device + simulator slices
-          if [[ -f "cdk-nitro/ios/Frameworks/device/libcdk_nitro.a" ]]; then
-            xc_out="cdk-nitro/ios/Frameworks/CdkNitro.xcframework"
-            rm -rf "$xc_out"
+          # iOS: place XCFramework
+          mkdir -p cdk-nitro/ios/Frameworks
+          cp -r xcframework cdk-nitro/ios/Frameworks/CdkNitro.xcframework
+          echo "ios: placed XCFramework"
 
-            # Copy the C header next to the libs for framework packaging
-            for arch_dir in cdk-nitro/ios/Frameworks/device cdk-nitro/ios/Frameworks/simulator; do
-              mkdir -p "${arch_dir}/Headers"
-              cp cdk-nitro/cpp/cdk_nitro.h "${arch_dir}/Headers/"
-            done
-
-            xcodebuild -create-xcframework \
-              -library cdk-nitro/ios/Frameworks/device/libcdk_nitro.a \
-              -headers cdk-nitro/ios/Frameworks/device/Headers \
-              -library cdk-nitro/ios/Frameworks/simulator/libcdk_nitro.a \
-              -headers cdk-nitro/ios/Frameworks/simulator/Headers \
-              -output "$xc_out"
-            echo "Created XCFramework at ${xc_out}"
-
-            # Clean up intermediate dirs
-            rm -rf cdk-nitro/ios/Frameworks/device cdk-nitro/ios/Frameworks/simulator
-          fi
+          echo ""
+          echo "--- Android jniLibs ---"
+          find cdk-nitro/android/src/main/jniLibs -type f 2>/dev/null || echo "(none)"
+          echo ""
+          echo "--- iOS Frameworks ---"
+          ls -la cdk-nitro/ios/Frameworks/CdkNitro.xcframework/ 2>/dev/null || echo "(none)"
 
       - name: Commit to release branch
         working-directory: cdk-nitro
