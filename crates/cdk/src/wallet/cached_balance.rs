@@ -9,7 +9,7 @@ use std::fmt::Debug;
 
 use async_trait::async_trait;
 use bitcoin::bip32::DerivationPath;
-use cdk_common::database::{self, WalletDatabase};
+use cdk_common::database::{self, KVStore, WalletDatabase};
 use cdk_common::mint_url::MintUrl;
 use cdk_common::nuts::{
     CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintInfo, PublicKey, SpendingConditions, State,
@@ -37,12 +37,12 @@ impl<T: Debug> Debug for CachedBalance<T> {
 
 impl<T> CachedBalance<T>
 where
-    T: WalletDatabase<database::Error> + Send + Sync,
+    T: WalletDatabase<database::Error> + KVStore<Err = database::Error> + Send + Sync,
 {
     /// Wrap a store. Rebuilds the cache from proofs if no KV entries exist.
     pub async fn new(inner: T) -> Result<Self, database::Error> {
         let cached = Self { inner };
-        let keys = cached.inner.kv_list(KV_NS, KV_SUB).await?;
+        let keys = WalletDatabase::kv_list(&cached.inner, KV_NS, KV_SUB).await?;
         if keys.is_empty() {
             cached.rebuild().await?;
         }
@@ -52,9 +52,9 @@ where
     /// Rebuild cache from the proof table and persist to KV.
     pub async fn rebuild(&self) -> Result<(), database::Error> {
         // Clear existing KV entries
-        let old_keys = self.inner.kv_list(KV_NS, KV_SUB).await?;
+        let old_keys = WalletDatabase::kv_list(&self.inner, KV_NS, KV_SUB).await?;
         for key in old_keys {
-            self.inner.kv_remove(KV_NS, KV_SUB, &key).await?;
+            WalletDatabase::kv_remove(&self.inner, KV_NS, KV_SUB, &key).await?;
         }
 
         // Sum all proofs by (mint_url, unit, state)
@@ -66,19 +66,21 @@ where
         }
 
         for (key, total) in totals {
-            self.inner
-                .kv_write(KV_NS, KV_SUB, &key, total.to_string().as_bytes())
-                .await?;
+            WalletDatabase::kv_write(
+                &self.inner,
+                KV_NS,
+                KV_SUB,
+                &key,
+                total.to_string().as_bytes(),
+            )
+            .await?;
         }
 
         Ok(())
     }
 
-    /// Apply signed deltas to KV entries.
-    async fn apply_deltas(
-        &self,
-        deltas: Vec<(String, i64)>,
-    ) -> Result<(), database::Error> {
+    /// Apply signed deltas to KV entries, each within a transaction.
+    async fn apply_deltas(&self, deltas: Vec<(String, i64)>) -> Result<(), database::Error> {
         // Merge deltas for the same key
         let mut merged: HashMap<String, i64> = HashMap::new();
         for (key, delta) in deltas {
@@ -89,16 +91,16 @@ where
             if delta == 0 {
                 continue;
             }
-            let current = self
-                .inner
+            let mut tx = self.inner.begin_transaction().await?;
+            let current = tx
                 .kv_read(KV_NS, KV_SUB, &key)
                 .await?
                 .and_then(|b| String::from_utf8_lossy(&b).parse::<u64>().ok())
                 .unwrap_or(0);
             let new_val = (current as i64).saturating_add(delta).max(0) as u64;
-            self.inner
-                .kv_write(KV_NS, KV_SUB, &key, new_val.to_string().as_bytes())
+            tx.kv_write(KV_NS, KV_SUB, &key, new_val.to_string().as_bytes())
                 .await?;
+            tx.commit().await?;
         }
         Ok(())
     }
@@ -125,7 +127,7 @@ fn parse_kv_key(s: &str) -> Option<(String, String, String)> {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl<T> WalletDatabase<database::Error> for CachedBalance<T>
 where
-    T: WalletDatabase<database::Error> + Send + Sync + Debug,
+    T: WalletDatabase<database::Error> + KVStore<Err = database::Error> + Send + Sync + Debug,
 {
     // ---- Overridden: balance from KV cache ----
 
@@ -135,7 +137,7 @@ where
         unit: Option<CurrencyUnit>,
         states: Option<Vec<State>>,
     ) -> Result<u64, database::Error> {
-        let keys = self.inner.kv_list(KV_NS, KV_SUB).await?;
+        let keys = WalletDatabase::kv_list(&self.inner, KV_NS, KV_SUB).await?;
         let states: Vec<String> = states
             .unwrap_or_default()
             .into_iter()
@@ -160,9 +162,7 @@ where
             if !states.is_empty() && !states.contains(&s) {
                 continue;
             }
-            let val = self
-                .inner
-                .kv_read(KV_NS, KV_SUB, key)
+            let val = WalletDatabase::kv_read(&self.inner, KV_NS, KV_SUB, key)
                 .await?
                 .and_then(|b| String::from_utf8_lossy(&b).parse::<u64>().ok())
                 .unwrap_or(0);
@@ -289,10 +289,7 @@ where
     ) -> Result<Option<KeySetInfo>, database::Error> {
         self.inner.get_keyset_by_id(keyset_id).await
     }
-    async fn get_mint_quote(
-        &self,
-        quote_id: &str,
-    ) -> Result<Option<MintQuote>, database::Error> {
+    async fn get_mint_quote(&self, quote_id: &str) -> Result<Option<MintQuote>, database::Error> {
         self.inner.get_mint_quote(quote_id).await
     }
     async fn get_mint_quotes(&self) -> Result<Vec<MintQuote>, database::Error> {
@@ -342,12 +339,11 @@ where
         direction: Option<TransactionDirection>,
         unit: Option<CurrencyUnit>,
     ) -> Result<Vec<Transaction>, database::Error> {
-        self.inner.list_transactions(mint_url, direction, unit).await
+        self.inner
+            .list_transactions(mint_url, direction, unit)
+            .await
     }
-    async fn add_transaction(
-        &self,
-        transaction: Transaction,
-    ) -> Result<(), database::Error> {
+    async fn add_transaction(&self, transaction: Transaction) -> Result<(), database::Error> {
         self.inner.add_transaction(transaction).await
     }
     async fn update_mint_url(
@@ -436,10 +432,7 @@ where
     ) -> Result<(), database::Error> {
         self.inner.reserve_melt_quote(quote_id, operation_id).await
     }
-    async fn release_melt_quote(
-        &self,
-        operation_id: &uuid::Uuid,
-    ) -> Result<(), database::Error> {
+    async fn release_melt_quote(&self, operation_id: &uuid::Uuid) -> Result<(), database::Error> {
         self.inner.release_melt_quote(operation_id).await
     }
     async fn reserve_mint_quote(
@@ -449,10 +442,7 @@ where
     ) -> Result<(), database::Error> {
         self.inner.reserve_mint_quote(quote_id, operation_id).await
     }
-    async fn release_mint_quote(
-        &self,
-        operation_id: &uuid::Uuid,
-    ) -> Result<(), database::Error> {
+    async fn release_mint_quote(&self, operation_id: &uuid::Uuid) -> Result<(), database::Error> {
         self.inner.release_mint_quote(operation_id).await
     }
     async fn kv_read(
@@ -461,18 +451,14 @@ where
         secondary_namespace: &str,
         key: &str,
     ) -> Result<Option<Vec<u8>>, database::Error> {
-        self.inner
-            .kv_read(primary_namespace, secondary_namespace, key)
-            .await
+        WalletDatabase::kv_read(&self.inner, primary_namespace, secondary_namespace, key).await
     }
     async fn kv_list(
         &self,
         primary_namespace: &str,
         secondary_namespace: &str,
     ) -> Result<Vec<String>, database::Error> {
-        self.inner
-            .kv_list(primary_namespace, secondary_namespace)
-            .await
+        WalletDatabase::kv_list(&self.inner, primary_namespace, secondary_namespace).await
     }
     async fn kv_write(
         &self,
@@ -481,9 +467,14 @@ where
         key: &str,
         value: &[u8],
     ) -> Result<(), database::Error> {
-        self.inner
-            .kv_write(primary_namespace, secondary_namespace, key, value)
-            .await
+        WalletDatabase::kv_write(
+            &self.inner,
+            primary_namespace,
+            secondary_namespace,
+            key,
+            value,
+        )
+        .await
     }
     async fn kv_remove(
         &self,
