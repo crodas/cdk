@@ -10,7 +10,7 @@ on:
         description: 'CDK dependency version (e.g. 0.17.0). Defaults to release_tag without the "v" prefix.'
         required: false
       cdk_ref:
-        description: 'CDK git ref to publish from. Defaults to release_tag.'
+        description: "CDK git ref to publish from. Defaults to release_tag."
         required: false
 env:
   CARGO_TERM_COLOR: ${{ vars.CARGO_TERM_COLOR }}
@@ -36,7 +36,7 @@ jobs:
 
       - name: Clone cdk-swift
         run: |
-          git clone https://x-access-token:${{ secrets.SWIFT_DEPLOY_KEY }}@github.com/${{ vars.CDK_SWIFT_REPO }}.git cdk-swift
+          git clone https://x-access-token:${{ secrets.FFI_DEPLOY_KEY }}@github.com/${{ vars.CDK_SWIFT_REPO }}.git cdk-swift
 
       - name: Copy bindings/swift to cdk-swift
         run: |
@@ -147,7 +147,7 @@ jobs:
       - name: Clone cdk-swift
         run: |
           git clone --branch "${RELEASE_BRANCH}" \
-            https://x-access-token:${{ secrets.SWIFT_DEPLOY_KEY }}@github.com/${{ vars.CDK_SWIFT_REPO }}.git cdk-swift
+            https://x-access-token:${{ secrets.FFI_DEPLOY_KEY }}@github.com/${{ vars.CDK_SWIFT_REPO }}.git cdk-swift
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -196,7 +196,7 @@ jobs:
       - name: Clone cdk-swift
         run: |
           git clone --branch "${RELEASE_BRANCH}" \
-            https://x-access-token:${{ secrets.SWIFT_DEPLOY_KEY }}@github.com/${{ vars.CDK_SWIFT_REPO }}.git cdk-swift
+            https://x-access-token:${{ secrets.FFI_DEPLOY_KEY }}@github.com/${{ vars.CDK_SWIFT_REPO }}.git cdk-swift
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -332,7 +332,7 @@ jobs:
       - name: Clone cdk-swift
         run: |
           git clone --branch "${RELEASE_BRANCH}" \
-            https://x-access-token:${{ secrets.SWIFT_DEPLOY_KEY }}@github.com/${{ vars.CDK_SWIFT_REPO }}.git cdk-swift
+            https://x-access-token:${{ secrets.FFI_DEPLOY_KEY }}@github.com/${{ vars.CDK_SWIFT_REPO }}.git cdk-swift
 
       - name: Download XCFramework
         uses: actions/download-artifact@v4
@@ -395,7 +395,7 @@ jobs:
       - name: Create release on cdk-swift (creates tag and uploads asset atomically)
         working-directory: cdk-swift
         env:
-          GH_TOKEN: ${{ secrets.SWIFT_DEPLOY_KEY }}
+          GH_TOKEN: ${{ secrets.FFI_DEPLOY_KEY }}
         run: |
           COMMIT_SHA=$(git rev-parse HEAD)
           gh release create "${TAG}" \
