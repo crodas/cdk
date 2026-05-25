@@ -622,6 +622,10 @@ release m="":
   echo "📦 Triggering Golang package release for version $VERSION..."
   just ffi-release-go $VERSION
 
+  # Trigger Nitro (React Native) package release after Rust crates are published
+  echo "📦 Triggering Nitro package release for version $VERSION..."
+  just ffi-release-nitro $VERSION
+
 check-docs:
   #!/usr/bin/env bash
   set -euo pipefail
@@ -950,6 +954,24 @@ ffi-release-go VERSION:
 
   echo "✅ Go workflow triggered successfully!"
 
+# Trigger Nitro (React Native) Bindings release workflow
+ffi-release-nitro VERSION:
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  echo "🚀 Triggering Nitro bindings workflow..."
+  echo "   Version: {{VERSION}}"
+  echo "   CDK Ref: v{{VERSION}}"
+
+  # Trigger the workflow using GitHub CLI
+  gh workflow run "FFI - Nitro Bindings" \
+    --repo cashubtc/cdk \
+    --field release_tag="v{{VERSION}}" \
+    --field cdk_version="{{VERSION}}" \
+    --field cdk_ref="v{{VERSION}}"
+
+  echo "✅ Nitro workflow triggered successfully!"
+
 # Generate Dart FFI bindings via nix
 binding-dart:
   #!/usr/bin/env bash
@@ -1012,3 +1034,20 @@ test-swift:
   else
     DYLD_LIBRARY_PATH="$LIB_DIR" swift test
   fi
+
+# Run React Native Nitro Rust unit tests
+test-nitro:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  cargo test -p cdk-nitro
+
+# Run React Native Nitro Node.js FFI tests
+test-nitro-node:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  cargo build -p cdk-nitro
+  cd bindings/react-native/test
+  npm install
+  npm test
