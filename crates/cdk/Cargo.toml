@@ -185,6 +185,8 @@ required-features = ["wallet"]
 
 [dev-dependencies]
 rand.workspace = true
+paste.workspace = true
+cdk-common = { workspace = true, features = ["test"] }
 cdk-sqlite.workspace = true
 cdk-fake-wallet.workspace = true
 bip39.workspace = true

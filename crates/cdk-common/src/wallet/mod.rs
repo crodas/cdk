@@ -25,6 +25,9 @@ use crate::{Amount, Error};
 
 pub mod saga;
 
+#[cfg(feature = "test")]
+pub mod test;
+
 pub use saga::{
     IssueSagaState, MeltOperationData, MeltSagaState, MintOperationData, OperationData,
     ReceiveOperationData, ReceiveSagaState, SendOperationData, SendSagaState, SwapOperationData,
@@ -771,6 +774,26 @@ pub enum KeysetFilter {
     Active,
     /// Return all keysets (active and inactive)
     All,
+}
+
+/// Report of recovery operations performed by [`Wallet::recover_incomplete_sagas`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecoveryReport {
+    /// Operations successfully completed after crash
+    pub recovered: usize,
+    /// Operations rolled back (resources released)
+    pub compensated: usize,
+    /// Operations still pending (will retry on next call)
+    pub skipped: usize,
+    /// Operations that could not be recovered
+    pub failed: usize,
+}
+
+impl RecoveryReport {
+    /// Returns true if no operations were recovered, compensated, skipped, or failed.
+    pub fn is_empty(&self) -> bool {
+        self.recovered == 0 && self.compensated == 0 && self.skipped == 0 && self.failed == 0
+    }
 }
 
 /// Unified wallet trait providing a common interface for wallet operations.

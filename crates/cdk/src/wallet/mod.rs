@@ -1305,3 +1305,17 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod wallet_trait_tests {
+    use cdk_common::wallet::test::WalletTestContext;
+    use cdk_common::wallet_test;
+
+    async fn provide_wallet(_test_name: String) -> WalletTestContext<super::Wallet> {
+        let db = super::test_utils::create_test_db().await;
+        let wallet = super::test_utils::create_test_wallet(db.clone()).await;
+        WalletTestContext { wallet, db }
+    }
+
+    wallet_test!(provide_wallet);
+}

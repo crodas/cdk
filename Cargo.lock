@@ -1250,6 +1250,7 @@ dependencies = [
  "lightning",
  "lightning-invoice",
  "nostr-sdk",
+ "paste",
  "rand 0.9.4",
  "regex",
  "ring 0.17.14",
