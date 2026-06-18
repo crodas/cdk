@@ -59,10 +59,12 @@ where
 {
     fn map_http_error(err: HttpError) -> Error {
         match err {
-            HttpError::Status { status, message } => match ErrorResponse::from_json(&message) {
-                Ok(ok) => ok.into(),
-                Err(_) => Error::HttpError(Some(status), message),
-            },
+            HttpError::Status { status, message } => {
+                match serde_json::from_str::<ErrorResponse>(&message) {
+                    Ok(err_response) => err_response.into(),
+                    Err(_) => Error::HttpError(Some(status), message),
+                }
+            }
             HttpError::Timeout => Error::Timeout,
             HttpError::Connection(message)
             | HttpError::Serialization(message)
