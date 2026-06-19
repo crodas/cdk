@@ -262,12 +262,19 @@ impl RequestBuilderExt for ReqwestRequestBuilder {
 pub struct HttpClientBuilder {
     proxy: Option<ProxyConfig>,
     accept_invalid_certs: bool,
+    no_redirects: bool,
 }
 
 impl HttpClientBuilder {
     /// Accept invalid TLS certificates.
     pub fn danger_accept_invalid_certs(mut self, accept: bool) -> Self {
         self.accept_invalid_certs = accept;
+        self
+    }
+
+    /// Disable automatic HTTP redirect following.
+    pub fn no_redirects(mut self) -> Self {
+        self.no_redirects = true;
         self
     }
 
@@ -290,18 +297,26 @@ impl HttpClientBuilder {
 
     /// Build the HTTP client.
     pub fn build(self) -> Response<HttpClient> {
-        let direct = reqwest::Client::builder()
-            .danger_accept_invalid_certs(self.accept_invalid_certs)
+        let mut direct_builder =
+            reqwest::Client::builder().danger_accept_invalid_certs(self.accept_invalid_certs);
+        if self.no_redirects {
+            direct_builder = direct_builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let direct = direct_builder
             .build()
             .map_err(|e| HttpError::Build(e.to_string()))?;
 
         let proxied = if let Some(proxy) = &self.proxy {
-            reqwest::Client::builder()
+            let mut proxied_builder = reqwest::Client::builder()
                 .danger_accept_invalid_certs(self.accept_invalid_certs)
                 .proxy(
                     reqwest::Proxy::all(proxy.url.as_str())
                         .map_err(|e| HttpError::Proxy(e.to_string()))?,
-                )
+                );
+            if self.no_redirects {
+                proxied_builder = proxied_builder.redirect(reqwest::redirect::Policy::none());
+            }
+            proxied_builder
                 .build()
                 .map_err(|e| HttpError::Build(e.to_string()))?
         } else {

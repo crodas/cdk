@@ -227,6 +227,11 @@ impl HttpClientBuilder {
         panic!("danger_accept_invalid_certs configuration is not supported on WASM")
     }
 
+    /// Disable automatic HTTP redirect following (not supported on WASM)
+    pub fn no_redirects(self) -> Self {
+        self
+    }
+
     /// Set a proxy URL (not supported on WASM)
     pub fn proxy(self, _url: url::Url) -> Self {
         panic!("proxy configuration is not supported on WASM")
