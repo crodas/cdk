@@ -100,6 +100,7 @@ pub struct WasmRequestBuilder {
     url: String,
     headers: Vec<(String, String)>,
     body: Option<WasmBody>,
+    error: Option<HttpError>,
 }
 
 #[derive(Debug)]
@@ -116,10 +117,14 @@ impl WasmRequestBuilder {
             url: url.to_string(),
             headers: Vec::new(),
             body: None,
+            error: None,
         }
     }
 
     async fn execute(self) -> Response<RawResponse> {
+        if let Some(err) = self.error {
+            return Err(err);
+        }
         let opts = web_sys::RequestInit::new();
         opts.set_method(&self.method);
 
@@ -184,7 +189,7 @@ impl RequestBuilderExt for WasmRequestBuilder {
                 self.headers
                     .push(("Content-Type".to_string(), "application/json".to_string()));
             }
-            Err(_) => {} // Error will surface when trying to send
+            Err(e) => self.error = Some(HttpError::Serialization(e.to_string())),
         }
         self
     }
@@ -198,7 +203,7 @@ impl RequestBuilderExt for WasmRequestBuilder {
                     "application/x-www-form-urlencoded".to_string(),
                 ));
             }
-            Err(_) => {}
+            Err(e) => self.error = Some(HttpError::Serialization(e.to_string())),
         }
         self
     }
