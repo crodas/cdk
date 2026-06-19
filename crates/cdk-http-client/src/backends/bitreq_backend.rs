@@ -96,17 +96,7 @@ impl HttpClient {
             .send_async_with_client(&self.inner)
             .await
             .map_err(HttpError::from)?;
-        let status = response.status_code;
-
-        if !(200..300).contains(&status) {
-            let message = response.as_str().unwrap_or("").to_string();
-            return Err(HttpError::Status {
-                status: status as u16,
-                message,
-            });
-        }
-
-        response.json().map_err(HttpError::from)
+        RawResponse::new(response.status_code as u16, response.into_bytes()).json_or_status_error()
     }
 
     /// POST with JSON body, returns JSON deserialized to R
@@ -121,17 +111,8 @@ impl HttpClient {
             .send_async_with_client(&self.inner)
             .await
             .map_err(HttpError::from)?;
-        let status = response.status_code;
 
-        if !(200..300).contains(&status) {
-            let message = response.as_str().unwrap_or("").to_string();
-            return Err(HttpError::Status {
-                status: status as u16,
-                message,
-            });
-        }
-
-        response.json().map_err(HttpError::from)
+        RawResponse::new(response.status_code as u16, response.into_bytes()).json_or_status_error()
     }
 
     /// POST with form data, returns JSON deserialized to R
@@ -150,17 +131,8 @@ impl HttpClient {
             .send_async_with_client(&self.inner)
             .await
             .map_err(HttpError::from)?;
-        let status = response.status_code;
 
-        if !(200..300).contains(&status) {
-            let message = response.as_str().unwrap_or("").to_string();
-            return Err(HttpError::Status {
-                status: status as u16,
-                message,
-            });
-        }
-
-        response.json().map_err(HttpError::from)
+        RawResponse::new(response.status_code as u16, response.into_bytes()).json_or_status_error()
     }
 
     /// PATCH with JSON body, returns JSON deserialized to R
@@ -177,17 +149,8 @@ impl HttpClient {
             .send_async_with_client(&self.inner)
             .await
             .map_err(HttpError::from)?;
-        let status = response.status_code;
 
-        if !(200..300).contains(&status) {
-            let message = response.as_str().unwrap_or("").to_string();
-            return Err(HttpError::Status {
-                status: status as u16,
-                message,
-            });
-        }
-
-        response.json().map_err(HttpError::from)
+        RawResponse::new(response.status_code as u16, response.into_bytes()).json_or_status_error()
     }
 
     /// GET request returning raw response body
@@ -330,17 +293,8 @@ impl RequestBuilderExt for BitreqRequestBuilder {
             .send_async_with_client(&self.client)
             .await
             .map_err(HttpError::from)?;
-        let status = response.status_code;
 
-        if !(200..300).contains(&status) {
-            let message = response.as_str().unwrap_or("").to_string();
-            return Err(HttpError::Status {
-                status: status as u16,
-                message,
-            });
-        }
-
-        response.json().map_err(HttpError::from)
+        RawResponse::new(response.status_code as u16, response.into_bytes()).json_or_status_error()
     }
 }
 

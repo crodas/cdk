@@ -81,17 +81,10 @@ impl HttpClient {
         request: reqwest::RequestBuilder,
     ) -> Response<R> {
         let response = request.send().await.map_err(map_reqwest_error)?;
-        let status = response.status();
+        let status = response.status().as_u16();
         let body = response.bytes().await.map_err(map_reqwest_error)?.to_vec();
 
-        if !status.is_success() {
-            return Err(HttpError::Status {
-                status: status.as_u16(),
-                message: String::from_utf8_lossy(&body).to_string(),
-            });
-        }
-
-        serde_json::from_slice(&body).map_err(HttpError::from)
+        RawResponse::new(status, body).json_or_status_error()
     }
 
     /// GET request, returns JSON deserialized to R.
@@ -260,15 +253,7 @@ impl RequestBuilderExt for ReqwestRequestBuilder {
     }
 
     async fn send_json<R: DeserializeOwned>(self) -> Response<R> {
-        let raw = self.send().await?;
-        let status = raw.status();
-
-        if !raw.is_success() {
-            let message = String::from_utf8_lossy(&raw.body).to_string();
-            return Err(HttpError::Status { status, message });
-        }
-
-        serde_json::from_slice(&raw.body).map_err(HttpError::from)
+        self.send().await?.json_or_status_error()
     }
 }
 

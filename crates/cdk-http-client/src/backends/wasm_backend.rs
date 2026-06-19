@@ -208,15 +208,7 @@ impl RequestBuilderExt for WasmRequestBuilder {
     }
 
     async fn send_json<R: DeserializeOwned>(self) -> Response<R> {
-        let raw = self.execute().await?;
-        let status = raw.status();
-
-        if !raw.is_success() {
-            let message = String::from_utf8_lossy(&raw.body).to_string();
-            return Err(HttpError::Status { status, message });
-        }
-
-        serde_json::from_slice(&raw.body).map_err(HttpError::from)
+        self.execute().await?.json_or_status_error()
     }
 }
 
