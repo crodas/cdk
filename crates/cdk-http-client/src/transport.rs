@@ -37,6 +37,14 @@ pub trait Transport: Default + Send + Sync + Debug + Clone {
     where
         P: Serialize + Send + Sync,
         R: DeserializeOwned;
+
+    /// Whether DNS queries must be routed through this transport (e.g. Tor).
+    ///
+    /// When `true`, callers should use DNS-over-HTTPS via [`Transport::http_get`]
+    /// instead of issuing bare DNS queries that would bypass the transport.
+    fn dns_proxy_required(&self) -> bool {
+        false
+    }
 }
 
 /// Default async transport backed by the crate `HttpClient`.
@@ -334,6 +342,10 @@ mod tor_transport {
 
     #[async_trait]
     impl Transport for TorAsync {
+        fn dns_proxy_required(&self) -> bool {
+            true
+        }
+
         fn with_proxy(
             &mut self,
             _proxy: Url,

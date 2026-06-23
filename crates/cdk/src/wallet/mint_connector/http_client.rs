@@ -31,6 +31,23 @@ use crate::wallet::auth::{AuthMintConnector, AuthWallet};
 
 type Cache = (u64, HashSet<(nut19::Method, nut19::Path)>);
 
+/// DNS-over-HTTPS JSON response (Google / RFC 8484 JSON API).
+#[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
+#[derive(serde::Deserialize)]
+struct DohResponse {
+    #[serde(rename = "Answer")]
+    answer: Option<Vec<DohAnswer>>,
+}
+
+#[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
+#[derive(serde::Deserialize)]
+struct DohAnswer {
+    /// DNS record type (16 = TXT).
+    r#type: u16,
+    /// Record data.
+    data: String,
+}
+
 fn payment_method_path_segment(method: &PaymentMethod) -> Result<&str, Error> {
     match method {
         PaymentMethod::Known(known) => Ok(known.as_str()),
@@ -98,6 +115,32 @@ where
             .http_post(url, auth, payload)
             .await
             .map_err(Self::map_http_error)
+    }
+
+    /// Resolve DNS TXT records via DNS-over-HTTPS, routing the query through
+    /// the transport so it is protected by Tor or any configured proxy.
+    #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
+    async fn resolve_dns_txt_over_https(&self, domain: &str) -> Result<Vec<String>, Error> {
+        // Use Google's DoH JSON API — it returns application/json without
+        // requiring a special Accept header, which works with any Transport.
+        let url = Url::parse(&format!(
+            "https://dns.google/resolve?name={domain}&type=TXT&do=1"
+        ))
+        .map_err(|e| Error::Custom(format!("Failed to build DoH URL: {e}")))?;
+
+        let resp: DohResponse = self
+            .transport
+            .http_get(url, None)
+            .await
+            .map_err(Self::map_http_error)?;
+
+        Ok(resp
+            .answer
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| a.r#type == 16) // TXT record type
+            .map(|a| a.data.trim_matches('"').to_string())
+            .collect())
     }
 
     /// Create new [`HttpClient`] with a provided transport implementation.
@@ -284,6 +327,10 @@ where
     #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
     #[instrument(skip(self), fields(mint_url = %self.mint_url))]
     async fn resolve_dns_txt(&self, domain: &str) -> Result<Vec<String>, Error> {
+        if self.transport.dns_proxy_required() {
+            return self.resolve_dns_txt_over_https(domain).await;
+        }
+
         use std::str::FromStr;
 
         use hickory_resolver::config::{ResolverConfig, ResolverOpts};
