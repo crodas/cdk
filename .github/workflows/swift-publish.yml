@@ -103,6 +103,7 @@ jobs:
             --exclude='build' \
             bindings/swift/ cdk-swift/
           cp rust-toolchain.toml cdk-swift/
+          cp Cargo.lock cdk-swift/rust/
 
       - name: Update versions and resolve workspace references
         run: |
@@ -165,12 +166,10 @@ jobs:
           echo "--- rust/Cargo.toml ---"
           cat cdk-swift/rust/Cargo.toml
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Generate Cargo.lock for standalone crate
-        working-directory: cdk-swift/rust
-        run: cargo generate-lockfile
+      - name: Fix Cargo.lock for standalone crate
+        run: |
+          rustc misc/scripts/fix-lockfile.rs -o /tmp/fix-lockfile
+          /tmp/fix-lockfile cdk-swift/rust/Cargo.lock cdk-ffi-swift
 
       - name: Push to cdk-swift release branch
         working-directory: cdk-swift

@@ -66,6 +66,7 @@ jobs:
             --exclude='.git' \
             bindings/go/ cdk-go/
           cp rust-toolchain.toml cdk-go/
+          cp Cargo.lock cdk-go/rust/
 
       - name: Update versions and resolve workspace references
         run: |
@@ -127,6 +128,11 @@ jobs:
 
           echo "--- rust/Cargo.toml ---"
           cat cdk-go/rust/Cargo.toml
+
+      - name: Fix Cargo.lock for standalone crate
+        run: |
+          rustc misc/scripts/fix-lockfile.rs -o /tmp/fix-lockfile
+          /tmp/fix-lockfile cdk-go/rust/Cargo.lock cdk-ffi-go
 
       - name: Push to cdk-go release branch
         working-directory: cdk-go
