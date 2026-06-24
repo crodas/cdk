@@ -47,16 +47,23 @@ fn main() {
     });
 
     // Insert pins, skipping deps already declared in Cargo.toml
+    let existing_deps: Vec<String> = cargo_toml
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            // Match lines like: name = "..." or name = { ... }
+            if t.contains(" = ") && !t.starts_with('[') && !t.starts_with('#') {
+                t.split(|c: char| c == ' ' || c == '=').next().map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let pin_lines: String = drifts
         .iter()
         .filter(|(name, _, _)| {
-            // Skip if already a direct dependency (e.g., cdk-ffi)
-            let pat1 = format!("{name} = ");
-            let pat2 = format!("{name} = {{");
-            !cargo_toml.lines().any(|l| {
-                let t = l.trim();
-                t.starts_with(&pat1) || t.starts_with(&pat2)
-            })
+            !existing_deps.iter().any(|d| d == name)
         })
         .map(|(name, _current, ref_ver)| {
             eprintln!("  {name} -> ={ref_ver}");
@@ -202,9 +209,12 @@ fn find_drifts(
     target: &BTreeMap<(String, String), bool>,
     reference: &BTreeMap<(String, String), bool>,
 ) -> Vec<(String, String, String)> {
+    // Index reference by name, but only registry deps (skip workspace path deps)
     let mut ref_by_name: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (name, ver) in reference.keys() {
-        ref_by_name.entry(name).or_default().push(ver);
+    for ((name, ver), &has_source) in reference {
+        if has_source {
+            ref_by_name.entry(name).or_default().push(ver);
+        }
     }
 
     let mut drifts = Vec::new();
