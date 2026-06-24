@@ -1,170 +1,260 @@
-// Self-contained Cargo.lock transformer for standalone binding crates.
-//
-// Converts a workspace Cargo.lock into one valid for a detached binding crate
-// by resolving path dependencies to registry dependencies (fetching checksums
-// from the crates.io sparse index) and pruning unreachable workspace members.
+// Generates a Cargo.lock for a standalone binding crate that matches
+// the workspace's dependency versions by pinning drifted transitive
+// dependencies as exact-version constraints in Cargo.toml.
 //
 // Compile: rustc misc/scripts/fix-lockfile.rs -o /tmp/fix-lockfile
-// Usage:   /tmp/fix-lockfile <lockfile> <root-crate>
+// Usage:   /tmp/fix-lockfile <target-dir> <reference-lockfile>
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeMap;
 use std::{env, fs, process};
-
-const REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index";
-const INDEX_BASE: &str = "https://index.crates.io";
-
-#[derive(Clone)]
-struct Package {
-    name: String,
-    version: String,
-    source: Option<String>,
-    checksum: Option<String>,
-    deps: Vec<String>, // "name" or "name version"
-}
-
-/// (name, version) key
-type PkgKey = (String, String);
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 {
-        eprintln!("usage: {} <lockfile> <root-crate>", args[0]);
+        eprintln!("usage: {} <target-dir> <reference-lockfile>", args[0]);
         process::exit(1);
     }
-    let lockfile_path = &args[1];
-    let root_crate = &args[2];
+    let target_dir = &args[1];
+    let reference_path = &args[2];
 
-    let contents = fs::read_to_string(lockfile_path).unwrap_or_else(|e| {
-        eprintln!("cannot read {lockfile_path}: {e}");
+    let ref_contents = fs::read_to_string(reference_path).unwrap_or_else(|e| {
+        eprintln!("cannot read {reference_path}: {e}");
+        process::exit(1);
+    });
+    let ref_map = parse_versions(&ref_contents);
+
+    // Step 1: generate fresh lock file
+    eprintln!("generating lockfile...");
+    run_cargo(target_dir, &["generate-lockfile"]);
+
+    // Step 2: find drifted versions
+    let target_lock = format!("{target_dir}/Cargo.lock");
+    let target_contents = fs::read_to_string(&target_lock).unwrap();
+    let target_map = parse_versions(&target_contents);
+    let drifts = find_drifts(&target_map, &ref_map);
+
+    if drifts.is_empty() {
+        eprintln!("ok: all versions match reference");
+        return;
+    }
+
+    // Step 3: pin drifted versions in Cargo.toml
+    eprintln!("pinning {} drifted versions in Cargo.toml...", drifts.len());
+    let cargo_toml_path = format!("{target_dir}/Cargo.toml");
+    let mut cargo_toml = fs::read_to_string(&cargo_toml_path).unwrap_or_else(|e| {
+        eprintln!("cannot read {cargo_toml_path}: {e}");
         process::exit(1);
     });
 
-    let mut packages = parse_lockfile(&contents);
-
-    // Find the root crate
-    let root_key = packages
-        .keys()
-        .find(|(n, _)| n == root_crate)
-        .cloned()
-        .unwrap_or_else(|| {
-            eprintln!("root crate '{root_crate}' not found in lockfile");
-            process::exit(1);
-        });
-
-    // BFS to find all reachable packages
-    let reachable = find_reachable(&packages, &root_key);
-
-    // Convert reachable path deps to registry deps
-    let path_deps_to_convert: Vec<PkgKey> = reachable
+    // Insert pins, skipping deps already declared in Cargo.toml
+    let pin_lines: String = drifts
         .iter()
-        .filter(|k| {
-            let pkg = &packages[*k];
-            pkg.source.is_none() && **k != root_key
+        .filter(|(name, _, _)| {
+            // Skip if already a direct dependency (e.g., cdk-ffi)
+            let pat1 = format!("{name} = ");
+            let pat2 = format!("{name} = {{");
+            !cargo_toml.lines().any(|l| {
+                let t = l.trim();
+                t.starts_with(&pat1) || t.starts_with(&pat2)
+            })
         })
-        .cloned()
+        .map(|(name, _current, ref_ver)| {
+            eprintln!("  {name} -> ={ref_ver}");
+            format!("{name} = \"={ref_ver}\"\n")
+        })
         .collect();
 
-    for key in &path_deps_to_convert {
-        let pkg = &packages[key];
-        let cksum = fetch_checksum(&pkg.name, &pkg.version);
-        let pkg = packages.get_mut(key).unwrap();
-        pkg.source = Some(REGISTRY.to_string());
-        pkg.checksum = Some(cksum);
+    // Find the end of [dependencies] section (next section header or EOF)
+    if let Some(deps_pos) = cargo_toml.find("\n[dependencies]") {
+        let after_header = deps_pos + "\n[dependencies]\n".len();
+        cargo_toml.insert_str(after_header, &pin_lines);
+    } else {
+        cargo_toml.push_str(&format!("\n[dependencies]\n{pin_lines}"));
     }
 
-    // Prune unreachable
-    packages.retain(|k, _| reachable.contains(k));
-
-    // Write
-    let out = serialize_lockfile(&packages);
-    fs::write(lockfile_path, out.as_bytes()).unwrap_or_else(|e| {
-        eprintln!("cannot write {lockfile_path}: {e}");
+    fs::write(&cargo_toml_path, &cargo_toml).unwrap_or_else(|e| {
+        eprintln!("cannot write {cargo_toml_path}: {e}");
         process::exit(1);
     });
 
-    eprintln!(
-        "ok: {} packages kept, {} path deps converted",
-        packages.len(),
-        path_deps_to_convert.len()
-    );
-}
+    // Step 4: regenerate lock file, iteratively removing yanked pins
+    eprintln!("regenerating lockfile...");
+    let mut yanked_pins: Vec<String> = Vec::new();
 
-fn parse_lockfile(contents: &str) -> BTreeMap<PkgKey, Package> {
-    let mut packages = BTreeMap::new();
+    loop {
+        let gen_result = process::Command::new("cargo")
+            .args(["generate-lockfile"])
+            .current_dir(target_dir)
+            .output()
+            .unwrap();
 
-    // Split into blocks separated by blank lines; each [[package]] block
-    // starts with "[[package]]" and ends at the next blank line (or EOF).
-    let mut in_package = false;
-    let mut name = String::new();
-    let mut version = String::new();
-    let mut source: Option<String> = None;
-    let mut checksum: Option<String> = None;
-    let mut deps: Vec<String> = Vec::new();
-    let mut in_deps = false;
-
-    for line in contents.lines() {
-        if line == "[[package]]" {
-            if in_package {
-                let key = (name.clone(), version.clone());
-                packages.insert(
-                    key,
-                    Package { name: name.clone(), version: version.clone(), source: source.take(), checksum: checksum.take(), deps: std::mem::take(&mut deps) },
-                );
-            }
-            in_package = true;
-            name.clear();
-            version.clear();
-            source = None;
-            checksum = None;
-            deps.clear();
-            in_deps = false;
-            continue;
+        if gen_result.status.success() {
+            break;
         }
 
-        if !in_package {
-            continue;
+        let stderr = String::from_utf8_lossy(&gen_result.stderr);
+        if !stderr.contains("is yanked") {
+            eprintln!("cargo generate-lockfile failed:\n{stderr}");
+            process::exit(1);
         }
 
-        if in_deps {
-            let trimmed = line.trim();
-            if trimmed == "]" {
-                in_deps = false;
-                continue;
-            }
-            // Parse dep entry: " \"name\"," or " \"name version\","
-            if let Some(s) = trimmed.strip_prefix('"') {
-                if let Some(s) = s.strip_suffix(',').or(Some(s)) {
-                    if let Some(s) = s.strip_suffix('"') {
-                        deps.push(s.to_string());
+        // Extract yanked crate name: "requirement `name = ..."
+        let mut found_yanked = false;
+        for line in stderr.lines() {
+            if line.contains("requirement `") {
+                if let Some(spec) = line.split('`').nth(1) {
+                    if let Some(name) = spec.split(' ').next() {
+                        let name = name.to_string();
+                        if !yanked_pins.contains(&name) {
+                            eprintln!("  {name} is yanked, removing pin");
+                            yanked_pins.push(name.clone());
+
+                            let mut toml = fs::read_to_string(&cargo_toml_path).unwrap();
+                            let pin_prefix = format!("{name} = \"=");
+                            toml = toml.lines()
+                                .filter(|l| !l.starts_with(&pin_prefix))
+                                .collect::<Vec<_>>()
+                                .join("\n") + "\n";
+                            fs::write(&cargo_toml_path, &toml).unwrap();
+                            found_yanked = true;
+                            break; // retry after removing one
+                        }
                     }
                 }
             }
+        }
+        if !found_yanked {
+            eprintln!("cargo generate-lockfile failed:\n{stderr}");
+            process::exit(1);
+        }
+    }
+
+    // Pin yanked crates via --precise (which allows yanked versions)
+    if !yanked_pins.is_empty() {
+        eprintln!("pinning {} yanked crates via --precise...", yanked_pins.len());
+        // Re-read the lock to get current versions
+        let mid_contents = fs::read_to_string(&target_lock).unwrap();
+        let mid_map = parse_versions(&mid_contents);
+        for name in &yanked_pins {
+            let ref_ver = drifts.iter().find(|(n, _, _)| n == name).map(|(_, _, r)| r.as_str());
+            let cur_ver = mid_map.keys().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
+            if let (Some(ref_ver), Some(cur_ver)) = (ref_ver, cur_ver) {
+                eprintln!("  {name} {cur_ver} -> {ref_ver} (yanked, --precise)");
+                let _ = process::Command::new("cargo")
+                    .args(["update", "-p", &format!("{name}@{cur_ver}"), "--precise", ref_ver])
+                    .current_dir(target_dir)
+                    .stdout(process::Stdio::null())
+                    .stderr(process::Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    // Step 5: verify
+    let final_contents = fs::read_to_string(&target_lock).unwrap();
+    let final_map = parse_versions(&final_contents);
+    let remaining = find_drifts(&final_map, &ref_map);
+
+    if remaining.is_empty() {
+        eprintln!("ok: all {} versions pinned", drifts.len());
+    } else {
+        // Try --precise for remaining drifts
+        for (name, current, ref_ver) in &remaining {
+            let _ = process::Command::new("cargo")
+                .args(["update", "-p", &format!("{name}@{current}"), "--precise", ref_ver])
+                .current_dir(target_dir)
+                .stdout(process::Stdio::null())
+                .stderr(process::Stdio::null())
+                .status();
+        }
+
+        let final2 = fs::read_to_string(&target_lock).unwrap();
+        let final2_map = parse_versions(&final2);
+        let remaining2 = find_drifts(&final2_map, &ref_map);
+        if remaining2.is_empty() {
+            eprintln!("ok: all {} versions pinned", drifts.len());
+        } else {
+            eprintln!("{} versions still differ:", remaining2.len());
+            for (name, current, ref_ver) in &remaining2 {
+                eprintln!("  {name} {current} (wanted {ref_ver})");
+            }
+            process::exit(1);
+        }
+    }
+}
+
+fn run_cargo(dir: &str, args: &[&str]) {
+    let status = process::Command::new("cargo")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("cargo {} failed: {e}", args.join(" "));
+            process::exit(1);
+        });
+    if !status.success() {
+        eprintln!("cargo {} exited with {status}", args.join(" "));
+        process::exit(1);
+    }
+}
+
+fn find_drifts(
+    target: &BTreeMap<(String, String), bool>,
+    reference: &BTreeMap<(String, String), bool>,
+) -> Vec<(String, String, String)> {
+    let mut ref_by_name: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (name, ver) in reference.keys() {
+        ref_by_name.entry(name).or_default().push(ver);
+    }
+
+    let mut drifts = Vec::new();
+    for ((name, version), &has_source) in target {
+        if !has_source { continue; }
+        let ref_versions = match ref_by_name.get(name.as_str()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let matched = if ref_versions.len() == 1 {
+            Some(ref_versions[0])
+        } else {
+            ref_versions.iter().find(|v| same_major_minor(v, version)).copied()
+        };
+        if let Some(ref_ver) = matched {
+            if ref_ver != version {
+                drifts.push((name.clone(), version.clone(), ref_ver.to_string()));
+            }
+        }
+    }
+    drifts
+}
+
+fn parse_versions(contents: &str) -> BTreeMap<(String, String), bool> {
+    let mut result = BTreeMap::new();
+    let mut name = String::new();
+    let mut version = String::new();
+    let mut has_source = false;
+    let mut in_pkg = false;
+
+    for line in contents.lines() {
+        if line == "[[package]]" {
+            if in_pkg && !name.is_empty() {
+                result.insert((name.clone(), version.clone()), has_source);
+            }
+            in_pkg = true;
+            name.clear();
+            version.clear();
+            has_source = false;
             continue;
         }
-
-        if line.starts_with("name = \"") {
-            name = extract_quoted(line);
-        } else if line.starts_with("version = \"") {
-            version = extract_quoted(line);
-        } else if line.starts_with("source = \"") {
-            source = Some(extract_quoted(line));
-        } else if line.starts_with("checksum = \"") {
-            checksum = Some(extract_quoted(line));
-        } else if line.starts_with("dependencies = [") {
-            in_deps = true;
-        }
+        if !in_pkg { continue; }
+        if line.starts_with("name = \"") { name = extract_quoted(line); }
+        else if line.starts_with("version = \"") { version = extract_quoted(line); }
+        else if line.starts_with("source = \"") { has_source = true; }
     }
-
-    // Flush last package
-    if in_package && !name.is_empty() {
-        let key = (name.clone(), version.clone());
-        packages.insert(
-            key,
-            Package { name, version, source, checksum, deps },
-        );
+    if in_pkg && !name.is_empty() {
+        result.insert((name, version), has_source);
     }
-
-    packages
+    result
 }
 
 fn extract_quoted(line: &str) -> String {
@@ -173,131 +263,8 @@ fn extract_quoted(line: &str) -> String {
     line[start..end].to_string()
 }
 
-fn find_reachable(packages: &BTreeMap<PkgKey, Package>, root: &PkgKey) -> BTreeSet<PkgKey> {
-    let mut visited = BTreeSet::new();
-    let mut queue = VecDeque::new();
-    queue.push_back(root.clone());
-    visited.insert(root.clone());
-
-    // Build a name→keys index for resolving unversioned dep refs
-    let mut by_name: BTreeMap<&str, Vec<&PkgKey>> = BTreeMap::new();
-    for key in packages.keys() {
-        by_name.entry(&key.0).or_default().push(key);
-    }
-
-    while let Some(key) = queue.pop_front() {
-        let pkg = match packages.get(&key) {
-            Some(p) => p,
-            None => continue,
-        };
-        for dep in &pkg.deps {
-            let resolved = resolve_dep(dep, &by_name);
-            for r in resolved {
-                if visited.insert(r.clone()) {
-                    queue.push_back(r);
-                }
-            }
-        }
-    }
-
-    visited
-}
-
-fn resolve_dep<'a>(dep: &str, by_name: &BTreeMap<&str, Vec<&'a PkgKey>>) -> Vec<PkgKey> {
-    let parts: Vec<&str> = dep.splitn(2, ' ').collect();
-    let name = parts[0];
-    let version = parts.get(1).copied();
-
-    match by_name.get(name) {
-        Some(keys) => {
-            if let Some(ver) = version {
-                keys.iter()
-                    .filter(|k| k.1 == ver)
-                    .map(|k| (*k).clone())
-                    .collect()
-            } else {
-                keys.iter().map(|k| (*k).clone()).collect()
-            }
-        }
-        None => Vec::new(),
-    }
-}
-
-fn fetch_checksum(name: &str, version: &str) -> String {
-    let prefix = sparse_index_prefix(name);
-    let url = format!("{INDEX_BASE}/{prefix}/{name}");
-
-    let output = process::Command::new("curl")
-        .args(["-sfL", &url])
-        .output()
-        .unwrap_or_else(|e| {
-            eprintln!("failed to run curl for {name}: {e}");
-            process::exit(1);
-        });
-
-    if !output.status.success() {
-        eprintln!(
-            "curl failed for {name} v{version} ({}): {}",
-            url,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        process::exit(1);
-    }
-
-    let body = String::from_utf8_lossy(&output.stdout);
-
-    // Each line is a JSON object. Find the one with matching "vers".
-    let vers_needle = format!("\"vers\":\"{version}\"");
-    for line in body.lines() {
-        // Normalize whitespace for matching
-        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-        if compact.contains(&vers_needle) {
-            // Extract "cksum":"<hex>"
-            if let Some(pos) = compact.find("\"cksum\":\"") {
-                let start = pos + "\"cksum\":\"".len();
-                let end = compact[start..].find('"').unwrap() + start;
-                return compact[start..end].to_string();
-            }
-        }
-    }
-
-    eprintln!("checksum not found for {name} v{version} in sparse index");
-    process::exit(1);
-}
-
-fn sparse_index_prefix(name: &str) -> String {
-    match name.len() {
-        1 => format!("1"),
-        2 => format!("2"),
-        3 => format!("3/{}", &name[..1]),
-        _ => format!("{}/{}", &name[..2], &name[2..4]),
-    }
-}
-
-fn serialize_lockfile(packages: &BTreeMap<PkgKey, Package>) -> String {
-    let mut out = String::new();
-    out.push_str("# This file is automatically @generated by Cargo.\n");
-    out.push_str("# It is not intended for manual editing.\n");
-    out.push_str("version = 4\n");
-
-    for pkg in packages.values() {
-        out.push_str("\n[[package]]\n");
-        out.push_str(&format!("name = \"{}\"\n", pkg.name));
-        out.push_str(&format!("version = \"{}\"\n", pkg.version));
-        if let Some(src) = &pkg.source {
-            out.push_str(&format!("source = \"{src}\"\n"));
-        }
-        if let Some(ck) = &pkg.checksum {
-            out.push_str(&format!("checksum = \"{ck}\"\n"));
-        }
-        if !pkg.deps.is_empty() {
-            out.push_str("dependencies = [\n");
-            for dep in &pkg.deps {
-                out.push_str(&format!(" \"{dep}\",\n"));
-            }
-            out.push_str("]\n");
-        }
-    }
-
-    out
+fn same_major_minor(a: &str, b: &str) -> bool {
+    let a: Vec<&str> = a.splitn(3, '.').collect();
+    let b: Vec<&str> = b.splitn(3, '.').collect();
+    a.len() >= 2 && b.len() >= 2 && a[0] == b[0] && a[1] == b[1]
 }

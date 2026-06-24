@@ -102,7 +102,6 @@ jobs:
             --exclude='.git' \
             bindings/kotlin/ cdk-kotlin/
           cp rust-toolchain.toml cdk-kotlin/
-          cp Cargo.lock cdk-kotlin/rust/
 
       - name: Update versions and resolve workspace references
         run: |
@@ -172,7 +171,7 @@ jobs:
       - name: Fix Cargo.lock for standalone crate
         run: |
           rustc misc/scripts/fix-lockfile.rs -o /tmp/fix-lockfile
-          /tmp/fix-lockfile cdk-kotlin/rust/Cargo.lock cdk-ffi-kotlin
+          /tmp/fix-lockfile cdk-kotlin/rust Cargo.lock
 
       - name: Push to cdk-kotlin release branch
         working-directory: cdk-kotlin
