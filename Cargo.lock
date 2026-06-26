@@ -1218,6 +1218,7 @@ dependencies = [
  "bip39",
  "cdk",
  "cdk-fake-wallet",
+ "cdk-http-client",
  "cdk-prometheus",
  "cdk-signatory",
  "cdk-sqlite",
@@ -1342,6 +1343,7 @@ dependencies = [
  "async-trait",
  "bitcoin 0.32.100",
  "cdk-common",
+ "cdk-http-client",
  "futures",
  "lightning",
  "lightning-invoice",
@@ -1365,6 +1367,7 @@ dependencies = [
  "bip39",
  "cdk",
  "cdk-common",
+ "cdk-http-client",
  "cdk-npubcash",
  "cdk-postgres",
  "cdk-sql-common",
@@ -1452,6 +1455,7 @@ dependencies = [
  "tor-rtcompat",
  "tracing",
  "url",
+ "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -1581,6 +1585,7 @@ dependencies = [
  "cdk",
  "cdk-common",
  "cdk-fake-wallet",
+ "cdk-http-client",
  "cdk-sqlite",
  "clap",
  "home",
@@ -1612,6 +1617,7 @@ dependencies = [
  "cdk-cln",
  "cdk-common",
  "cdk-fake-wallet",
+ "cdk-http-client",
  "cdk-ldk-node",
  "cdk-lnbits",
  "cdk-lnd",
@@ -1672,6 +1678,7 @@ dependencies = [
  "cdk-cln",
  "cdk-common",
  "cdk-fake-wallet",
+ "cdk-http-client",
  "cdk-lnd",
  "cdk-sqlite",
  "clap",
@@ -3387,6 +3394,25 @@ dependencies = [
 
 [[package]]
 name = "h2"
+version = "0.3.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0beca50380b1fc32983fc1cb4587bfa4bb9e78fc259aad4a0032d2080309222d"
+dependencies = [
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "futures-util",
+ "http 0.2.12",
+ "indexmap 2.14.0",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "h2"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
@@ -3735,6 +3761,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
+ "h2 0.3.27",
  "http 0.2.12",
  "http-body 0.4.6",
  "httparse",
@@ -3758,7 +3785,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
- "h2",
+ "h2 0.4.14",
  "http 1.4.1",
  "http-body 1.0.1",
  "httparse",
@@ -7756,7 +7783,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
- "h2",
+ "h2 0.4.14",
  "http 1.4.1",
  "http-body 1.0.1",
  "http-body-util",
@@ -7785,7 +7812,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
- "h2",
+ "h2 0.4.14",
  "http 1.4.1",
  "http-body 1.0.1",
  "http-body-util",
