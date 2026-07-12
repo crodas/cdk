@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bitcoin::bip32::DerivationPath;
 use cdk_common::database::{DynMintAuthDatabase, DynMintDatabase, MintKeysDatabase};
@@ -72,6 +73,8 @@ pub struct MintBuilder {
     custom_paths: HashMap<CurrencyUnit, DerivationPath>,
     use_keyset_v2: Option<bool>,
     keyset_rotations: Vec<KeysetRotation>,
+    keyset_rotation_interval: Option<Duration>,
+    keyset_refresh_interval: Duration,
     max_inputs: usize,
     max_outputs: usize,
     max_batch_size: Option<u64>,
@@ -115,10 +118,44 @@ impl MintBuilder {
             custom_paths: HashMap::new(),
             use_keyset_v2: None,
             keyset_rotations: Vec::new(),
+            // Match the Mint default (90 days). Overridden from mint config.
+            keyset_rotation_interval: Some(Duration::from_secs(7_776_000)),
+            // How often the mint pings the signatory to refresh its local
+            // keyset cache. Overridden from mint config.
+            keyset_refresh_interval: Duration::from_secs(1),
             max_inputs: 1000,
             max_outputs: 1000,
             max_batch_size: None,
         }
+    }
+
+    /// Configure automatic keyset rotation.
+    ///
+    /// When `enabled` is false or `interval_seconds` is zero, automatic
+    /// rotation is disabled. Otherwise active keysets older than the interval
+    /// are rotated at startup and on each background tick.
+    pub fn with_automatic_keyset_rotation(mut self, enabled: bool, interval_seconds: u64) -> Self {
+        self.keyset_rotation_interval = if enabled && interval_seconds > 0 {
+            Some(Duration::from_secs(interval_seconds))
+        } else {
+            None
+        };
+        self
+    }
+
+    /// Set how often the mint pings the signatory to refresh its local keyset
+    /// cache.
+    ///
+    /// The mint serves key/keyset requests from a local copy of the signatory's
+    /// keys; this interval controls how often a background task confirms that
+    /// copy is still current. A value of zero falls back to one second.
+    pub fn with_keyset_refresh_interval(mut self, interval_seconds: u64) -> Self {
+        self.keyset_refresh_interval = if interval_seconds > 0 {
+            Duration::from_secs(interval_seconds)
+        } else {
+            Duration::from_secs(1)
+        };
+        self
     }
 
     /// Set use keyset v2
@@ -656,6 +693,7 @@ impl MintBuilder {
                             cdk_common::nut02::KeySetVersion::Version00
                         },
                         final_expiry: None,
+                        active_keyset_id: None,
                     })
                     .await?;
             }
@@ -674,6 +712,7 @@ impl MintBuilder {
                         cdk_common::nut02::KeySetVersion::Version00
                     },
                     final_expiry: rotation.final_expiry,
+                    active_keyset_id: None,
                 })
                 .await?;
         }
@@ -702,7 +741,7 @@ impl MintBuilder {
                 tx.commit().await?;
             }
 
-            return Mint::new_with_auth(
+            let mint = Mint::new_with_auth(
                 self.mint_info,
                 signatory,
                 self.localstore,
@@ -711,9 +750,10 @@ impl MintBuilder {
                 self.max_inputs,
                 self.max_outputs,
             )
-            .await;
+            .await?;
+            return Ok(mint.with_keyset_refresh_interval(self.keyset_refresh_interval));
         }
-        Mint::new(
+        let mint = Mint::new(
             self.mint_info,
             signatory,
             self.localstore,
@@ -721,7 +761,8 @@ impl MintBuilder {
             self.max_inputs,
             self.max_outputs,
         )
-        .await
+        .await?;
+        Ok(mint.with_keyset_refresh_interval(self.keyset_refresh_interval))
     }
 
     /// Build the mint with the provided keystore and seed
@@ -730,17 +771,20 @@ impl MintBuilder {
         keystore: Arc<dyn MintKeysDatabase<Err = cdk_database::Error> + Send + Sync>,
         seed: &[u8],
     ) -> Result<Mint, Error> {
-        let in_memory_signatory = cdk_signatory::db_signatory::DbSignatory::new(
-            keystore,
-            seed,
-            self.supported_units.clone(),
-            self.custom_paths.clone(),
-        )
-        .await?;
+        let in_memory_signatory = Arc::new(
+            cdk_signatory::db_signatory::DbSignatory::new(
+                keystore,
+                seed,
+                self.supported_units.clone(),
+                self.custom_paths.clone(),
+                self.keyset_rotation_interval,
+            )
+            .await?,
+        );
+        // Start the signatory's own rotation loop.
+        in_memory_signatory.spawn_rotation();
 
-        let signatory = Arc::new(cdk_signatory::embedded::Service::new(Arc::new(
-            in_memory_signatory,
-        )));
+        let signatory = Arc::new(cdk_signatory::embedded::Service::new(in_memory_signatory));
 
         self.build_with_signatory(signatory).await
     }

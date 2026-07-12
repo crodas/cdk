@@ -187,9 +187,16 @@ pub async fn cli_main() -> Result<()> {
     };
     let seed = mnemonic.to_seed_normalized("");
 
-    let signatory =
-        db_signatory::DbSignatory::new(localstore, &seed, supported_units, Default::default())
-            .await?;
+    // A standalone signatory serves a remote mint; automatic rotation for the
+    // remote path is out of scope for now (see ADR 001), so it is disabled here.
+    let signatory = db_signatory::DbSignatory::new(
+        localstore,
+        &seed,
+        supported_units,
+        Default::default(),
+        None,
+    )
+    .await?;
 
     let socket_addr = SocketAddr::from_str(&format!("{}:{}", args.listen_addr, args.listen_port))?;
 

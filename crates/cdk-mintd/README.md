@@ -184,6 +184,22 @@ mint-cli rotate-next-keyset --use-keyset-v2       # Rotate to V2
 mint-cli rotate-next-keyset --use-keyset-v2=false # Rotate to V1
 ```
 
+**Automatic Rotation (by age):**
+The mint rotates an active keyset automatically once it exceeds a configured
+age. A new keyset is generated with the next derivation-path index and marked
+active; the old keyset is deactivated but stays usable for redeeming existing
+proofs. After rotation the active keyset is recovered from the database on the
+next restart, so `MINT_DERIVATION_PATH` never needs to be edited by hand.
+
+- `keyset_rotation_enabled = true` (or `CDK_MINTD_MINT_KEYSET_ROTATION_ENABLED=true`): master switch, defaults to enabled.
+- `keyset_rotation_interval_seconds = 7776000` (or `CDK_MINTD_MINT_KEYSET_ROTATION_INTERVAL_SECONDS=7776000`): age after which an active keyset is rotated. Must be greater than zero. Defaults to 90 days.
+
+These settings configure the embedded (in-process) signatory. When using a remote (gRPC) signatory, rotation is owned by that signatory process and is configured there.
+
+The mint serves key and keyset requests from a local copy of the signatory's keys and keeps that copy current with a background poll:
+
+- `keyset_refresh_interval_seconds = 1` (or `CDK_MINTD_MINT_KEYSET_REFRESH_INTERVAL_SECONDS=1`): how often the mint pings the signatory to refresh its local keyset cache. Must be greater than zero. Defaults to 1 second. Applies to both embedded and remote signatories.
+
 ## Production Examples
 
 ### With LDK Node (Recommended for Testing)

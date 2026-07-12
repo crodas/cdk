@@ -366,6 +366,9 @@ impl TryInto<crate::signatory::RotateKeyArguments> for RotationRequest {
             final_expiry: self.final_expiry,
             keyset_id_type: KeySetVersion::from_proto_i32(self.keyset_id_type)
                 .map_err(|err| Status::invalid_argument(err.to_string()))?,
+            // The gRPC rotation request carries no guard id; a remote signatory
+            // rotation is always treated as freshly triggered.
+            active_keyset_id: None,
         })
     }
 }

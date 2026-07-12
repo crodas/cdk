@@ -77,6 +77,9 @@ pub struct Mint {
     max_inputs: usize,
     /// Maximum number of outputs allowed per transaction
     max_outputs: usize,
+    /// How often the background task pings the signatory to refresh the local
+    /// keyset cache
+    keyset_refresh_interval: Duration,
 }
 
 impl std::fmt::Debug for Mint {
@@ -92,6 +95,8 @@ struct TaskState {
     shutdown_notify: Option<Arc<Notify>>,
     /// Handle to the main supervisor task
     supervisor_handle: Option<JoinHandle<Result<(), Error>>>,
+    /// Handle to the periodic keyset cache refresh task
+    refresh_handle: Option<JoinHandle<()>>,
 }
 
 impl Mint {
@@ -248,7 +253,15 @@ impl Mint {
             task_state: Arc::new(Mutex::new(TaskState::default())),
             max_inputs,
             max_outputs,
+            keyset_refresh_interval: Duration::from_secs(1),
         })
+    }
+
+    /// Set how often the background task pings the signatory to refresh the
+    /// local keyset cache. Defaults to one second.
+    pub fn with_keyset_refresh_interval(mut self, interval: Duration) -> Self {
+        self.keyset_refresh_interval = interval;
+        self
     }
 
     /// Start the mint's background services and operations
@@ -339,9 +352,39 @@ impl Mint {
             .await
         });
 
+        // Keep the local keyset cache fresh. A background task pings the
+        // signatory on an interval to confirm the cached keys are still active
+        // and to pick up any change, swapping the local copy without blocking
+        // any request. It runs unconditionally, so the cache never silently goes
+        // stale, and behaves the same whether the signatory is embedded or a
+        // remote gRPC service. The first tick fires immediately for an initial
+        // refresh.
+        let refresh_handle = {
+            let mint = self.clone();
+            let shutdown = shutdown_notify.clone();
+            let interval = self.keyset_refresh_interval;
+            Some(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            if let Err(e) = mint.refresh_keysets().await {
+                                tracing::error!("Keyset refresh task failed: {}", e);
+                            }
+                        }
+                        _ = shutdown.notified() => {
+                            tracing::info!("Keyset refresh task shutting down");
+                            break;
+                        }
+                    }
+                }
+            }))
+        };
+
         // Store the handles
         task_state.shutdown_notify = Some(shutdown_notify);
         task_state.supervisor_handle = Some(supervisor_handle);
+        task_state.refresh_handle = refresh_handle;
 
         // Give the background task a tiny bit of time to start waiting
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -365,6 +408,7 @@ impl Mint {
         // Take the handles out of the state
         let shutdown_notify = task_state.shutdown_notify.take();
         let supervisor_handle = task_state.supervisor_handle.take();
+        let refresh_handle = task_state.refresh_handle.take();
 
         // If nothing to stop, return early
         let (shutdown_notify, supervisor_handle) = match (shutdown_notify, supervisor_handle) {
@@ -383,6 +427,13 @@ impl Mint {
 
         // Signal shutdown
         shutdown_notify.notify_waiters();
+
+        // Wait for the refresh task to observe the shutdown signal
+        if let Some(handle) = refresh_handle {
+            if let Err(join_error) = handle.await {
+                tracing::error!("Keyset refresh task panicked: {:?}", join_error);
+            }
+        }
 
         // Wait for supervisor to complete
         let result = match supervisor_handle.await {
@@ -1326,6 +1377,7 @@ mod tests {
         seed: &'a [u8],
         mint_info: MintInfo,
         supported_units: HashMap<CurrencyUnit, (u64, Vec<u64>)>,
+        rotation_interval: Option<Duration>,
     }
 
     async fn create_mint(config: MintConfig<'_>) -> Mint {
@@ -1349,10 +1401,12 @@ mod tests {
                 config.seed,
                 config.supported_units.clone(),
                 HashMap::new(),
+                config.rotation_interval,
             )
             .await
             .expect("Failed to create signatory"),
         );
+        signatory.spawn_rotation();
 
         for (unit, (fee, amounts)) in &config.supported_units {
             signatory
@@ -1362,6 +1416,7 @@ mod tests {
                     input_fee_ppk: *fee,
                     keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
                     final_expiry: None,
+                    active_keyset_id: None,
                 })
                 .await
                 .unwrap();
@@ -1407,6 +1462,73 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Amount::default()]
         );
+    }
+
+    fn active_sat(mint: &Mint) -> Option<SignatoryKeySet> {
+        mint.keysets
+            .load()
+            .iter()
+            .find(|k| k.active && k.unit == CurrencyUnit::Sat)
+            .cloned()
+    }
+
+    async fn sat_mint(rotation_interval: Option<Duration>) -> Mint {
+        let mut supported_units = HashMap::new();
+        supported_units.insert(CurrencyUnit::Sat, (2u64, vec![1, 2, 4, 8]));
+        create_mint(MintConfig::<'_> {
+            supported_units,
+            rotation_interval,
+            ..Default::default()
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn background_rotation_is_autonomous() {
+        // The signatory rotates on its own 1s loop; the mint's refresh poll
+        // mirrors the result into its cache. Nothing here drives rotation.
+        let mint = sat_mint(Some(Duration::from_secs(1))).await;
+        let old = active_sat(&mint).expect("active sat keyset");
+
+        mint.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        mint.stop().await.unwrap();
+
+        let new = active_sat(&mint).expect("new active sat keyset");
+        assert_ne!(new.id, old.id, "signatory rotated the keyset on its own");
+        assert!(
+            new.version > old.version,
+            "derivation index advanced ({} -> {})",
+            old.version,
+            new.version
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_disabled_no_background_activity() {
+        // No interval on the signatory: no rotation loop and no mint refresh task.
+        let mint = sat_mint(None).await;
+        let old = active_sat(&mint).expect("active sat keyset");
+
+        mint.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        mint.stop().await.unwrap();
+
+        assert_eq!(active_sat(&mint).unwrap().id, old.id, "nothing rotates");
+    }
+
+    #[tokio::test]
+    async fn fresh_keyset_is_not_rotated() {
+        // A long interval keeps the signatory loop at the 60s cap, so within this
+        // short window nothing rotates even though the refresh poll runs.
+        let mint = sat_mint(Some(Duration::from_secs(7_776_000))).await;
+        let old = active_sat(&mint).expect("active sat keyset");
+
+        mint.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        mint.stop().await.unwrap();
+
+        assert_eq!(active_sat(&mint).unwrap().id, old.id, "fresh keyset stays");
     }
 
     #[tokio::test]
@@ -1777,6 +1899,7 @@ mod tests {
             input_fee_ppk: 100,
             keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
             final_expiry: None,
+            active_keyset_id: None,
         };
         let rotation_result = mint.signatory.rotate_keyset(rotate_argument).await;
 

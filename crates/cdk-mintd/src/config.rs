@@ -77,6 +77,23 @@ pub struct Info {
     /// If not provided, defaults are used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quote_ttl: Option<QuoteTTL>,
+
+    /// Automatically rotate active keysets once they exceed the configured age.
+    /// Defaults to enabled. When enabled, the active keyset is recovered from
+    /// the database after rotation, so the derivation path never needs manual
+    /// edits.
+    pub keyset_rotation_enabled: Option<bool>,
+
+    /// Age in seconds after which an active keyset is automatically rotated.
+    /// Must be greater than zero. Defaults to 7776000 (90 days).
+    pub keyset_rotation_interval_seconds: Option<u64>,
+
+    /// How often, in seconds, the mint pings the signatory to refresh its local
+    /// keyset cache. The mint serves key/keyset requests from a local copy of
+    /// the signatory's keys; this interval controls how often a background task
+    /// confirms that copy is still current. Applies whether the signatory is
+    /// embedded or remote. Defaults to 1.
+    pub keyset_refresh_interval_seconds: Option<u64>,
 }
 
 impl Default for Info {
@@ -95,6 +112,9 @@ impl Default for Info {
             enable_info_page: Some(true),
             logging: LoggingConfig::default(),
             quote_ttl: None,
+            keyset_rotation_enabled: Some(true),
+            keyset_rotation_interval_seconds: Some(7_776_000),
+            keyset_refresh_interval_seconds: Some(1),
         }
     }
 }
@@ -121,6 +141,15 @@ impl std::fmt::Debug for Info {
             .field("http_cache", &self.http_cache)
             .field("logging", &self.logging)
             .field("enable_info_page", &self.enable_info_page)
+            .field("keyset_rotation_enabled", &self.keyset_rotation_enabled)
+            .field(
+                "keyset_rotation_interval_seconds",
+                &self.keyset_rotation_interval_seconds,
+            )
+            .field(
+                "keyset_refresh_interval_seconds",
+                &self.keyset_refresh_interval_seconds,
+            )
             .finish()
     }
 }

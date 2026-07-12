@@ -200,6 +200,7 @@ pub fn create_fake_wallet_settings(
                 file_level: Some("debug".to_string()),
             },
             enable_info_page: None,
+            ..Default::default()
         },
         mint_info: cdk_mintd::config::MintInfo::default(),
         limits: cdk_mintd::config::Limits::default(),
@@ -273,6 +274,7 @@ pub fn create_cln_settings(
                 file_level: Some("debug".to_string()),
             },
             enable_info_page: None,
+            ..Default::default()
         },
         mint_info: cdk_mintd::config::MintInfo::default(),
         limits: cdk_mintd::config::Limits::default(),
@@ -329,6 +331,7 @@ pub fn create_lnd_settings(
                 file_level: Some("debug".to_string()),
             },
             enable_info_page: None,
+            ..Default::default()
         },
         mint_info: cdk_mintd::config::MintInfo::default(),
         limits: cdk_mintd::config::Limits::default(),

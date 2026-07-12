@@ -554,6 +554,17 @@ fn configure_basic_info(settings: &config::Settings, mint_builder: MintBuilder) 
 
     builder = builder.with_keyset_v2(settings.info.use_keyset_v2);
 
+    builder = builder.with_automatic_keyset_rotation(
+        settings.info.keyset_rotation_enabled.unwrap_or(true),
+        settings
+            .info
+            .keyset_rotation_interval_seconds
+            .unwrap_or(7_776_000),
+    );
+
+    builder = builder
+        .with_keyset_refresh_interval(settings.info.keyset_refresh_interval_seconds.unwrap_or(1));
+
     builder
 }
 /// Configures Lightning Network backend based on the specified backend type

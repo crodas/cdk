@@ -192,6 +192,7 @@ mod tests {
                 &seed,
                 supported_units.clone(),
                 HashMap::new(),
+                None,
             )
             .await
             .expect("signatory"),
@@ -205,6 +206,7 @@ mod tests {
                     input_fee_ppk: *fee,
                     keyset_id_type: KeySetVersion::Version00,
                     final_expiry: None,
+                    active_keyset_id: None,
                 })
                 .await
                 .expect("rotate keyset");

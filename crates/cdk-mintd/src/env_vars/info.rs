@@ -71,6 +71,38 @@ impl Info {
             }
         }
 
+        if let Ok(rotation_enabled_str) = env::var(ENV_KEYSET_ROTATION_ENABLED) {
+            if let Ok(enabled) = rotation_enabled_str.parse() {
+                self.keyset_rotation_enabled = Some(enabled);
+            }
+        }
+
+        if let Ok(rotation_interval_str) = env::var(ENV_KEYSET_ROTATION_INTERVAL_SECONDS) {
+            match rotation_interval_str.parse::<u64>() {
+                Ok(seconds) if seconds > 0 => {
+                    self.keyset_rotation_interval_seconds = Some(seconds);
+                }
+                _ => tracing::warn!(
+                    "Invalid {} '{}'; must be a positive integer. Ignoring.",
+                    ENV_KEYSET_ROTATION_INTERVAL_SECONDS,
+                    rotation_interval_str
+                ),
+            }
+        }
+
+        if let Ok(refresh_interval_str) = env::var(ENV_KEYSET_REFRESH_INTERVAL_SECONDS) {
+            match refresh_interval_str.parse::<u64>() {
+                Ok(seconds) if seconds > 0 => {
+                    self.keyset_refresh_interval_seconds = Some(seconds);
+                }
+                _ => tracing::warn!(
+                    "Invalid {} '{}'; must be a positive integer. Ignoring.",
+                    ENV_KEYSET_REFRESH_INTERVAL_SECONDS,
+                    refresh_interval_str
+                ),
+            }
+        }
+
         // Logging configuration
         if let Ok(output_str) = env::var(ENV_LOGGING_OUTPUT) {
             if let Ok(output) = LoggingOutput::from_str(&output_str) {

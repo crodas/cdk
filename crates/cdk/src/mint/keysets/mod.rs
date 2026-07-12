@@ -68,8 +68,11 @@ impl Mint {
             .map(|x| x.into())
     }
 
-    /// Add current keyset to inactive keysets
-    /// Generate new keyset
+    /// Manually rotate the active keyset for a unit to a new one.
+    ///
+    /// Automatic age-based rotation is owned by the signatory; this is the
+    /// operator-triggered path (e.g. the management RPC). It refreshes the local
+    /// keyset cache from the signatory after the rotation.
     #[instrument(skip(self))]
     pub async fn rotate_keyset(
         &self,
@@ -91,6 +94,7 @@ impl Mint {
                     cdk_common::nut02::KeySetVersion::Version00
                 },
                 final_expiry,
+                active_keyset_id: None,
             })
             .await?;
 
@@ -98,5 +102,20 @@ impl Mint {
         self.keysets.store(new_keyset.keysets.into());
 
         Ok(result.into())
+    }
+
+    /// Refresh the local keyset cache from the signatory.
+    ///
+    /// The mint keeps a local copy of the signatory's keysets and serves reads
+    /// from it. A background task calls this on the refresh interval to confirm
+    /// the cached keys are still active and to pick up any change (autonomous,
+    /// manual, or peer-replica rotations), swapping the copy in place without
+    /// blocking any request. Also usable directly to force a refresh. See
+    /// `docs/adr/001-automatic-keyset-rotation.md`.
+    #[instrument(skip(self))]
+    pub async fn refresh_keysets(&self) -> Result<(), Error> {
+        let keysets = self.signatory.keysets().await?;
+        self.keysets.store(keysets.keysets.into());
+        Ok(())
     }
 }

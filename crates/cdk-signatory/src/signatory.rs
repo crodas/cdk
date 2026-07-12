@@ -52,6 +52,13 @@ pub struct RotateKeyArguments {
     pub keyset_id_type: KeySetVersion,
     /// FinalExpiry
     pub final_expiry: Option<u64>,
+    /// Keyset that triggered this rotation check.
+    ///
+    /// When set, the signatory skips rotation if this keyset is no longer the
+    /// active one for the unit (another process/task already rotated it),
+    /// returning the current active keyset instead. This guards against
+    /// near-sequential double rotations.
+    pub active_keyset_id: Option<Id>,
 }
 
 #[derive(Debug, Clone)]

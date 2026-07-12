@@ -2,21 +2,29 @@
 //!
 //! It is named db_signatory because it uses a database to maintain state.
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bitcoin::bip32::{DerivationPath, Xpriv};
 use bitcoin::secp256k1::{self, Secp256k1};
 use cdk_common::dhke::{sign_message, verify_message};
 use cdk_common::mint::MintKeySetInfo;
 use cdk_common::nuts::{BlindSignature, BlindedMessage, CurrencyUnit, Id, MintKeySet, Proof};
+use cdk_common::util::unix_time;
 use cdk_common::{database, Error, PublicKey};
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tracing::instrument;
 
 use crate::common::{
     check_unit_string_collision, create_new_keyset, derivation_path_from_unit, init_keysets,
 };
 use crate::signatory::{RotateKeyArguments, Signatory, SignatoryKeySet, SignatoryKeysets};
+
+/// Upper bound on how often the internal rotation loop wakes to check keyset age.
+/// The rotation interval itself can be far larger (e.g. 90 days); this cap keeps
+/// the check responsive without a busy loop.
+const ROTATION_CHECK_CAP: Duration = Duration::from_secs(60);
 
 /// In-memory Signatory
 ///
@@ -33,6 +41,33 @@ pub struct DbSignatory {
     custom_paths: HashMap<CurrencyUnit, DerivationPath>,
     xpriv: Xpriv,
     xpub: PublicKey,
+    /// Automatic keyset rotation interval. `None` disables rotation; otherwise
+    /// active keysets older than this are rotated by the internal rotation loop.
+    rotation_interval: Option<Duration>,
+    /// Handle to the internal rotation loop, aborted on drop.
+    rotation_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for DbSignatory {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.rotation_task.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+    }
+}
+
+/// Whether an active keyset is old enough to rotate.
+///
+/// Rotate when the keyset is active, has a known (non-zero) `valid_from`, and has
+/// been valid for at least `interval`. Inactive keysets and keysets without a
+/// `valid_from` never rotate.
+fn should_rotate(info: &MintKeySetInfo, interval: Duration) -> bool {
+    if !info.active || info.valid_from == 0 {
+        return false;
+    }
+    unix_time().saturating_sub(info.valid_from) >= interval.as_secs()
 }
 
 impl DbSignatory {
@@ -46,6 +81,7 @@ impl DbSignatory {
         seed: &[u8],
         mut supported_units: HashMap<CurrencyUnit, (u64, Vec<u64>)>,
         custom_paths: HashMap<CurrencyUnit, DerivationPath>,
+        rotation_interval: Option<Duration>,
     ) -> Result<Self, Error> {
         let secp_ctx = Secp256k1::new();
         let xpriv = Xpriv::new_master(bitcoin::Network::Bitcoin, seed).expect("RNG busted");
@@ -63,10 +99,108 @@ impl DbSignatory {
             xpub: xpriv.to_keypair(&secp_ctx).public_key().into(),
             secp_ctx,
             xpriv,
+            rotation_interval,
+            rotation_task: Mutex::new(None),
         };
         keys.reload_keys_from_db().await?;
 
         Ok(keys)
+    }
+
+    /// Start the internal rotation loop so the signatory rotates on its own.
+    ///
+    /// Spawns a task that wakes on a timer (cadence `min(interval, 60s)`) and
+    /// rotates any keyset aged past the interval, with no external driver. The
+    /// task holds a `Weak` reference so it never keeps the signatory alive, and
+    /// it is aborted on drop. No-op when automatic rotation is disabled. Call
+    /// once, after wrapping the signatory in an `Arc`. See
+    /// `docs/adr/001-automatic-keyset-rotation.md`.
+    pub fn spawn_rotation(self: &Arc<Self>) {
+        let Some(interval) = self.rotation_interval.filter(|i| !i.is_zero()) else {
+            return;
+        };
+
+        let weak = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval.min(ROTATION_CHECK_CAP));
+            loop {
+                ticker.tick().await;
+                match weak.upgrade() {
+                    Some(signatory) => {
+                        if let Err(err) = signatory.rotate_keysets_if_needed().await {
+                            tracing::error!("Keyset rotation loop failed: {}", err);
+                        }
+                    }
+                    None => break,
+                }
+            }
+        });
+
+        if let Ok(mut guard) = self.rotation_task.lock() {
+            *guard = Some(handle);
+        }
+    }
+
+    /// Reload keyset state and rotate every active keyset older than the
+    /// configured interval, returning the current keysets. Called by the
+    /// internal rotation loop; the reload also surfaces peer-replica changes.
+    #[tracing::instrument(skip(self))]
+    pub async fn rotate_keysets_if_needed(&self) -> Result<SignatoryKeysets, Error> {
+        let interval = match self.rotation_interval {
+            Some(interval) => interval,
+            None => return self.keysets().await,
+        };
+
+        self.reload_keys_from_db().await?;
+
+        // Snapshot the stale, active, non-auth keysets before mutating state.
+        let stale = {
+            let keysets = self.keysets.read().await;
+            keysets
+                .values()
+                .filter(|(info, _)| info.unit != CurrencyUnit::Auth)
+                .filter(|(info, _)| should_rotate(info, interval))
+                .map(|(info, _)| info.clone())
+                .collect::<Vec<_>>()
+        };
+
+        for info in stale {
+            // Preserve the redemption grace period: the new keyset expires the
+            // same duration past the old expiry as the old keyset stayed active.
+            let final_expiry = info
+                .final_expiry
+                .map(|expiry| expiry + unix_time().saturating_sub(info.valid_from));
+
+            tracing::warn!(
+                "Active keyset {} for unit {:?} exceeded the rotation interval ({}s). Rotating.",
+                info.id,
+                info.unit,
+                interval.as_secs()
+            );
+
+            let args = RotateKeyArguments {
+                unit: info.unit.clone(),
+                amounts: info.amounts.clone(),
+                input_fee_ppk: info.input_fee_ppk,
+                keyset_id_type: info.id.get_version(),
+                final_expiry,
+                active_keyset_id: Some(info.id),
+            };
+
+            match self.rotate_keyset(args).await {
+                Ok(new_keyset) => tracing::info!(
+                    "Rotated keyset {} -> {} for unit {:?}",
+                    info.id,
+                    new_keyset.id,
+                    info.unit
+                ),
+                Err(err) => {
+                    tracing::error!("Failed to automatically rotate keyset {}: {}", info.id, err)
+                }
+            }
+        }
+
+        self.keysets().await
     }
 
     /// Load all the keysets from the database, even if they are not active.
@@ -188,21 +322,52 @@ impl Signatory for DbSignatory {
     /// Generate new keyset
     #[tracing::instrument(skip(self))]
     async fn rotate_keyset(&self, args: RotateKeyArguments) -> Result<SignatoryKeySet, Error> {
-        let (path_index, amounts) = if let Some(current_keyset_id) =
-            self.localstore.get_active_keyset_id(&args.unit).await?
-        {
-            let keyset_info = self
-                .localstore
-                .get_keyset_info(&current_keyset_id)
-                .await?
-                .ok_or(Error::UnknownKeySet)?;
+        let current_active_id = self.localstore.get_active_keyset_id(&args.unit).await?;
 
-            (
-                keyset_info.derivation_path_index.unwrap_or(1) + 1,
-                keyset_info.amounts,
-            )
-        } else {
-            (1, vec![])
+        // Concurrency guard: if the caller intended to rotate a specific keyset
+        // but it is no longer the active one, another process or task already
+        // rotated it. Return the current active keyset instead of rotating
+        // again, so near-sequential checks converge on a single new keyset.
+        // See docs/adr/001-automatic-keyset-rotation.md.
+        if let Some(requested) = args.active_keyset_id {
+            if current_active_id != Some(requested) {
+                if let Some(active_id) = current_active_id {
+                    let info = self
+                        .localstore
+                        .get_keyset_info(&active_id)
+                        .await?
+                        .ok_or(Error::UnknownKeySet)?;
+                    let keyset = self.generate_keyset(&info);
+                    return Ok((&(info, keyset)).into());
+                }
+            }
+        }
+
+        // Select the next derivation index from the highest index seen for this
+        // unit (active or not) so indexes never collide or regress, even if the
+        // active keyset is somehow not the highest-index one.
+        let unit_keyset_infos = self
+            .localstore
+            .get_keyset_infos()
+            .await?
+            .into_iter()
+            .filter(|info| info.unit == args.unit)
+            .collect::<Vec<_>>();
+
+        let path_index = unit_keyset_infos
+            .iter()
+            .filter_map(|info| info.derivation_path_index)
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        let default_amounts = match &current_active_id {
+            Some(id) => unit_keyset_infos
+                .iter()
+                .find(|info| &info.id == id)
+                .map(|info| info.amounts.clone())
+                .unwrap_or_default(),
+            None => vec![],
         };
 
         let derivation_path = match self.custom_paths.get(&args.unit) {
@@ -212,10 +377,10 @@ impl Signatory for DbSignatory {
         };
 
         let amounts = if args.amounts.is_empty() {
-            if amounts.is_empty() {
+            if default_amounts.is_empty() {
                 return Err(Error::Custom("Amounts cannot be empty".to_string()));
             }
-            amounts
+            default_amounts
         } else {
             args.amounts
         };
@@ -250,6 +415,7 @@ impl Signatory for DbSignatory {
 #[cfg(test)]
 mod test {
     use std::collections::HashSet;
+    use std::str::FromStr;
 
     use bitcoin::key::Secp256k1;
     use bitcoin::Network;
@@ -271,6 +437,7 @@ mod test {
             b"test-seed-for-unit-tests",
             Default::default(),
             Default::default(),
+            None,
         )
         .await
         .expect("DbSignatory::new");
@@ -282,6 +449,7 @@ mod test {
                 input_fee_ppk: 0,
                 keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
                 final_expiry: Some(unix_time() - 1),
+                active_keyset_id: None,
             })
             .await
             .expect("rotate_keyset");
@@ -297,6 +465,274 @@ mod test {
             "expected ExpiredKeyset error, got: {:?}",
             result
         );
+    }
+
+    async fn sat_signatory_with(rotation_interval: Option<Duration>) -> Arc<DbSignatory> {
+        let store = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("in-memory db"),
+        );
+        let signatory = Arc::new(
+            DbSignatory::new(
+                store,
+                b"rotation-test-seed",
+                Default::default(),
+                Default::default(),
+                rotation_interval,
+            )
+            .await
+            .expect("DbSignatory::new"),
+        );
+        signatory.spawn_rotation();
+        signatory
+    }
+
+    async fn sat_signatory() -> Arc<DbSignatory> {
+        sat_signatory_with(None).await
+    }
+
+    fn sat_args(active_keyset_id: Option<Id>) -> RotateKeyArguments {
+        RotateKeyArguments {
+            unit: CurrencyUnit::Sat,
+            amounts: vec![1, 2, 4, 8],
+            input_fee_ppk: 0,
+            keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
+            final_expiry: None,
+            active_keyset_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_selects_highest_counter() {
+        let sig = sat_signatory().await;
+
+        let k1 = sig.rotate_keyset(sat_args(None)).await.expect("rotate 1");
+        let k2 = sig
+            .rotate_keyset(sat_args(Some(k1.id)))
+            .await
+            .expect("rotate 2");
+        let k3 = sig
+            .rotate_keyset(sat_args(Some(k2.id)))
+            .await
+            .expect("rotate 3");
+
+        // Each rotation increments the derivation-path index by exactly one.
+        assert_eq!(k1.version, 1);
+        assert_eq!(k2.version, 2);
+        assert_eq!(k3.version, 3);
+    }
+
+    #[tokio::test]
+    async fn stale_guard_skips_redundant_rotation() {
+        let sig = sat_signatory().await;
+
+        let k1 = sig.rotate_keyset(sat_args(None)).await.expect("rotate 1");
+        let k2 = sig
+            .rotate_keyset(sat_args(Some(k1.id)))
+            .await
+            .expect("rotate 2");
+
+        // k1 is already deactivated; rotating again while pointing at k1 must
+        // return the current active keyset instead of creating a third one.
+        let again = sig
+            .rotate_keyset(sat_args(Some(k1.id)))
+            .await
+            .expect("guarded rotate");
+        assert_eq!(again.id, k2.id);
+
+        let sat_keysets = sig
+            .localstore
+            .get_keyset_infos()
+            .await
+            .expect("infos")
+            .into_iter()
+            .filter(|i| i.unit == CurrencyUnit::Sat)
+            .count();
+        assert_eq!(sat_keysets, 2, "no third keyset should have been created");
+
+        let actives = sig.localstore.get_active_keysets().await.expect("actives");
+        assert_eq!(actives.get(&CurrencyUnit::Sat), Some(&k2.id));
+    }
+
+    #[tokio::test]
+    async fn concurrent_rotations_do_not_error() {
+        let sig = sat_signatory().await;
+        let k1 = sig.rotate_keyset(sat_args(None)).await.expect("rotate 1");
+
+        let (a, b) = tokio::join!(
+            sig.rotate_keyset(sat_args(Some(k1.id))),
+            sig.rotate_keyset(sat_args(Some(k1.id))),
+        );
+
+        assert!(a.is_ok(), "first concurrent rotation failed: {:?}", a.err());
+        assert!(
+            b.is_ok(),
+            "second concurrent rotation failed: {:?}",
+            b.err()
+        );
+
+        // The single-active-per-unit invariant still holds.
+        let actives = sig.localstore.get_active_keysets().await.expect("actives");
+        assert!(actives.contains_key(&CurrencyUnit::Sat));
+    }
+
+    fn sat_info(active: bool, valid_from: u64) -> MintKeySetInfo {
+        MintKeySetInfo {
+            id: Id::from_str("009a1f293253e41e").unwrap(),
+            unit: CurrencyUnit::Sat,
+            active,
+            valid_from,
+            derivation_path: DerivationPath::from_str("m/0'/0'/0'").unwrap(),
+            derivation_path_index: Some(0),
+            amounts: vec![1, 2, 4, 8],
+            input_fee_ppk: 0,
+            final_expiry: None,
+            issuer_version: None,
+        }
+    }
+
+    #[test]
+    fn should_rotate_fresh_active_keyset_is_false() {
+        assert!(!should_rotate(
+            &sat_info(true, unix_time()),
+            Duration::from_secs(7_776_000)
+        ));
+    }
+
+    #[test]
+    fn should_rotate_inactive_keyset_is_false() {
+        // Even far in the past, an inactive keyset is not rotated.
+        let info = sat_info(false, unix_time().saturating_sub(10_000_000));
+        assert!(!should_rotate(&info, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn should_rotate_without_valid_from_is_false() {
+        assert!(!should_rotate(&sat_info(true, 0), Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn should_rotate_old_active_keyset_is_true() {
+        let info = sat_info(true, unix_time().saturating_sub(100));
+        assert!(should_rotate(&info, Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn should_rotate_at_interval_boundary_is_true() {
+        // now - valid_from == interval satisfies the >= comparison.
+        let info = sat_info(true, unix_time().saturating_sub(30));
+        assert!(should_rotate(&info, Duration::from_secs(30)));
+    }
+
+    #[tokio::test]
+    async fn rotate_keysets_if_needed_rotates_stale_and_preserves_grace() {
+        // A large interval keeps the internal loop's check cadence at the 60s cap,
+        // so it does not fire during this sub-second test; we drive the rotation
+        // pass manually and deterministically.
+        let sig = sat_signatory_with(Some(Duration::from_secs(3600))).await;
+
+        // Create an active keyset that carries a final_expiry.
+        let expiry = 2_000_000_000u64;
+        let old = sig
+            .rotate_keyset(RotateKeyArguments {
+                unit: CurrencyUnit::Sat,
+                amounts: vec![1, 2, 4, 8],
+                input_fee_ppk: 0,
+                keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
+                final_expiry: Some(expiry),
+                active_keyset_id: None,
+            })
+            .await
+            .expect("rotate 1");
+
+        // Back-date its valid_from past the interval so it is due for rotation.
+        let mut info = sig
+            .localstore
+            .get_keyset_info(&old.id)
+            .await
+            .expect("get info")
+            .expect("info present");
+        let active_duration = 4000;
+        info.valid_from = unix_time().saturating_sub(active_duration);
+        {
+            let mut tx = sig.localstore.begin_transaction().await.expect("tx");
+            tx.add_keyset_info(info).await.expect("upsert");
+            tx.commit().await.expect("commit");
+        }
+
+        let keysets = sig
+            .rotate_keysets_if_needed()
+            .await
+            .expect("rotate if needed");
+
+        // Old keyset is inactive; a new active keyset exists with index+1.
+        let old_after = keysets
+            .keysets
+            .iter()
+            .find(|k| k.id == old.id)
+            .expect("old retained");
+        assert!(!old_after.active, "old keyset must be inactive");
+
+        let new = keysets
+            .keysets
+            .iter()
+            .find(|k| k.active && k.unit == CurrencyUnit::Sat)
+            .expect("new active keyset");
+        assert_ne!(new.id, old.id);
+        assert_eq!(new.version, old.version + 1, "index incremented by one");
+
+        // Grace period preserved: new expiry ~= old expiry + active duration.
+        let new_expiry = new.final_expiry.expect("grace preserved");
+        assert!(new_expiry >= expiry + active_duration);
+        assert!(new_expiry <= expiry + active_duration + 3);
+    }
+
+    #[tokio::test]
+    async fn rotate_keysets_if_needed_disabled_does_not_rotate() {
+        let sig = sat_signatory_with(None).await;
+        let old = sig.rotate_keyset(sat_args(None)).await.expect("rotate 1");
+
+        let keysets = sig.rotate_keysets_if_needed().await.expect("refresh");
+
+        let active = keysets
+            .keysets
+            .iter()
+            .find(|k| k.active && k.unit == CurrencyUnit::Sat)
+            .expect("active keyset");
+        assert_eq!(active.id, old.id, "nothing rotates when disabled");
+    }
+
+    #[tokio::test]
+    async fn internal_loop_rotates_without_external_help() {
+        // The signatory owns a 1s-cadence loop; nothing external drives rotation.
+        let sig = sat_signatory_with(Some(Duration::from_secs(1))).await;
+
+        // Establish an active keyset, then back-date it so the loop finds it stale.
+        let old = sig.rotate_keyset(sat_args(None)).await.expect("rotate 1");
+        let mut info = sig
+            .localstore
+            .get_keyset_info(&old.id)
+            .await
+            .expect("get info")
+            .expect("info present");
+        info.valid_from = unix_time().saturating_sub(100);
+        {
+            let mut tx = sig.localstore.begin_transaction().await.expect("tx");
+            tx.add_keyset_info(info).await.expect("upsert");
+            tx.commit().await.expect("commit");
+        }
+
+        // Wait for the loop to wake and rotate on its own (no method call here).
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let active = sig
+            .localstore
+            .get_active_keyset_id(&CurrencyUnit::Sat)
+            .await
+            .expect("active id")
+            .expect("has active");
+        assert_ne!(active, old.id, "the loop rotated the keyset autonomously");
     }
 
     #[test]

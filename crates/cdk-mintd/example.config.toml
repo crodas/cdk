@@ -13,6 +13,19 @@ mnemonic = ""
 # If unset (default), existing keysets are preserved, but new ones use V2.
 # use_keyset_v2 = true
 
+# Automatic keyset rotation.
+# When enabled (default), an active keyset older than the interval is rotated
+# automatically: a new keyset is generated and activated, and the old one is
+# deactivated (still usable for redeeming existing proofs). The active keyset is
+# recovered from the database after rotation, so the derivation path never needs
+# to be edited by hand.
+# keyset_rotation_enabled = true
+# keyset_rotation_interval_seconds = 7776000 # 90 days, must be > 0
+# The mint serves key/keyset requests from a local copy of the signatory's keys.
+# A background task pings the signatory on this interval to keep that copy
+# current. Applies whether the signatory is embedded or remote. Defaults to 1.
+# keyset_refresh_interval_seconds = 1 # must be > 0
+
 [info.quote_ttl]
 # Prefer explicit fields over inline tables for readability and ease of overrides
 mint_ttl = 600
