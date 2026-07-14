@@ -184,6 +184,11 @@ impl Signatory for DbSignatory {
         })
     }
 
+    #[tracing::instrument(skip_all)]
+    async fn keyset_ids(&self) -> Result<Vec<Id>, Error> {
+        Ok(self.keysets.read().await.keys().copied().collect())
+    }
+
     /// Add current keyset to inactive keysets
     /// Generate new keyset
     #[tracing::instrument(skip(self))]
@@ -297,6 +302,54 @@ mod test {
             "expected ExpiredKeyset error, got: {:?}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn keyset_ids_track_rotation() {
+        use std::collections::HashSet;
+
+        let store = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("in-memory db"),
+        );
+        let signatory = DbSignatory::new(
+            store,
+            b"test-seed-for-unit-tests",
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("DbSignatory::new");
+
+        // The cheap ping matches the ids in the full fetch.
+        let before: HashSet<_> = signatory.keyset_ids().await.unwrap().into_iter().collect();
+        let full_ids: HashSet<_> = signatory
+            .keysets()
+            .await
+            .unwrap()
+            .keysets
+            .into_iter()
+            .map(|k| k.id)
+            .collect();
+        assert_eq!(before, full_ids);
+
+        let rotated = signatory
+            .rotate_keyset(RotateKeyArguments {
+                unit: CurrencyUnit::Sat,
+                amounts: vec![1, 2, 4, 8],
+                input_fee_ppk: 0,
+                keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
+                final_expiry: None,
+            })
+            .await
+            .expect("rotate_keyset");
+
+        // Rotation adds a new id, so the set the mint would compare against grows
+        // and contains the new keyset.
+        let after: HashSet<_> = signatory.keyset_ids().await.unwrap().into_iter().collect();
+        assert!(after.contains(&rotated.id));
+        assert!(after.len() > before.len());
     }
 
     #[test]

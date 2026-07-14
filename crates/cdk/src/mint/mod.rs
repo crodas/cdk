@@ -92,6 +92,8 @@ struct TaskState {
     shutdown_notify: Option<Arc<Notify>>,
     /// Handle to the main supervisor task
     supervisor_handle: Option<JoinHandle<Result<(), Error>>>,
+    /// Handle to the keyset change-detection poll task
+    keyset_poll_handle: Option<JoinHandle<()>>,
 }
 
 impl Mint {
@@ -339,9 +341,19 @@ impl Mint {
             .await
         });
 
+        // Spawn the keyset change-detection poll task. It pings the signatory
+        // for a keyset fingerprint and refreshes the in-memory cache when the
+        // signatory rotated keys out of band.
+        let keyset_mint = Arc::new(self.clone());
+        let keyset_shutdown = shutdown_notify.clone();
+        let keyset_poll_handle = tokio::spawn(async move {
+            Self::poll_keyset_changes(keyset_mint, keyset_shutdown).await;
+        });
+
         // Store the handles
         task_state.shutdown_notify = Some(shutdown_notify);
         task_state.supervisor_handle = Some(supervisor_handle);
+        task_state.keyset_poll_handle = Some(keyset_poll_handle);
 
         // Give the background task a tiny bit of time to start waiting
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -365,6 +377,12 @@ impl Mint {
         // Take the handles out of the state
         let shutdown_notify = task_state.shutdown_notify.take();
         let supervisor_handle = task_state.supervisor_handle.take();
+
+        // Stop the keyset poll task; it holds only a shutdown signal and cache
+        // handles, so aborting it is safe.
+        if let Some(keyset_poll_handle) = task_state.keyset_poll_handle.take() {
+            keyset_poll_handle.abort();
+        }
 
         // If nothing to stop, return early
         let (shutdown_notify, supervisor_handle) = match (shutdown_notify, supervisor_handle) {

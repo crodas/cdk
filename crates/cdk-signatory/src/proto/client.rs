@@ -2,7 +2,7 @@ use std::path::Path;
 
 use cdk_common::error::Error;
 use cdk_common::grpc::{VersionInterceptor, VERSION_SIGNATORY_HEADER};
-use cdk_common::{BlindSignature, BlindedMessage, Proof};
+use cdk_common::{BlindSignature, BlindedMessage, Id, Proof};
 use tonic::codegen::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 
@@ -155,6 +155,22 @@ impl Signatory for SignatoryRpcClient {
             .keysets(tonic::Request::new(super::EmptyRequest {}))
             .await
             .map(|response| handle_error!(response, keysets).try_into())
+            .map_err(|e| Error::Custom(e.to_string()))?
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn keyset_ids(&self) -> Result<Vec<Id>, Error> {
+        self.client
+            .clone()
+            .keyset_ids(tonic::Request::new(super::EmptyRequest {}))
+            .await
+            .map(|response| {
+                handle_error!(response, ids, scalar)
+                    .iter()
+                    .map(|id| Id::from_bytes(id))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Error::from)
+            })
             .map_err(|e| Error::Custom(e.to_string()))?
     }
 

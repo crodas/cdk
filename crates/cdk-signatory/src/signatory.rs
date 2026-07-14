@@ -176,6 +176,14 @@ pub trait Signatory {
     /// Retrieve the list of all mint keysets
     async fn keysets(&self) -> Result<SignatoryKeysets, Error>;
 
+    /// Cheap keyset change-detection ping.
+    ///
+    /// Returns the ids of the current keyset set. The mint polls this and
+    /// compares it against the ids it already has cached, only calling
+    /// [`Signatory::keysets`] to refresh when the set differs, so the cost is
+    /// independent of the key material size.
+    async fn keyset_ids(&self) -> Result<Vec<Id>, Error>;
+
     /// Add current keyset to inactive keysets
     /// Generate new keyset
     async fn rotate_keyset(&self, args: RotateKeyArguments) -> Result<SignatoryKeySet, Error>;

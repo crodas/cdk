@@ -137,6 +137,26 @@ where
         Ok(Response::new(result))
     }
 
+    async fn keyset_ids(
+        &self,
+        request: Request<proto::EmptyRequest>,
+    ) -> Result<Response<proto::KeysetIdsResponse>, Status> {
+        let metadata = request.metadata();
+        let signatory = self.load_signatory(metadata).await?;
+        let result = match signatory.keyset_ids().await {
+            Ok(ids) => proto::KeysetIdsResponse {
+                ids: ids.into_iter().map(|id| id.to_bytes()).collect(),
+                ..Default::default()
+            },
+            Err(err) => proto::KeysetIdsResponse {
+                error: Some(err.into()),
+                ..Default::default()
+            },
+        };
+
+        Ok(Response::new(result))
+    }
+
     async fn rotate_keyset(
         &self,
         request: Request<proto::RotationRequest>,

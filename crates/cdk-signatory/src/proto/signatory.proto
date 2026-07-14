@@ -7,6 +7,8 @@ service Signatory {
   rpc VerifyProofs(Proofs) returns (BooleanResponse);
   // returns all the keysets for the mint
   rpc Keysets(EmptyRequest) returns (KeysResponse);
+  // cheap change-detection ping: returns the ids of the keyset set
+  rpc KeysetIds(EmptyRequest) returns (KeysetIdsResponse);
   // rotates the keysets
   rpc RotateKeyset(RotationRequest) returns (KeyRotationResponse);
 }
@@ -14,7 +16,7 @@ service Signatory {
 enum Constants {
   CONSTANTS_UNSPECIFIED = 0;
   // this constant should be sent on the header of the grpc code for verification
-  CONSTANTS_SCHEMA_VERSION = 1;
+  CONSTANTS_SCHEMA_VERSION = 2;
 }
 
 message BlindSignResponse {
@@ -46,6 +48,11 @@ message KeyRotationResponse {
 message KeysResponse {
   Error error = 1;
   SignatoryKeysets keysets = 2;
+}
+
+message KeysetIdsResponse {
+  Error error = 1;
+  repeated bytes ids = 2;
 }
 
 message SignatoryKeysets {

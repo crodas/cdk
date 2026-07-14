@@ -2,7 +2,7 @@
 //! run the Signatory in another thread, isolated form the main CDK, communicating through messages
 use std::sync::Arc;
 
-use cdk_common::{BlindSignature, BlindedMessage, Error, Proof};
+use cdk_common::{BlindSignature, BlindedMessage, Error, Id, Proof};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -17,6 +17,7 @@ enum Request {
     ),
     VerifyProof((Vec<Proof>, oneshot::Sender<Result<(), Error>>)),
     Keysets(oneshot::Sender<Result<SignatoryKeysets, Error>>),
+    KeysetIds(oneshot::Sender<Result<Vec<Id>, Error>>),
     RotateKeyset(
         (
             RotateKeyArguments,
@@ -82,6 +83,12 @@ impl Service {
                         tracing::error!("Error sending response: {:?}", err);
                     }
                 }
+                Request::KeysetIds(response) => {
+                    let output = handler.keyset_ids().await;
+                    if let Err(err) = response.send(output) {
+                        tracing::error!("Error sending response: {:?}", err);
+                    }
+                }
                 Request::RotateKeyset((args, response)) => {
                     let output = handler.rotate_keyset(args).await;
                     if let Err(err) = response.send(output) {
@@ -129,6 +136,17 @@ impl Signatory for Service {
         let (tx, rx) = oneshot::channel();
         self.pipeline
             .send(Request::Keysets(tx))
+            .await
+            .map_err(|e| Error::SendError(e.to_string()))?;
+
+        rx.await.map_err(|e| Error::RecvError(e.to_string()))?
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn keyset_ids(&self) -> Result<Vec<Id>, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.pipeline
+            .send(Request::KeysetIds(tx))
             .await
             .map_err(|e| Error::SendError(e.to_string()))?;
 
