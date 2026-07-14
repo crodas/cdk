@@ -17,6 +17,7 @@ use cdk_common::{
     MintQuoteCustomResponse, MintQuoteOnchainResponse, MintQuoteState, NotificationPayload,
     ProofState, PublicKey, QuoteId,
 };
+use tokio::sync::broadcast;
 
 use super::Mint;
 use crate::event::MintEvent;
@@ -206,7 +207,7 @@ impl Spec for MintPubSubSpec {
 
 /// PubsubManager
 #[allow(missing_debug_implementations)]
-pub struct PubSubManager(Pubsub<MintPubSubSpec>);
+pub struct PubSubManager(Pubsub<MintPubSubSpec>, broadcast::Sender<()>);
 
 impl PubSubManager {
     /// Create a new instance
@@ -216,7 +217,26 @@ impl PubSubManager {
             Arc<HashMap<PaymentProcessorKey, DynMintPayment>>,
         ),
     ) -> Arc<Self> {
-        Arc::new(Self(Pubsub::new(MintPubSubSpec::new_instance(context))))
+        let (keyset_changes, _) = broadcast::channel(16);
+        Arc::new(Self(
+            Pubsub::new(MintPubSubSpec::new_instance(context)),
+            keyset_changes,
+        ))
+    }
+
+    /// Subscribe to keyset-change notifications.
+    ///
+    /// Each message signals that the mint's active keysets were replaced, for
+    /// example after a signatory-side rotation. Consumers should re-read the
+    /// keysets rather than rely on the message payload.
+    pub fn subscribe_keyset_changes(&self) -> broadcast::Receiver<()> {
+        self.1.subscribe()
+    }
+
+    /// Notify subscribers that the mint's keysets changed.
+    pub fn notify_keysets_changed(&self) {
+        // A send error only means there are no subscribers, which is fine.
+        let _ = self.1.send(());
     }
 
     /// Helper function to emit a ProofState status
