@@ -99,6 +99,8 @@ struct TaskState {
     shutdown_notify: Option<Arc<Notify>>,
     /// Handle to the main supervisor task
     supervisor_handle: Option<JoinHandle<Result<(), Error>>>,
+    /// Handle to the keyset drain task
+    keyset_drain_handle: Option<JoinHandle<()>>,
     /// Keyset subscription retained from construction, drained once by the first
     /// `start()`. `None` after it has been taken; a restart re-subscribes.
     keyset_updates: Option<watch::Receiver<SignatoryKeysets>>,
@@ -389,12 +391,12 @@ impl Mint {
             },
         };
 
-        if let Some(mut keyset_updates) = keyset_updates {
+        let keyset_drain_handle = if let Some(mut keyset_updates) = keyset_updates {
             let keysets = self.keysets.clone();
             let keyset_store_lock = Arc::clone(&self.keyset_store_lock);
             let pubsub_manager = Arc::clone(&self.pubsub_manager);
             let shutdown = shutdown_notify.clone();
-            tokio::spawn(async move {
+            Some(tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         _ = shutdown.notified() => break,
@@ -418,12 +420,15 @@ impl Mint {
                         }
                     }
                 }
-            });
-        }
+            }))
+        } else {
+            None
+        };
 
         // Store the handles
         task_state.shutdown_notify = Some(shutdown_notify);
         task_state.supervisor_handle = Some(supervisor_handle);
+        task_state.keyset_drain_handle = keyset_drain_handle;
 
         // Give the background task a tiny bit of time to start waiting
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -447,6 +452,7 @@ impl Mint {
         // Take the handles out of the state
         let shutdown_notify = task_state.shutdown_notify.take();
         let supervisor_handle = task_state.supervisor_handle.take();
+        let keyset_drain_handle = task_state.keyset_drain_handle.take();
 
         // If nothing to stop, return early
         let (shutdown_notify, supervisor_handle) = match (shutdown_notify, supervisor_handle) {
@@ -477,6 +483,13 @@ impl Mint {
                 Err(Error::Internal)
             }
         };
+
+        // Wait for the keyset drain task to complete
+        if let Some(handle) = keyset_drain_handle {
+            if let Err(join_error) = handle.await {
+                tracing::error!("Keyset drain task panicked: {:?}", join_error);
+            }
+        }
 
         // Stop all payment processors
         self.stop_payment_processors().await?;
