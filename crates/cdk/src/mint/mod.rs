@@ -71,6 +71,13 @@ pub struct Mint {
     oidc_client: Option<OidcClient>,
     /// In-memory keyset
     keysets: Arc<ArcSwap<Vec<SignatoryKeySet>>>,
+    /// Serializes writes to `keysets`.
+    ///
+    /// Both a mint-initiated `rotate_keyset` and the signatory subscription
+    /// drain task replace the snapshot. Holding this lock across "read the
+    /// freshest signatory snapshot, then store it" makes the last write always
+    /// the newest one, so a stale snapshot can never overwrite a newer one.
+    keyset_store_lock: Arc<Mutex<()>>,
     /// Background task management
     task_state: Arc<Mutex<TaskState>>,
     /// Maximum number of inputs allowed per transaction
@@ -254,6 +261,7 @@ impl Mint {
             payment_processors,
             auth_localstore,
             keysets: Arc::new(ArcSwap::new(keysets.keysets.into())),
+            keyset_store_lock: Arc::new(Mutex::new(())),
             task_state: Arc::new(Mutex::new(TaskState {
                 keyset_updates: Some(keyset_updates),
                 ..Default::default()
@@ -366,6 +374,7 @@ impl Mint {
             Some(rx) => Some(rx),
             None => match self.signatory.subscribe_keysets().await {
                 Ok(mut rx) => {
+                    let _store = self.keyset_store_lock.lock().await;
                     let current = rx.borrow_and_update().keysets.clone();
                     if !current.is_empty() {
                         self.keysets.store(Arc::new(current));
@@ -382,6 +391,7 @@ impl Mint {
 
         if let Some(mut keyset_updates) = keyset_updates {
             let keysets = self.keysets.clone();
+            let keyset_store_lock = Arc::clone(&self.keyset_store_lock);
             let pubsub_manager = Arc::clone(&self.pubsub_manager);
             let shutdown = shutdown_notify.clone();
             tokio::spawn(async move {
@@ -393,6 +403,11 @@ impl Mint {
                                 // Signatory dropped the sender; stop draining.
                                 break;
                             }
+                            // Serialize with mint-initiated rotations: read the
+                            // freshest snapshot and store it under the lock, so a
+                            // concurrent rotate cannot land a stale snapshot after
+                            // this newer one.
+                            let _store = keyset_store_lock.lock().await;
                             let updated =
                                 keyset_updates.borrow_and_update().keysets.clone();
                             if updated.is_empty() {
@@ -1733,6 +1748,192 @@ mod tests {
         assert!(
             applied.is_ok(),
             "restart did not catch up on the snapshot pushed while stopped"
+        );
+
+        mint.stop().await.expect("mint should stop");
+    }
+
+    /// A single armed pause point for a `GatedSignatory::keysets` call.
+    struct Gate {
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    /// Wraps a real `DbSignatory`, delegating every call, but lets a test hold a
+    /// single `keysets()` call open: it reads the current snapshot, signals the
+    /// test, then blocks until released and returns the snapshot it read. This
+    /// reproduces the window where `Mint::rotate_keyset` has read a snapshot but
+    /// not yet stored it while another rotation lands, which without the shared
+    /// store lock let a stale write clobber a newer one in the keyset ArcSwap.
+    struct GatedSignatory {
+        inner: Arc<DbSignatory>,
+        gate: Mutex<Option<Gate>>,
+    }
+
+    impl GatedSignatory {
+        fn new(inner: Arc<DbSignatory>) -> Self {
+            Self {
+                inner,
+                gate: Mutex::new(None),
+            }
+        }
+
+        /// Arm the next `keysets()` call to pause. Returns a receiver that fires
+        /// once the call has read its snapshot, and a sender that releases it.
+        async fn arm(
+            &self,
+        ) -> (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ) {
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            *self.gate.lock().await = Some(Gate {
+                reached: reached_tx,
+                release: release_rx,
+            });
+            (reached_rx, release_tx)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Signatory for GatedSignatory {
+        fn name(&self) -> String {
+            self.inner.name()
+        }
+
+        async fn blind_sign(
+            &self,
+            blinded_messages: Vec<BlindedMessage>,
+        ) -> Result<Vec<BlindSignature>, Error> {
+            self.inner.blind_sign(blinded_messages).await
+        }
+
+        async fn verify_proofs(&self, proofs: Vec<cdk_common::Proof>) -> Result<(), Error> {
+            self.inner.verify_proofs(proofs).await
+        }
+
+        async fn keysets(&self) -> Result<SignatoryKeysets, Error> {
+            let snapshot = self.inner.keysets().await?;
+            let gate = self.gate.lock().await.take();
+            if let Some(gate) = gate {
+                let _ = gate.reached.send(());
+                let _ = gate.release.await;
+            }
+            Ok(snapshot)
+        }
+
+        async fn subscribe_keysets(&self) -> Result<watch::Receiver<SignatoryKeysets>, Error> {
+            self.inner.subscribe_keysets().await
+        }
+
+        async fn rotate_keyset(&self, args: RotateKeyArguments) -> Result<SignatoryKeySet, Error> {
+            self.inner.rotate_keyset(args).await
+        }
+    }
+
+    /// Regression test for the two-writer keyset race. A mint-initiated rotation
+    /// reads the signatory snapshot and then stores it, while the subscription
+    /// drain task also stores every published snapshot. If a newer rotation is
+    /// drained between the mint rotation's read and its store, the stale store
+    /// must not clobber the newer snapshot.
+    ///
+    /// The gate holds the mint rotation's `keysets()` read open while an
+    /// out-of-band rotation on another unit lands and is drained. When the
+    /// rotation resumes and stores its now-stale read, the shared store lock
+    /// serializes it with the drain so the newest snapshot still wins. Without
+    /// the lock the stale store sticks and this test times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotate_store_does_not_clobber_newer_drained_snapshot() {
+        let amounts: Vec<u64> = (0..4).map(|i| 2u64.pow(i)).collect();
+        let mut supported_units = HashMap::new();
+        supported_units.insert(CurrencyUnit::Sat, (0u64, amounts.clone()));
+        supported_units.insert(CurrencyUnit::Msat, (0u64, amounts.clone()));
+
+        let store = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("in-memory db"),
+        );
+        let inner = Arc::new(
+            DbSignatory::new(
+                store,
+                b"gated-signatory-seed",
+                supported_units.clone(),
+                Default::default(),
+            )
+            .await
+            .expect("DbSignatory::new"),
+        );
+        // Seed an active keyset for each unit.
+        for (unit, (fee, amts)) in &supported_units {
+            inner
+                .rotate_keyset(RotateKeyArguments {
+                    unit: unit.clone(),
+                    amounts: amts.clone(),
+                    input_fee_ppk: *fee,
+                    keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
+                    final_expiry: None,
+                })
+                .await
+                .expect("seed rotate");
+        }
+
+        let gated = Arc::new(GatedSignatory::new(inner));
+        let mint = create_mint_with_signatory(gated.clone()).await;
+        mint.start().await.expect("mint should start");
+
+        // Arm the gate, then start a mint-initiated Sat rotation. It commits the
+        // new Sat keyset, then reads a snapshot that still predates the Msat
+        // rotation below, and blocks before storing it.
+        let (reached, release) = gated.arm().await;
+        let mint_c = mint.clone();
+        let amts = amounts.clone();
+        let rotate = tokio::spawn(async move {
+            mint_c
+                .rotate_keyset(CurrencyUnit::Sat, amts, 0, true, None)
+                .await
+        });
+
+        // Wait until the rotation has read its soon-to-be-stale snapshot.
+        reached.await.expect("rotation reached the gate");
+
+        // Land an out-of-band Msat rotation; the drain applies the newer
+        // snapshot while the mint rotation is still parked at the gate.
+        let mut changes = mint.subscribe_keyset_changes();
+        let rotated_msat = mint
+            .signatory
+            .rotate_keyset(RotateKeyArguments {
+                unit: CurrencyUnit::Msat,
+                amounts: amounts.clone(),
+                input_fee_ppk: 0,
+                keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
+                final_expiry: None,
+            })
+            .await
+            .expect("out-of-band msat rotate");
+
+        // Release the parked rotation; its stale store must not win.
+        release.send(()).expect("release the gate");
+        let sat_info = rotate.await.expect("join").expect("mint rotate");
+
+        // The cache must converge to hold BOTH the new Sat and the new Msat
+        // keyset. A stale rotate store drops the drained Msat keyset and never
+        // recovers, so this loop would time out.
+        let converged = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ids: Vec<Id> = mint.keysets.load().iter().map(|k| k.id).collect();
+                if ids.contains(&sat_info.id) && ids.contains(&rotated_msat.id) {
+                    break;
+                }
+                let _ = changes.recv().await;
+            }
+        })
+        .await;
+
+        assert!(
+            converged.is_ok(),
+            "stale rotate store clobbered the newer drained Msat keyset"
         );
 
         mint.stop().await.expect("mint should stop");
