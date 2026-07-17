@@ -362,8 +362,8 @@ impl Mint {
         });
 
         // Keyset refresh: drain signatory keyset updates into the in-memory
-        // keysets and notify subscribers. A signatory-side rotation reaches the
-        // mint here without a restart or a mint-initiated rotate.
+        // keysets. A signatory-side rotation reaches the mint here without a
+        // restart or a mint-initiated rotate.
         //
         // The receiver is normally the one retained from construction, whose
         // cursor is pinned to the bootstrapped snapshot. On a restart after
@@ -380,7 +380,6 @@ impl Mint {
                     let current = rx.borrow_and_update().keysets.clone();
                     if !current.is_empty() {
                         self.keysets.store(Arc::new(current));
-                        self.pubsub_manager.notify_keysets_changed();
                     }
                     Some(rx)
                 }
@@ -394,7 +393,6 @@ impl Mint {
         let keyset_drain_handle = if let Some(mut keyset_updates) = keyset_updates {
             let keysets = self.keysets.clone();
             let keyset_store_lock = Arc::clone(&self.keyset_store_lock);
-            let pubsub_manager = Arc::clone(&self.pubsub_manager);
             let shutdown = shutdown_notify.clone();
             Some(tokio::spawn(async move {
                 loop {
@@ -416,7 +414,6 @@ impl Mint {
                                 continue;
                             }
                             keysets.store(Arc::new(updated));
-                            pubsub_manager.notify_keysets_changed();
                         }
                     }
                 }
@@ -1559,7 +1556,6 @@ mod tests {
         let mint = create_mint_with_signatory(mock.clone()).await;
         mint.start().await.expect("mint should start");
 
-        let mut changes = mint.subscribe_keyset_changes();
         let before: Vec<Id> = mint.keysets.load().iter().map(|k| k.id).collect();
         assert!(
             !before.contains(&new_id),
@@ -1574,7 +1570,7 @@ mod tests {
                 if mint.keysets.load().iter().any(|k| k.id == new_id) {
                     break;
                 }
-                let _ = changes.recv().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;
@@ -1598,7 +1594,6 @@ mod tests {
         let mock = Arc::new(MockSignatory::new(snaps[0].clone()));
         let mint = create_mint_with_signatory(mock.clone()).await;
         mint.start().await.expect("mint should start");
-        let mut changes = mint.subscribe_keyset_changes();
 
         // Two injections back-to-back: the watch keeps only the latest, so the
         // mint must settle on C even if B is never observed.
@@ -1610,7 +1605,7 @@ mod tests {
                 if mint.keysets.load().iter().any(|k| k.id == c_id) {
                     break;
                 }
-                let _ = changes.recv().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;
@@ -1640,19 +1635,15 @@ mod tests {
         let mock = Arc::new(MockSignatory::new(seed));
         let mint = create_mint_with_signatory(mock.clone()).await;
         mint.start().await.expect("mint should start");
-        let mut changes = mint.subscribe_keyset_changes();
 
-        // An empty snapshot must be dropped by the drain guard: no store, no
-        // notification.
+        // An empty snapshot must be dropped by the drain guard: the mint
+        // keysets stay untouched.
         mock.push(SignatoryKeysets {
             pubkey: seed_pubkey,
             keysets: vec![],
         });
-        let notified = tokio::time::timeout(Duration::from_millis(200), changes.recv()).await;
-        assert!(
-            notified.is_err(),
-            "empty snapshot must not fire a change notification"
-        );
+        // Give the drain task time to observe and discard the empty snapshot.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let current: Vec<Id> = mint.keysets.load().iter().map(|k| k.id).collect();
         assert_eq!(
             current, seed_ids,
@@ -1667,7 +1658,7 @@ mod tests {
                 if mint.keysets.load().iter().any(|k| k.id == next_id) {
                     break;
                 }
-                let _ = changes.recv().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;
@@ -1704,7 +1695,6 @@ mod tests {
         );
         mock.push(next);
 
-        let mut changes = mint.subscribe_keyset_changes();
         mint.start().await.expect("mint should start");
 
         // No push after start(): the mint must converge to B purely from the
@@ -1714,7 +1704,7 @@ mod tests {
                 if mint.keysets.load().iter().any(|k| k.id == new_id) {
                     break;
                 }
-                let _ = changes.recv().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;
@@ -1745,7 +1735,6 @@ mod tests {
         // Rotate while stopped: the drain task is gone, so the ArcSwap is stale.
         mock.push(next);
 
-        let mut changes = mint.subscribe_keyset_changes();
         mint.start().await.expect("mint should restart");
 
         let applied = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1753,7 +1742,7 @@ mod tests {
                 if mint.keysets.load().iter().any(|k| k.id == new_id) {
                     break;
                 }
-                let _ = changes.recv().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;
@@ -1913,7 +1902,6 @@ mod tests {
 
         // Land an out-of-band Msat rotation; the drain applies the newer
         // snapshot while the mint rotation is still parked at the gate.
-        let mut changes = mint.subscribe_keyset_changes();
         let rotated_msat = mint
             .signatory
             .rotate_keyset(RotateKeyArguments {
@@ -1939,7 +1927,7 @@ mod tests {
                 if ids.contains(&sat_info.id) && ids.contains(&rotated_msat.id) {
                     break;
                 }
-                let _ = changes.recv().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;
@@ -2424,7 +2412,6 @@ mod tests {
         let mint = create_mint(config).await;
         mint.start().await.expect("mint should start");
 
-        let mut changes = mint.subscribe_keyset_changes();
         let before: Vec<Id> = mint.keysets.load().iter().map(|k| k.id).collect();
 
         // Rotate directly on the signatory, out of band from the mint. Without
@@ -2446,15 +2433,14 @@ mod tests {
             "rotated keyset should be new"
         );
 
-        // The drain task should observe the pushed update, store it, and notify.
-        // The store happens before the notification, so a received notification
-        // implies the keyset is already applied.
+        // The drain task should observe the pushed update and store it, so
+        // polling the in-memory keysets eventually sees the rotated keyset.
         let applied = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if mint.keysets.load().iter().any(|k| k.id == rotated.id) {
                     break;
                 }
-                let _ = changes.recv().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;

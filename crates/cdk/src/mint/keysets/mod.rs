@@ -68,15 +68,6 @@ impl Mint {
             .map(|x| x.into())
     }
 
-    /// Subscribe to keyset-change notifications.
-    ///
-    /// A message is emitted whenever the in-memory keysets are replaced, for
-    /// example after a signatory-side rotation. Consumers should re-read the
-    /// keysets rather than rely on the message payload.
-    pub fn subscribe_keyset_changes(&self) -> tokio::sync::broadcast::Receiver<()> {
-        self.pubsub_manager.subscribe_keyset_changes()
-    }
-
     /// Add current keyset to inactive keysets
     /// Generate new keyset
     #[instrument(skip(self))]

@@ -13,8 +13,8 @@ and re-reads them only when it is the one that called `rotate_keyset`. A
 keyset rotated on the signatory side, out of band from a given mint instance,
 is never seen, and `SignatoryRpcClient` has no reconnect that would re-sync
 after a dropped connection. How does the signatory push keyset changes to the
-mint, re-inject the current set after a gRPC reconnect, and let the mint notify
-wallets, without breaking the key-segregation boundary from ADR 0001?
+mint and re-inject the current set after a gRPC reconnect, without breaking the
+key-segregation boundary from ADR 0001?
 
 ## Decision Drivers
 
@@ -62,14 +62,14 @@ The trait exposes an `mpsc::Receiver<SignatoryKeysets>`; the mint drains it.
 #### `watch` receiver drained into the mint's `ArcSwap`
 
 The trait exposes a `watch::Receiver<SignatoryKeysets>`; the mint drains it
-into its existing `ArcSwap` and notifies wallets on each change.
+into its existing `ArcSwap` on each change.
 
 **Pros:**
 
 * Good, because `watch` retains only the latest value (like `ArcSwap`) so a
   slow consumer never accumulates stale versions.
-* Good, because it wakes the consumer on change (like `mpsc`) so the mint can
-  react: notify wallets, log, refresh derived state.
+* Good, because it wakes the drain task on change (like `mpsc`), so the mint
+  applies the new snapshot without polling the signatory.
 * Good, because the mint keeps its storage type private to itself.
 
 **Cons:**
@@ -143,23 +143,23 @@ tokio::spawn(async move {
     while rx.changed().await.is_ok() {
         let ks = rx.borrow_and_update().clone();
         keysets.store(Arc::new(ks.keysets));   // same store() rotate uses today
-        pubsub_manager.notify_keysets_changed();
     }
 });
 ```
 
-**Keyset-change notification.** The mint drain task fires
-`PubSubManager::notify_keysets_changed()` after each swap. This is backed by an
-in-process `tokio::sync::broadcast` channel on the `PubSubManager`, exposed to
-the rest of CDK through `Mint::subscribe_keyset_changes()`. The payload is a
-bare signal: consumers re-read the keysets rather than trust a message body.
+**No change notification.** The drain task only stores the new snapshot into
+the `ArcSwap`. Readers already load it lock-free on every request, so there is
+nothing for an in-process consumer to subscribe to: the next read sees the new
+keysets. An earlier revision added a `tokio::sync::broadcast` signal
+(`notify_keysets_changed` / `subscribe_keyset_changes`), but nothing in the
+mint consumed it, so it was removed rather than kept as speculative plumbing.
 
 The over-the-wire NUT-17 notification to wallets is deferred. NUT-17 today
 carries only quote and proof-state kinds, and a `KeysetsChanged` kind would
 have to be added to the shared `cashu` protocol crate (`NotificationPayload`,
 `Kind`, and the WS layer), which is a protocol change worth proposing upstream
-on its own. The in-process broadcast is the seam a future WS bridge would hang
-off, so adding the wire event later does not change the mint-side plumbing.
+on its own. If that lands, the drain task is where a wire event would be
+emitted; adding it then does not change the storage path.
 
 ### Positive Consequences
 
@@ -167,8 +167,8 @@ off, so adding the wire event later does not change the mint-side plumbing.
   mint-initiated rotate.
 * gRPC reconnect re-syncs keysets by construction, closing the no-reconnect
   gap from ADR 0001.
-* In-process consumers are notified of a keyset change instead of polling, and
-  the seam for a future wallet-facing WS notification is in place.
+* Readers see the new keysets on their next lock-free `ArcSwap` load, with no
+  polling of the signatory and no separate notification channel to maintain.
 * The private-key boundary from ADR 0001 is preserved: only public
   `SignatoryKeysets` cross the trait, and the mint's storage type stays
   private.
@@ -179,8 +179,9 @@ off, so adding the wire event later does not change the mint-side plumbing.
   keep working through the unary `Keysets` path; the subscription is additive.
 * One background task per mint (drain) and one per gRPC client (reconnect),
   plus a watch channel in `DbSignatory`.
-* Wallets are not yet notified over the wire: the keyset-change notification is
-  in-process only until a NUT-17 keyset kind is added to the `cashu` crate.
+* Wallets are not yet notified over the wire: they still learn about a rotation
+  only by re-fetching keysets, until a NUT-17 keyset kind is added to the
+  `cashu` crate.
 * Every `Signatory` implementation must implement `subscribe_keysets`,
   including the embedded wrapper.
 
