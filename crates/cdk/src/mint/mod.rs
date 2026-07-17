@@ -13,11 +13,11 @@ use cdk_common::payment::{DynMintPayment, WaitPaymentResponse};
 pub use cdk_common::quote_id::QuoteId;
 #[cfg(feature = "prometheus")]
 use cdk_prometheus::MintMetricGuard;
-use cdk_signatory::signatory::{Signatory, SignatoryKeySet};
+use cdk_signatory::signatory::{Signatory, SignatoryKeySet, SignatoryKeysets};
 use futures::StreamExt;
 use nut21::ProtectedEndpoint;
 use subscription::PubSubManager;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{watch, Mutex, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::instrument;
 
@@ -92,6 +92,9 @@ struct TaskState {
     shutdown_notify: Option<Arc<Notify>>,
     /// Handle to the main supervisor task
     supervisor_handle: Option<JoinHandle<Result<(), Error>>>,
+    /// Keyset subscription retained from construction, drained once by the first
+    /// `start()`. `None` after it has been taken; a restart re-subscribes.
+    keyset_updates: Option<watch::Receiver<SignatoryKeysets>>,
 }
 
 impl Mint {
@@ -149,7 +152,13 @@ impl Mint {
         max_inputs: usize,
         max_outputs: usize,
     ) -> Result<Self, Error> {
-        let keysets = signatory.keysets().await?;
+        // Subscribe up front and bootstrap the in-memory snapshot from the same
+        // receiver that keeps it fresh. `borrow_and_update` pins the receiver
+        // cursor to this snapshot, so any signatory rotation that lands before
+        // `start()` spawns the drain task makes the loop's first `changed()`
+        // return immediately instead of being silently skipped.
+        let mut keyset_updates = signatory.subscribe_keysets().await?;
+        let keysets = keyset_updates.borrow_and_update().clone();
         if !keysets
             .keysets
             .iter()
@@ -245,7 +254,10 @@ impl Mint {
             payment_processors,
             auth_localstore,
             keysets: Arc::new(ArcSwap::new(keysets.keysets.into())),
-            task_state: Arc::new(Mutex::new(TaskState::default())),
+            task_state: Arc::new(Mutex::new(TaskState {
+                keyset_updates: Some(keyset_updates),
+                ..Default::default()
+            })),
             max_inputs,
             max_outputs,
         })
@@ -342,35 +354,56 @@ impl Mint {
         // Keyset refresh: drain signatory keyset updates into the in-memory
         // keysets and notify subscribers. A signatory-side rotation reaches the
         // mint here without a restart or a mint-initiated rotate.
-        match self.signatory.subscribe_keysets().await {
-            Ok(mut keyset_updates) => {
-                let keysets = self.keysets.clone();
-                let pubsub_manager = Arc::clone(&self.pubsub_manager);
-                let shutdown = shutdown_notify.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            _ = shutdown.notified() => break,
-                            changed = keyset_updates.changed() => {
-                                if changed.is_err() {
-                                    // Signatory dropped the sender; stop draining.
-                                    break;
-                                }
-                                let updated =
-                                    keyset_updates.borrow_and_update().keysets.clone();
-                                if updated.is_empty() {
-                                    continue;
-                                }
-                                keysets.store(Arc::new(updated));
-                                pubsub_manager.notify_keysets_changed();
+        //
+        // The receiver is normally the one retained from construction, whose
+        // cursor is pinned to the bootstrapped snapshot. On a restart after
+        // `stop()` that receiver was already consumed, so re-subscribe. A fresh
+        // `subscribe()` marks the current value as seen, so the re-subscribe
+        // branch applies the current snapshot immediately before waiting for the
+        // next change; the retained branch does not, since construction already
+        // seeded the same snapshot into the ArcSwap.
+        let keyset_updates = match task_state.keyset_updates.take() {
+            Some(rx) => Some(rx),
+            None => match self.signatory.subscribe_keysets().await {
+                Ok(mut rx) => {
+                    let current = rx.borrow_and_update().keysets.clone();
+                    if !current.is_empty() {
+                        self.keysets.store(Arc::new(current));
+                        self.pubsub_manager.notify_keysets_changed();
+                    }
+                    Some(rx)
+                }
+                Err(err) => {
+                    tracing::warn!("Could not subscribe to signatory keyset updates: {}", err);
+                    None
+                }
+            },
+        };
+
+        if let Some(mut keyset_updates) = keyset_updates {
+            let keysets = self.keysets.clone();
+            let pubsub_manager = Arc::clone(&self.pubsub_manager);
+            let shutdown = shutdown_notify.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = shutdown.notified() => break,
+                        changed = keyset_updates.changed() => {
+                            if changed.is_err() {
+                                // Signatory dropped the sender; stop draining.
+                                break;
                             }
+                            let updated =
+                                keyset_updates.borrow_and_update().keysets.clone();
+                            if updated.is_empty() {
+                                continue;
+                            }
+                            keysets.store(Arc::new(updated));
+                            pubsub_manager.notify_keysets_changed();
                         }
                     }
-                });
-            }
-            Err(err) => {
-                tracing::warn!("Could not subscribe to signatory keyset updates: {}", err);
-            }
+                }
+            });
         }
 
         // Store the handles
@@ -1613,6 +1646,93 @@ mod tests {
         assert!(
             applied.is_ok(),
             "valid snapshot after an empty one should still propagate"
+        );
+
+        mint.stop().await.expect("mint should stop");
+    }
+
+    /// Regression test for the bootstrap/subscribe race: a rotation that lands
+    /// between mint construction and `start()` must still reach the mint.
+    ///
+    /// The subscription is now both the bootstrap and the update source, so the
+    /// snapshot pushed in that window is delivered by the drain task's first
+    /// `changed()`. Under the old two-phase bootstrap (unary `keysets()` in the
+    /// constructor, `subscribe_keysets()` later in `start()`) this snapshot was
+    /// silently skipped until the next rotation, and this test would time out.
+    #[tokio::test]
+    async fn rotation_between_construction_and_start_is_not_missed() {
+        let snaps = rotated_snapshots(2).await;
+        let next = snaps[1].clone();
+        let new_id = active_sat_id(&next);
+
+        let mock = Arc::new(MockSignatory::new(snaps[0].clone()));
+        let mint = create_mint_with_signatory(mock.clone()).await;
+
+        // The mint bootstrapped snapshot A. Rotate to B *before* start() spawns
+        // the drain task: this is exactly the window the old bootstrap missed.
+        assert!(
+            !mint.keysets.load().iter().any(|k| k.id == new_id),
+            "bootstrapped snapshot must not already contain the rotated keyset"
+        );
+        mock.push(next);
+
+        let mut changes = mint.subscribe_keyset_changes();
+        mint.start().await.expect("mint should start");
+
+        // No push after start(): the mint must converge to B purely from the
+        // snapshot that landed in the construction-to-start window.
+        let applied = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if mint.keysets.load().iter().any(|k| k.id == new_id) {
+                    break;
+                }
+                let _ = changes.recv().await;
+            }
+        })
+        .await;
+
+        assert!(
+            applied.is_ok(),
+            "snapshot pushed before start() did not reach the mint"
+        );
+
+        mint.stop().await.expect("mint should stop");
+    }
+
+    /// A restart after `stop()` re-subscribes (the retained receiver was
+    /// consumed by the first `start()`) and must catch up on any snapshot that
+    /// landed while the drain task was stopped.
+    #[tokio::test]
+    async fn restart_catches_up_on_missed_rotation() {
+        let snaps = rotated_snapshots(2).await;
+        let next = snaps[1].clone();
+        let new_id = active_sat_id(&next);
+
+        let mock = Arc::new(MockSignatory::new(snaps[0].clone()));
+        let mint = create_mint_with_signatory(mock.clone()).await;
+
+        mint.start().await.expect("mint should start");
+        mint.stop().await.expect("mint should stop");
+
+        // Rotate while stopped: the drain task is gone, so the ArcSwap is stale.
+        mock.push(next);
+
+        let mut changes = mint.subscribe_keyset_changes();
+        mint.start().await.expect("mint should restart");
+
+        let applied = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if mint.keysets.load().iter().any(|k| k.id == new_id) {
+                    break;
+                }
+                let _ = changes.recv().await;
+            }
+        })
+        .await;
+
+        assert!(
+            applied.is_ok(),
+            "restart did not catch up on the snapshot pushed while stopped"
         );
 
         mint.stop().await.expect("mint should stop");
