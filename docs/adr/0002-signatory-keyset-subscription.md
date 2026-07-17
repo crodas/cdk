@@ -91,9 +91,13 @@ async fn subscribe_keysets(&self)
     -> Result<tokio::sync::watch::Receiver<SignatoryKeysets>, Error>;
 ```
 
-The existing `keysets()` method stays; the mint uses it for the synchronous
-bootstrap at construction, and `subscribe_keysets()` handles every update
-after that.
+The existing `keysets()` method stays. The mint uses it for the synchronous
+bootstrap at construction and for the read-back inside a mint-initiated
+`rotate_keyset`, which reloads the fresh snapshot right after rotating.
+`subscribe_keysets()` covers the updates that path misses: a rotation performed
+out of band on the signatory and a re-sync after a dropped gRPC connection. Both
+paths write the same `ArcSwap`, serialized by the keyset store lock so the last
+write is always the newest snapshot.
 
 **gRPC contract.** One server-streaming RPC, reusing existing messages:
 
