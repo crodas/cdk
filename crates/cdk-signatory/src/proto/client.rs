@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use cdk_common::error::Error;
-use cdk_common::grpc::{supervise_stream, BackoffPolicy, VersionInterceptor, VERSION_SIGNATORY_HEADER};
+use cdk_common::grpc::{VersionInterceptor, VERSION_SIGNATORY_HEADER};
+use cdk_common::stream::{supervise_stream, BackoffPolicy};
 use cdk_common::{BlindSignature, BlindedMessage, Proof};
 use tokio::sync::watch;
 use tonic::codegen::InterceptedService;
@@ -112,13 +113,18 @@ impl SignatoryRpcClient {
                             .map(tonic::Response::into_inner)
                     }
                 },
-                |message| match keys_response_into_keysets(message) {
-                    Ok(keysets) => {
-                        keyset_updates_tx.send_replace(keysets);
+                |message| {
+                    // Decoding and publishing is synchronous; return a ready
+                    // future so the handler borrows nothing.
+                    match keys_response_into_keysets(message) {
+                        Ok(keysets) => {
+                            keyset_updates_tx.send_replace(keysets);
+                        }
+                        Err(err) => {
+                            tracing::warn!("Invalid keyset update from signatory: {err}");
+                        }
                     }
-                    Err(err) => {
-                        tracing::warn!("Invalid keyset update from signatory: {err}");
-                    }
+                    std::future::ready(())
                 },
             )
             .await;
