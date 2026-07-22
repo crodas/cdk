@@ -62,9 +62,19 @@ The live Python test in `tests/test_live_async_onchain_melt.py` covers
 
 ## Language Packages
 
-For production use, see language-specific repositories:
+For production use, install from the published package registries:
 
-- [cdk-swift](https://github.com/cashubtc/cdk-swift) - iOS/macOS packages
-- [cdk-kotlin](https://github.com/cashubtc/cdk-kotlin) - Android/JVM packages  
-- [cdk-go](https://github.com/cashubtc/cdk-go) - Golang packages
-- [cdk-python](https://github.com/cashubtc/cdk-python) - PyPI packages
+| Language | Distribution | Coordinates |
+|---|---|---|
+| Kotlin / Android / JVM | [Maven Central](https://central.sonatype.com/namespace/org.cashudevkit) | `org.cashudevkit:cdk-android`, `org.cashudevkit:cdk-jvm`, `org.cashudevkit:cdk-jvm-natives` |
+| Swift | Swift Package Manager | [cdk-swift](https://github.com/cashubtc/cdk-swift) |
+| Go | Go modules | [cdk-go](https://github.com/cashubtc/cdk-go) |
+| Python | PyPI | [cdk-python](https://github.com/cashubtc/cdk-python) |
+
+The Kotlin artifacts are published directly to Maven Central under the
+`org.cashudevkit` namespace. Android apps depend on `cdk-android`; desktop JVM
+apps depend on `cdk-jvm` plus `cdk-jvm-natives`. See
+[`bindings/kotlin/README.md`](../../bindings/kotlin/README.md) for coordinates
+and install snippets. The `cashubtc/cdk-kotlin` repository is only the internal
+release target for the publish workflow; consumers should not depend on it
+directly.

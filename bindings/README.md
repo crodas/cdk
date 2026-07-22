@@ -50,6 +50,7 @@ own `uniffi.toml` controlling language-specific code generation.
 |----------|-----------|--------|-------|------|
 | **Dart** | `bindings/dart/` | Active | `just binding-dart` | `just test-dart` |
 | **Swift** | `bindings/swift/` | Active | CI workflow | `just test-swift` |
+| **Kotlin** | `bindings/kotlin/` | Active | `just binding-kotlin` | `just test-kotlin` |
 
 ### Dart
 
