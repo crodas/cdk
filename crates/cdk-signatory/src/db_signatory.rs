@@ -215,7 +215,7 @@ impl DbSignatory {
             return Ok(());
         }
 
-        for info in due {
+        for (i, info) in due.iter().enumerate() {
             let active_age = now.saturating_sub(info.valid_from);
             let final_expiry = info
                 .final_expiry
@@ -229,17 +229,24 @@ impl DbSignatory {
                 max_age
             );
 
-            self.commit_rotated_keyset(
-                RotateKeyArguments {
-                    unit: info.unit.clone(),
-                    amounts: info.amounts.clone(),
-                    input_fee_ppk: info.input_fee_ppk,
-                    keyset_id_type: info.id.get_version(),
-                    final_expiry,
-                },
-                &snapshot,
-            )
-            .await?;
+            if let Err(err) = self
+                .commit_rotated_keyset(
+                    RotateKeyArguments {
+                        unit: info.unit.clone(),
+                        amounts: info.amounts.clone(),
+                        input_fee_ppk: info.input_fee_ppk,
+                        keyset_id_type: info.id.get_version(),
+                        final_expiry,
+                    },
+                    &snapshot,
+                )
+                .await
+            {
+                if i > 0 {
+                    self.reload_keys_from_db().await?;
+                }
+                return Err(err);
+            }
         }
 
         // Reload once for the whole pass, after every rotation has been
