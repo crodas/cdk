@@ -47,6 +47,14 @@ pub struct DbSignatory {
     /// only wrap the synchronous swap, so signing is not blocked during the
     /// read.
     reload_lock: tokio::sync::Mutex<()>,
+    /// Serializes keyset rotations (`rotate_keyset` and `rotate_aged_keysets`).
+    /// A rotation reads the unit's current active keyset id, derives the next
+    /// derivation index from it, then commits. Two rotations interleaving those
+    /// steps for the same unit would both read the same index and write
+    /// conflicting keysets, so each rotation holds this lock across its DB
+    /// commit and the reload. Signing is unaffected: it only takes the
+    /// `keysets` read lock.
+    rotation_lock: tokio::sync::Mutex<()>,
 }
 
 impl DbSignatory {
@@ -85,6 +93,7 @@ impl DbSignatory {
             xpriv,
             keyset_updates,
             reload_lock: Default::default(),
+            rotation_lock: Default::default(),
         };
         keys.reload_keys_from_db().await?;
 
@@ -168,40 +177,45 @@ impl DbSignatory {
     /// This runs directly against the signatory's own `RwLock`-guarded state
     /// rather than through the embedded actor, because the age check needs each
     /// keyset's `valid_from`, which does not cross the `Signatory` trait. The
-    /// locks make concurrent signing requests safe; the only real contention is
-    /// a mint-initiated `rotate_keyset` for the same unit, which the per-unit
-    /// recheck below guards against.
+    /// `rotation_lock` held for the whole pass makes it exclusive with
+    /// `rotate_keyset`, so a mint-initiated rotation cannot interleave with the
+    /// automatic one and double-rotate a unit.
     async fn rotate_aged_keysets(&self, max_age: Duration) -> Result<(), Error> {
         let now = unix_time();
         let max_age = max_age.as_secs();
 
-        let due: Vec<MintKeySetInfo> = {
+        if max_age == 0 {
+            return Ok(());
+        }
+
+        // Snapshot the due keysets and the collision-check set from short-lived
+        // read locks, released before the commits. `commit_rotated_keyset`
+        // takes the snapshot as an argument precisely so it never locks
+        // `keysets` itself, and holding a `keysets` lock across the loop would
+        // block signing (and deadlock the reload, which takes `keysets` write).
+        let (due, snapshot): (Vec<_>, Vec<_>) = {
             let keysets = self.keysets.read().await;
             let active_keysets = self.active_keysets.read().await;
-            active_keysets
+            let due = active_keysets
                 .values()
                 .filter_map(|id| keysets.get(id).map(|(info, _)| info.clone()))
                 .filter(|info| now.saturating_sub(info.valid_from) >= max_age)
-                .collect()
+                .collect();
+            let snapshot = keysets.values().map(|k| k.into()).collect();
+            (due, snapshot)
         };
 
-        for info in due {
-            // Another rotation may have landed between snapshotting `due` and
-            // reaching this unit (for example a mint-initiated rotate). If the
-            // unit's active keyset is no longer the one judged due, it was
-            // already advanced; skip to avoid issuing a redundant keyset. A tiny
-            // race remains before `rotate_keyset` re-reads the active id, but its
-            // worst case is one extra keyset, never inconsistent state.
-            let still_active = self.active_keysets.read().await.get(&info.unit).copied();
-            if still_active != Some(info.id) {
-                tracing::debug!(
-                    "Skipping auto-rotation of keyset {} for unit {}: already rotated",
-                    info.id,
-                    info.unit
-                );
-                continue;
-            }
+        if due.is_empty() {
+            return Ok(());
+        }
 
+        // Hold the rotation lock for the whole pass so no `rotate_keyset` (or
+        // another pass) can commit between our snapshot and reload. With it
+        // held, the active keysets cannot change underneath us, so the `due`
+        // set stays accurate through the loop.
+        let _rotation = self.rotation_lock.lock().await;
+
+        for info in due {
             let active_age = now.saturating_sub(info.valid_from);
             let final_expiry = info
                 .final_expiry
@@ -215,15 +229,22 @@ impl DbSignatory {
                 max_age
             );
 
-            self.rotate_keyset(RotateKeyArguments {
-                unit: info.unit.clone(),
-                amounts: info.amounts.clone(),
-                input_fee_ppk: info.input_fee_ppk,
-                keyset_id_type: info.id.get_version(),
-                final_expiry,
-            })
+            self.commit_rotated_keyset(
+                RotateKeyArguments {
+                    unit: info.unit.clone(),
+                    amounts: info.amounts.clone(),
+                    input_fee_ppk: info.input_fee_ppk,
+                    keyset_id_type: info.id.get_version(),
+                    final_expiry,
+                },
+                &snapshot,
+            )
             .await?;
         }
+
+        // Reload once for the whole pass, after every rotation has been
+        // committed, so subscribers see a single updated snapshot.
+        self.reload_keys_from_db().await?;
 
         Ok(())
     }
@@ -377,6 +398,34 @@ impl Signatory for DbSignatory {
     /// Generate new keyset
     #[tracing::instrument(skip(self))]
     async fn rotate_keyset(&self, args: RotateKeyArguments) -> Result<SignatoryKeySet, Error> {
+        let _rotation = self.rotation_lock.lock().await;
+        let current = self.keysets().await?;
+        let (info, keyset) = self.commit_rotated_keyset(args, &current.keysets).await?;
+        self.reload_keys_from_db().await?;
+        Ok((&(info, keyset)).into())
+    }
+}
+
+impl DbSignatory {
+    /// Persist the next keyset for `args.unit` and mark it active in the
+    /// database, returning the committed keyset.
+    ///
+    /// This does not touch the in-memory maps, take a keyset lock, or publish
+    /// an update. The caller must call `reload_keys_from_db` once after it has
+    /// committed its rotations, so a batch (auto-rotation) reloads a single
+    /// time.
+    ///
+    /// The current keyset snapshot used for the collision check is injected by
+    /// the caller rather than read here. That keeps this method from taking the
+    /// `keysets` read lock: `rotate_aged_keysets` calls it while holding the
+    /// `active_keysets` write lock, and `reload_keys_from_db` takes the two
+    /// locks in the opposite order (`keysets` then `active_keysets`), so
+    /// acquiring `keysets` here could deadlock against a concurrent reload.
+    async fn commit_rotated_keyset(
+        &self,
+        args: RotateKeyArguments,
+        current_keysets: &[SignatoryKeySet],
+    ) -> Result<(MintKeySetInfo, MintKeySet), Error> {
         let (path_index, amounts) = if let Some(current_keyset_id) =
             self.localstore.get_active_keyset_id(&args.unit).await?
         {
@@ -421,8 +470,7 @@ impl Signatory for DbSignatory {
             args.keyset_id_type,
         );
 
-        let keysets = self.keysets().await?;
-        check_unit_string_collision(keysets.keysets, &info)?;
+        check_unit_string_collision(current_keysets, &info)?;
 
         let id = info.id;
         let mut tx = self.localstore.begin_transaction().await?;
@@ -430,9 +478,7 @@ impl Signatory for DbSignatory {
         tx.set_active_keyset(args.unit, id).await?;
         tx.commit().await?;
 
-        self.reload_keys_from_db().await?;
-
-        Ok((&(info, keyset)).into())
+        Ok((info, keyset))
     }
 }
 
@@ -490,35 +536,23 @@ mod test {
 
     #[tokio::test]
     async fn rotate_aged_keysets_respects_age() {
-        let store = Arc::new(
-            cdk_sqlite::mint::memory::empty()
-                .await
-                .expect("in-memory db"),
-        );
-        let signatory = DbSignatory::new(
-            store,
-            b"test-seed-for-aged-rotation",
-            Default::default(),
-            Default::default(),
+        let signatory = test_signatory(b"test-seed-for-aged-rotation").await;
+
+        // Seed one keyset aged 120 seconds.
+        let seeded = seed_aged_keyset(
+            &signatory,
+            CurrencyUnit::Sat,
+            &[1, 2, 4, 8],
+            0,
+            cdk_common::nut02::KeySetVersion::Version00,
+            None,
+            120,
         )
-        .await
-        .expect("DbSignatory::new");
+        .await;
 
-        let original = signatory
-            .rotate_keyset(RotateKeyArguments {
-                unit: CurrencyUnit::Sat,
-                amounts: vec![1, 2, 4, 8],
-                input_fee_ppk: 0,
-                keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
-                final_expiry: None,
-            })
-            .await
-            .expect("rotate_keyset");
-
-        // A keyset created moments ago has not reached a one second age, so it
-        // is left in place.
+        // An interval larger than the keyset's age leaves it in place.
         signatory
-            .rotate_aged_keysets(Duration::from_secs(1))
+            .rotate_aged_keysets(Duration::from_secs(600))
             .await
             .expect("rotate_aged_keysets");
         assert_eq!(
@@ -528,13 +562,13 @@ mod test {
                 .await
                 .get(&CurrencyUnit::Sat)
                 .expect("active sat keyset"),
-            original.id,
+            seeded,
             "keyset younger than the interval must not rotate"
         );
 
-        // With a zero interval every active keyset is due, so it rotates.
+        // An interval below the keyset's age makes it due, so it rotates.
         signatory
-            .rotate_aged_keysets(Duration::from_secs(0))
+            .rotate_aged_keysets(Duration::from_secs(60))
             .await
             .expect("rotate_aged_keysets");
         assert_ne!(
@@ -544,49 +578,35 @@ mod test {
                 .await
                 .get(&CurrencyUnit::Sat)
                 .expect("active sat keyset"),
-            original.id,
+            seeded,
             "keyset at or past the interval must rotate"
         );
     }
 
     #[tokio::test]
     async fn spawn_auto_rotation_pushes_new_keyset() {
-        let store = Arc::new(
-            cdk_sqlite::mint::memory::empty()
-                .await
-                .expect("in-memory db"),
-        );
-        let signatory = Arc::new(
-            DbSignatory::new(
-                store,
-                b"test-seed-for-auto-rotation",
-                Default::default(),
-                Default::default(),
-            )
-            .await
-            .expect("DbSignatory::new"),
-        );
+        let signatory = test_signatory(b"test-seed-for-auto-rotation").await;
 
-        // Seed an active Sat keyset for the task to rotate.
-        signatory
-            .rotate_keyset(RotateKeyArguments {
-                unit: CurrencyUnit::Sat,
-                amounts: vec![1, 2, 4, 8],
-                input_fee_ppk: 0,
-                keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
-                final_expiry: None,
-            })
-            .await
-            .expect("rotate_keyset");
+        // Seed an already-aged active Sat keyset for the task to rotate.
+        seed_aged_keyset(
+            &signatory,
+            CurrencyUnit::Sat,
+            &[1, 2, 4, 8],
+            0,
+            cdk_common::nut02::KeySetVersion::Version00,
+            None,
+            120,
+        )
+        .await;
 
         let mut updates = signatory.subscribe_keysets().await.expect("subscribe");
         let before = updates.borrow_and_update().keysets.len();
 
-        // Sub-second interval so `as_secs()` is zero and the keyset is always
-        // due; the first real tick fires after one interval. Keep the shutdown
-        // sender alive so the loop is not asked to stop.
+        // The seeded keyset is older than this one second interval, so the
+        // first (immediate) tick rotates it. Keep the shutdown sender alive so
+        // the loop is not asked to stop.
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let _handle = signatory.spawn_auto_rotation(Duration::from_millis(50), shutdown_rx);
+        let _handle = signatory.spawn_auto_rotation(Duration::from_secs(1), shutdown_rx);
 
         tokio::time::timeout(Duration::from_secs(5), updates.changed())
             .await
@@ -625,23 +645,78 @@ mod test {
             .expect("active keyset for unit")
     }
 
+    /// Seed an active keyset for `unit` whose `valid_from` is backdated by
+    /// `age` seconds, so `rotate_aged_keysets` treats it as due for any
+    /// interval below `age`. Returns the seeded keyset id.
+    async fn seed_aged_keyset(
+        sig: &DbSignatory,
+        unit: CurrencyUnit,
+        amounts: &[u64],
+        input_fee_ppk: u64,
+        version: cdk_common::nut02::KeySetVersion,
+        final_expiry: Option<u64>,
+        age: u64,
+    ) -> Id {
+        let derivation_path = derivation_path_from_unit(unit.clone(), 1).expect("derivation path");
+        let (keyset, mut info) = create_new_keyset(
+            &sig.secp_ctx,
+            sig.xpriv,
+            derivation_path,
+            Some(1),
+            unit.clone(),
+            amounts,
+            input_fee_ppk,
+            final_expiry,
+            version,
+        );
+        // Backdate the keyset so it reads as aged without waiting.
+        info.valid_from = unix_time() - age;
+        let id = keyset.id;
+
+        let mut tx = sig.localstore.begin_transaction().await.expect("begin tx");
+        tx.add_keyset_info(info).await.expect("add keyset info");
+        tx.set_active_keyset(unit, id)
+            .await
+            .expect("set active keyset");
+        tx.commit().await.expect("commit");
+        sig.reload_keys_from_db().await.expect("reload");
+
+        id
+    }
+
+    /// Backdate the active keyset for `unit` by `age` seconds so the next
+    /// `rotate_aged_keysets` treats it as due, then reload. Used to trigger a
+    /// second rotation after the first one produced a fresh (age zero) keyset.
+    async fn age_active_keyset(sig: &DbSignatory, unit: &CurrencyUnit, age: u64) {
+        let active_id = sig
+            .localstore
+            .get_active_keyset_id(unit)
+            .await
+            .expect("active keyset id")
+            .expect("active keyset for unit");
+        let mut info = sig
+            .localstore
+            .get_keyset_info(&active_id)
+            .await
+            .expect("keyset info")
+            .expect("keyset info present");
+        info.valid_from = unix_time() - age;
+
+        let mut tx = sig.localstore.begin_transaction().await.expect("begin tx");
+        tx.add_keyset_info(info).await.expect("update keyset info");
+        tx.commit().await.expect("commit");
+        sig.reload_keys_from_db().await.expect("reload");
+    }
+
     async fn assert_rotation_preserves_metadata(version: cdk_common::nut02::KeySetVersion) {
         let sig = test_signatory(b"test-seed-preserve").await;
         let amounts = vec![1, 2, 4, 8, 16];
         let fee = 100;
 
-        let original = sig
-            .rotate_keyset(RotateKeyArguments {
-                unit: CurrencyUnit::Sat,
-                amounts: amounts.clone(),
-                input_fee_ppk: fee,
-                keyset_id_type: version,
-                final_expiry: None,
-            })
-            .await
-            .expect("rotate_keyset");
+        seed_aged_keyset(&sig, CurrencyUnit::Sat, &amounts, fee, version, None, 120).await;
+        let original = active_keyset(&sig, &CurrencyUnit::Sat).await;
 
-        sig.rotate_aged_keysets(Duration::ZERO)
+        sig.rotate_aged_keysets(Duration::from_secs(60))
             .await
             .expect("rotate_aged_keysets");
 
@@ -678,38 +753,22 @@ mod test {
     #[tokio::test]
     async fn rotate_aged_keysets_pushes_final_expiry_forward() {
         let sig = test_signatory(b"test-seed-final-expiry").await;
-        let amounts = vec![1, 2, 4, 8];
         let age = 100;
-        let now = unix_time();
-        let valid_from = now - age;
         // Far enough in the future that the keyset is not treated as expired.
-        let expiry = now + 10_000;
+        let expiry = unix_time() + 10_000;
 
-        let derivation_path =
-            derivation_path_from_unit(CurrencyUnit::Sat, 1).expect("derivation path");
-        let (keyset, mut info) = create_new_keyset(
-            &sig.secp_ctx,
-            sig.xpriv,
-            derivation_path,
-            Some(1),
+        seed_aged_keyset(
+            &sig,
             CurrencyUnit::Sat,
-            &amounts,
+            &[1, 2, 4, 8],
             0,
-            Some(expiry),
             cdk_common::nut02::KeySetVersion::Version00,
-        );
-        // Backdate the keyset so it reads as aged without waiting.
-        info.valid_from = valid_from;
+            Some(expiry),
+            age,
+        )
+        .await;
 
-        let mut tx = sig.localstore.begin_transaction().await.expect("begin tx");
-        tx.add_keyset_info(info).await.expect("add keyset info");
-        tx.set_active_keyset(CurrencyUnit::Sat, keyset.id)
-            .await
-            .expect("set active keyset");
-        tx.commit().await.expect("commit");
-        sig.reload_keys_from_db().await.expect("reload");
-
-        sig.rotate_aged_keysets(Duration::from_secs(1))
+        sig.rotate_aged_keysets(Duration::from_secs(60))
             .await
             .expect("rotate_aged_keysets");
 
@@ -744,15 +803,16 @@ mod test {
     async fn rotate_aged_keysets_ignores_inactive_keysets() {
         let sig = test_signatory(b"test-seed-inactive").await;
 
-        sig.rotate_keyset(RotateKeyArguments {
-            unit: CurrencyUnit::Sat,
-            amounts: vec![1, 2, 4, 8],
-            input_fee_ppk: 0,
-            keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
-            final_expiry: None,
-        })
-        .await
-        .expect("rotate_keyset");
+        seed_aged_keyset(
+            &sig,
+            CurrencyUnit::Sat,
+            &[1, 2, 4, 8],
+            0,
+            cdk_common::nut02::KeySetVersion::Version00,
+            None,
+            120,
+        )
+        .await;
 
         let total = |ks: &SignatoryKeysets| ks.keysets.len();
         let active_sat = |ks: &SignatoryKeysets| {
@@ -766,7 +826,7 @@ mod test {
         assert_eq!(total(&after_seed), 1);
         assert_eq!(active_sat(&after_seed), 1);
 
-        sig.rotate_aged_keysets(Duration::ZERO)
+        sig.rotate_aged_keysets(Duration::from_secs(60))
             .await
             .expect("rotate_aged_keysets");
         let after_first = sig.keysets().await.expect("keysets");
@@ -777,7 +837,13 @@ mod test {
         );
         assert_eq!(active_sat(&after_first), 1, "exactly one active Sat keyset");
 
-        sig.rotate_aged_keysets(Duration::ZERO)
+        // The first rotation left a fresh active keyset (age zero). Age it so
+        // the next pass finds it due. The keyset the first pass retired stays
+        // inactive and aged, so if inactive keysets were re-rotated the count
+        // would grow by more than one.
+        age_active_keyset(&sig, &CurrencyUnit::Sat, 120).await;
+
+        sig.rotate_aged_keysets(Duration::from_secs(60))
             .await
             .expect("rotate_aged_keysets");
         let after_second = sig.keysets().await.expect("keysets");
@@ -797,35 +863,35 @@ mod test {
     async fn rotate_aged_keysets_rotates_all_aged_units() {
         let sig = test_signatory(b"test-seed-multi-unit").await;
 
-        let sat = sig
-            .rotate_keyset(RotateKeyArguments {
-                unit: CurrencyUnit::Sat,
-                amounts: vec![1, 2, 4, 8],
-                input_fee_ppk: 0,
-                keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
-                final_expiry: None,
-            })
-            .await
-            .expect("rotate sat");
-        let usd = sig
-            .rotate_keyset(RotateKeyArguments {
-                unit: CurrencyUnit::Usd,
-                amounts: vec![1, 2, 4, 8],
-                input_fee_ppk: 0,
-                keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
-                final_expiry: None,
-            })
-            .await
-            .expect("rotate usd");
+        let sat = seed_aged_keyset(
+            &sig,
+            CurrencyUnit::Sat,
+            &[1, 2, 4, 8],
+            0,
+            cdk_common::nut02::KeySetVersion::Version00,
+            None,
+            120,
+        )
+        .await;
+        let usd = seed_aged_keyset(
+            &sig,
+            CurrencyUnit::Usd,
+            &[1, 2, 4, 8],
+            0,
+            cdk_common::nut02::KeySetVersion::Version00,
+            None,
+            120,
+        )
+        .await;
 
-        sig.rotate_aged_keysets(Duration::ZERO)
+        sig.rotate_aged_keysets(Duration::from_secs(60))
             .await
             .expect("rotate_aged_keysets");
 
         let new_sat = active_keyset(&sig, &CurrencyUnit::Sat).await;
         let new_usd = active_keyset(&sig, &CurrencyUnit::Usd).await;
-        assert_ne!(new_sat.id, sat.id, "Sat keyset should rotate");
-        assert_ne!(new_usd.id, usd.id, "Usd keyset should rotate");
+        assert_ne!(new_sat.id, sat, "Sat keyset should rotate");
+        assert_ne!(new_usd.id, usd, "Usd keyset should rotate");
     }
 
     #[tokio::test]
