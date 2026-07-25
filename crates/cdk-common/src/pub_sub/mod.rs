@@ -19,12 +19,14 @@
 //!   low-level transport messages (e.g., WebSocket subscribe frames).
 //! - **Spec**: type bundle tying `Event`, `Topic`, `SubscriptionId`, and serialization.
 
+mod bus;
 mod error;
 mod pubsub;
 pub mod remote_consumer;
 mod subscriber;
 mod types;
 
+pub use self::bus::{Bus, LocalBus, LocalDelivery};
 pub use self::error::Error;
 pub use self::pubsub::Pubsub;
 pub use self::subscriber::{Subscriber, SubscriptionRequest};
@@ -172,6 +174,49 @@ mod test {
 
         assert!(result.is_err());
         assert_eq!(pubsub.active_subscribers(), 0);
+    }
+
+    #[tokio::test]
+    async fn custom_bus_receives_published_events_and_still_delivers_locally() {
+        use std::sync::Mutex;
+
+        use super::bus::{Bus, LocalDelivery};
+
+        // A bus that records every published event and forwards it to local
+        // subscribers. Stands in for a real cross-process bus, whose forwarding
+        // step would additionally hit the wire.
+        struct RecordingBus {
+            local: LocalDelivery<CustomPubSub>,
+            seen: Arc<Mutex<Vec<Message>>>,
+        }
+
+        impl Bus<CustomPubSub> for RecordingBus {
+            fn publish(&self, event: Message) {
+                self.seen.lock().unwrap().push(event.clone());
+                self.local.deliver(event);
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_bus = seen.clone();
+        let pubsub = Pubsub::new_with_bus(CustomPubSub::new_instance(()), move |local| {
+            Arc::new(RecordingBus {
+                local,
+                seen: seen_for_bus,
+            })
+        });
+
+        let mut subscriber = pubsub.subscribe(SubscriptionReq::Foo(2)).unwrap();
+
+        pubsub.publish(Message { foo: 2, bar: 7 });
+
+        // The event reached the local subscriber through the custom bus.
+        assert_eq!(subscriber.recv().await.map(|x| x.bar), Some(7));
+        // And the bus observed it on the way out.
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[Message { foo: 2, bar: 7 }]
+        );
     }
 
     #[tokio::test]
