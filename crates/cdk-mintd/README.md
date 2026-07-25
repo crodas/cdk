@@ -189,9 +189,9 @@ An embedded signatory can rotate active keysets automatically once they reach a
 given age. The replacement keeps the previous amounts, input fee and version.
 Meant for long periods (days); the example uses 90 days.
 
-- `keyset_rotation_interval_seconds = 7776000` (or
-  `CDK_MINTD_KEYSET_ROTATION_INTERVAL_SECONDS=7776000`): rotate active keysets
-  once they are 90 days old.
+- `[signatory].keyset_rotation_interval_seconds = 7776000` (or
+  `CDK_MINTD_SIGNATORY_KEYSET_ROTATION_INTERVAL_SECONDS=7776000`): rotate active
+  keysets once they are 90 days old.
 - **Unset or `0` (Default)**: auto-rotation is disabled.
 
 This applies only to an embedded signatory; a remote signatory manages its own

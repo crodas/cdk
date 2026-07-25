@@ -59,12 +59,6 @@ pub struct Info {
     /// Use keyset v2
     pub use_keyset_v2: Option<bool>,
 
-    /// Automatically rotate active keysets once they reach this age, in seconds.
-    ///
-    /// Only applies when the mint runs an embedded signatory. `None` or `0`
-    /// disables auto-rotation. A remote signatory manages its own schedule.
-    pub keyset_rotation_interval_seconds: Option<u64>,
-
     pub http_cache: cache::Config,
 
     /// Logging configuration
@@ -94,7 +88,6 @@ impl Default for Info {
             mnemonic: None,
             input_fee_ppk: None,
             use_keyset_v2: None,
-            keyset_rotation_interval_seconds: None,
             http_cache: cache::Config::default(),
             enable_info_page: Some(true),
             logging: LoggingConfig::default(),
@@ -122,10 +115,6 @@ impl std::fmt::Debug for Info {
             .field("mnemonic", &mnemonic_display)
             .field("input_fee_ppk", &self.input_fee_ppk)
             .field("use_keyset_v2", &self.use_keyset_v2)
-            .field(
-                "keyset_rotation_interval_seconds",
-                &self.keyset_rotation_interval_seconds,
-            )
             .field("http_cache", &self.http_cache)
             .field("logging", &self.logging)
             .field("enable_info_page", &self.enable_info_page)
@@ -146,6 +135,13 @@ pub struct Signatory {
     pub tls_dir: Option<PathBuf>,
     #[serde(default)]
     pub allow_insecure: bool,
+    /// Automatically rotate active keysets once they reach this age, in seconds.
+    ///
+    /// Applies to the embedded signatory the mint runs when `enabled` is false.
+    /// `None` or `0` disables auto-rotation. A remote signatory (`enabled =
+    /// true`) manages its own rotation schedule and ignores this value.
+    #[serde(default)]
+    pub keyset_rotation_interval_seconds: Option<u64>,
 }
 
 impl Default for Signatory {
@@ -156,6 +152,7 @@ impl Default for Signatory {
             port: default_signatory_port(),
             tls_dir: None,
             allow_insecure: false,
+            keyset_rotation_interval_seconds: None,
         }
     }
 }

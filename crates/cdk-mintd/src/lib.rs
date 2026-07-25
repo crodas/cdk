@@ -884,8 +884,9 @@ fn configure_basic_info(settings: &config::Settings, mint_builder: MintBuilder) 
 
     builder = builder.with_keyset_rotation_interval(
         settings
-            .info
-            .keyset_rotation_interval_seconds
+            .signatory
+            .as_ref()
+            .and_then(|signatory| signatory.keyset_rotation_interval_seconds)
             .map(std::time::Duration::from_secs),
     );
 
@@ -2146,6 +2147,7 @@ mod tests {
                 port: 15060,
                 tls_dir: Some("/tmp/certs".into()),
                 allow_insecure: false,
+                keyset_rotation_interval_seconds: None,
             }),
             ..Default::default()
         };
