@@ -188,6 +188,12 @@ impl DbSignatory {
             return Ok(());
         }
 
+        // Hold the rotation lock for the whole pass so no `rotate_keyset` (or
+        // another pass) can commit between our snapshot and reload. With it
+        // held, the active keysets cannot change underneath us, so the `due`
+        // set stays accurate through the loop.
+        let _rotation = self.rotation_lock.lock().await;
+
         // Snapshot the due keysets and the collision-check set from short-lived
         // read locks, released before the commits. `commit_rotated_keyset`
         // takes the snapshot as an argument precisely so it never locks
@@ -208,12 +214,6 @@ impl DbSignatory {
         if due.is_empty() {
             return Ok(());
         }
-
-        // Hold the rotation lock for the whole pass so no `rotate_keyset` (or
-        // another pass) can commit between our snapshot and reload. With it
-        // held, the active keysets cannot change underneath us, so the `due`
-        // set stays accurate through the loop.
-        let _rotation = self.rotation_lock.lock().await;
 
         for info in due {
             let active_age = now.saturating_sub(info.valid_from);
@@ -277,12 +277,15 @@ impl DbSignatory {
         interval: Duration,
         mut shutdown: watch::Receiver<bool>,
     ) {
-        // Poll on a fixed cadence, independent of the rotation age threshold.
-        // Each tick asks `rotate_aged_keysets` to rotate any keyset older than
-        // `interval`. The first tick fires immediately, so a freshly built
-        // keyset (age 0) is only rotated once it has aged past `interval` on a
-        // later tick.
-        let mut ticker = tokio::time::interval(DEFAULT_TICKET);
+        // Poll at `min(interval, DEFAULT_TICKET)`. Each tick asks
+        // `rotate_aged_keysets` to rotate any keyset older than `interval`. The
+        // cadence is capped at `DEFAULT_TICKET` so large intervals (hours/days)
+        // still check periodically, and floored at the interval so a small
+        // interval is not checked slower than it, which would let a keyset age
+        // well past `interval` before rotating. The first tick fires
+        // immediately, so a freshly built keyset (age 0) is only rotated once it
+        // has aged past `interval` on a later tick.
+        let mut ticker = tokio::time::interval(interval.min(DEFAULT_TICKET));
 
         loop {
             // Wait for the next tick or a shutdown signal. Shutdown is only
@@ -416,11 +419,11 @@ impl DbSignatory {
     /// time.
     ///
     /// The current keyset snapshot used for the collision check is injected by
-    /// the caller rather than read here. That keeps this method from taking the
-    /// `keysets` read lock: `rotate_aged_keysets` calls it while holding the
-    /// `active_keysets` write lock, and `reload_keys_from_db` takes the two
-    /// locks in the opposite order (`keysets` then `active_keysets`), so
-    /// acquiring `keysets` here could deadlock against a concurrent reload.
+    /// the caller rather than read here, so this method never takes a `keysets`
+    /// lock. `rotate_aged_keysets` commits a whole batch of rotations under one
+    /// `rotation_lock` and reloads once at the end; keeping this helper
+    /// lock-free lets that batch reuse a single snapshot instead of re-reading
+    /// (and re-locking) `keysets` per rotation.
     async fn commit_rotated_keyset(
         &self,
         args: RotateKeyArguments,

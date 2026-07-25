@@ -73,14 +73,11 @@ pub struct MintBuilder {
     use_keyset_v2: Option<bool>,
     keyset_rotations: Vec<KeysetRotation>,
     keyset_rotation_interval: Option<std::time::Duration>,
-    /// Cooperative-shutdown handle for the embedded auto-rotation task, set in
+    /// Rotation spawner for the embedded auto-rotation loop, built in
     /// `build_with_seed` and handed to the `Mint` in `build_with_signatory` so
-    /// that `Mint::stop` signals the loop to stop and awaits an in-flight
-    /// rotation. `None` when no rotation interval is configured.
-    rotation_shutdown: Option<(
-        tokio::sync::watch::Sender<bool>,
-        tokio::task::JoinHandle<()>,
-    )>,
+    /// that `Mint::start` can spawn (and re-spawn) it. `None` when no rotation
+    /// interval is configured.
+    rotation_spawner: Option<crate::mint::RotationSpawner>,
     max_inputs: usize,
     max_outputs: usize,
     max_batch_size: Option<u64>,
@@ -125,7 +122,7 @@ impl MintBuilder {
             use_keyset_v2: None,
             keyset_rotations: Vec::new(),
             keyset_rotation_interval: None,
-            rotation_shutdown: None,
+            rotation_spawner: None,
             max_inputs: 1000,
             max_outputs: 1000,
             max_batch_size: None,
@@ -152,11 +149,9 @@ impl MintBuilder {
     /// leaves auto-rotation disabled. A remote signatory manages its own
     /// rotation schedule.
     ///
-    /// The rotation task is spawned once, at build time, because it needs the
-    /// concrete embedded signatory (only reachable here, not through the
-    /// `Signatory` trait the mint holds). [`Mint::stop`] halts it, but a later
-    /// [`Mint::start`] does not respawn it; rebuild the mint to re-enable
-    /// rotation. This differs from the drain task, which resumes on restart.
+    /// The rotation loop is spawned by [`Mint::start`] and halted by
+    /// [`Mint::stop`], resuming on a later `start()` like the other background
+    /// services.
     pub fn with_keyset_rotation_interval(mut self, interval: Option<std::time::Duration>) -> Self {
         self.keyset_rotation_interval = interval.filter(|i| !i.is_zero());
         self
@@ -615,7 +610,7 @@ impl MintBuilder {
     ) -> Result<Mint, Error> {
         // Taken now so the field is not caught in the piecemeal moves of `self`
         // into the `Mint` constructors below.
-        let rotation_shutdown = self.rotation_shutdown.take();
+        let rotation_spawner = self.rotation_spawner.take();
 
         // Check active keysets and rotate if necessary
         let active_keysets = signatory.keysets().await?;
@@ -756,10 +751,10 @@ impl MintBuilder {
             .await?
         };
 
-        // Bind the embedded auto-rotation task to the mint so `stop()` halts it
-        // cooperatively.
-        if let Some((shutdown, handle)) = rotation_shutdown {
-            mint.set_rotation_shutdown(shutdown, handle).await;
+        // Bind the embedded auto-rotation spawner to the mint so `start()` runs
+        // it and `stop()` halts it cooperatively.
+        if let Some(spawner) = rotation_spawner {
+            mint.set_rotation_spawner(spawner).await;
         }
 
         Ok(mint)
@@ -781,26 +776,26 @@ impl MintBuilder {
             .await?,
         );
 
-        let rotation_task = self.keyset_rotation_interval.map(|interval| {
+        if let Some(interval) = self.keyset_rotation_interval {
             tracing::info!(
                 "Enabling keyset auto-rotation every {}s",
                 interval.as_secs()
             );
-            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            let handle = in_memory_signatory.spawn_auto_rotation(interval, shutdown_rx);
-            (shutdown_tx, handle)
-        });
-
-        let mut service = cdk_signatory::embedded::Service::new(in_memory_signatory);
-        if let Some((shutdown_tx, handle)) = rotation_task {
-            // `Mint::stop` signals `shutdown_tx` and awaits `handle` for a
-            // cooperative shutdown that lets an in-flight rotation finish. The
-            // service keeps an abort handle so a drop without `stop()` does not
-            // leave the task lingering.
-            service = service.with_background_task(handle.abort_handle());
-            self.rotation_shutdown = Some((shutdown_tx, handle));
+            // Capture a weak handle so the spawner does not keep the signatory
+            // alive; the embedded `Service` owns the only strong reference.
+            // `Mint::start` calls this to spawn the loop (and re-spawn it after a
+            // `stop()`); if the signatory has been dropped the loop has nothing
+            // to rotate, so spawn a no-op.
+            let weak = Arc::downgrade(&in_memory_signatory);
+            let spawner: crate::mint::RotationSpawner =
+                Arc::new(move |shutdown_rx| match weak.upgrade() {
+                    Some(signatory) => signatory.spawn_auto_rotation(interval, shutdown_rx),
+                    None => tokio::spawn(async {}),
+                });
+            self.rotation_spawner = Some(spawner);
         }
-        let signatory = Arc::new(service);
+
+        let signatory = Arc::new(cdk_signatory::embedded::Service::new(in_memory_signatory));
 
         self.build_with_signatory(signatory).await
     }
