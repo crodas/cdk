@@ -21,6 +21,8 @@ use crate::common::{
 };
 use crate::signatory::{RotateKeyArguments, Signatory, SignatoryKeySet, SignatoryKeysets};
 
+const DEFAULT_TICKET: Duration = Duration::from_secs(120);
+
 /// In-memory Signatory
 ///
 /// This is the default signatory implementation for the mint.
@@ -254,10 +256,12 @@ impl DbSignatory {
         interval: Duration,
         mut shutdown: watch::Receiver<bool>,
     ) {
-        // Check once per `interval`. The first tick fires immediately, so a
-        // freshly built keyset (age 0) is only rotated once it has aged past
-        // `interval` on a later tick.
-        let mut ticker = tokio::time::interval(interval);
+        // Poll on a fixed cadence, independent of the rotation age threshold.
+        // Each tick asks `rotate_aged_keysets` to rotate any keyset older than
+        // `interval`. The first tick fires immediately, so a freshly built
+        // keyset (age 0) is only rotated once it has aged past `interval` on a
+        // later tick.
+        let mut ticker = tokio::time::interval(DEFAULT_TICKET);
 
         loop {
             // Wait for the next tick or a shutdown signal. Shutdown is only
