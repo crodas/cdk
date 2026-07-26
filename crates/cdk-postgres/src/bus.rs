@@ -35,6 +35,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_postgres::{AsyncMessage, Client, Connection};
 
@@ -319,42 +320,24 @@ async fn run_driver(
         };
 
         match outcome {
-            Ok((client, mut driver)) => {
-                backoff = INITIAL_BACKOFF;
-                let client = Arc::new(client);
-                if let Ok(mut slot) = client_slot.write() {
-                    *slot = Some(client.clone());
-                }
-
-                let listen_result = client.batch_execute(&listen_sql).await;
-                if let Some(tx) = ready_tx.take() {
-                    let _ = tx.send(
-                        listen_result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|e| e.to_string()),
-                    );
-                }
-                if let Err(err) = listen_result {
-                    tracing::warn!("postgres bus: LISTEN failed: {err}");
-                }
-
-                tokio::select! {
-                    biased;
-                    _ = shutdown.changed() => {
-                        driver.abort();
-                        if let Ok(mut slot) = client_slot.write() {
-                            *slot = None;
-                        }
-                        break;
-                    }
-                    // Runs until the connection ends.
-                    _ = &mut driver => {
-                        if let Ok(mut slot) = client_slot.write() {
-                            *slot = None;
-                        }
-                        tracing::warn!("postgres bus: connection lost, reconnecting");
-                    }
+            Ok((client, driver)) => {
+                let session = serve_connection(
+                    Arc::new(client),
+                    driver,
+                    &listen_sql,
+                    &client_slot,
+                    &mut ready_tx,
+                    &mut shutdown,
+                )
+                .await;
+                match session {
+                    Session::Shutdown => break,
+                    // A listening session ran and the connection later ended.
+                    // The endpoint was healthy, so retry from the base backoff.
+                    Session::Disconnected => backoff = INITIAL_BACKOFF,
+                    // Setup failed on this connection. Keep growing the backoff
+                    // so repeated LISTEN failures do not hammer the database.
+                    Session::ListenFailed => {}
                 }
             }
             Err(err) => {
@@ -371,6 +354,81 @@ async fn run_driver(
             _ = tokio::time::sleep(backoff) => {}
         }
         backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// Outcome of serving a single connection in [`run_driver`].
+enum Session {
+    /// The bus was dropped; stop the driver loop.
+    Shutdown,
+    /// A listening session ran and the connection later ended; reconnect.
+    Disconnected,
+    /// The connection came up but `LISTEN` never took effect; reconnect.
+    ListenFailed,
+}
+
+/// Serve one connection: install the client, issue `LISTEN`, then run until the
+/// connection ends or shutdown fires.
+///
+/// A SQL-level `LISTEN` failure does not necessarily close an otherwise healthy
+/// Postgres connection. Treat it as a failed setup for this connection: clear
+/// the installed client, abort the driver, and return [`Session::ListenFailed`]
+/// so the caller reconnects. Serving such a connection would leave the bus
+/// connected and still publishing outbound `pg_notify` while never receiving
+/// inbound peer notifications until the connection dropped for some unrelated
+/// reason.
+async fn serve_connection(
+    client: Arc<Client>,
+    mut driver: JoinHandle<()>,
+    listen_sql: &str,
+    client_slot: &SharedClient,
+    ready_tx: &mut Option<oneshot::Sender<Result<(), String>>>,
+    shutdown: &mut watch::Receiver<()>,
+) -> Session {
+    // LISTEN needs an installed client, so install it first and uninstall it on
+    // failure below, so publishers never use a connection that is not listening.
+    if let Ok(mut slot) = client_slot.write() {
+        *slot = Some(client.clone());
+    }
+
+    let listen_result = client.batch_execute(listen_sql).await;
+    if let Some(tx) = ready_tx.take() {
+        let _ = tx.send(
+            listen_result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        );
+    }
+
+    if let Err(err) = listen_result {
+        tracing::warn!("postgres bus: LISTEN failed: {err}, dropping connection to reconnect");
+        driver.abort();
+        clear_client(client_slot);
+        return Session::ListenFailed;
+    }
+
+    tokio::select! {
+        biased;
+        _ = shutdown.changed() => {
+            driver.abort();
+            clear_client(client_slot);
+            Session::Shutdown
+        }
+        // Runs until the connection ends.
+        _ = &mut driver => {
+            clear_client(client_slot);
+            tracing::warn!("postgres bus: connection lost, reconnecting");
+            Session::Disconnected
+        }
+    }
+}
+
+/// Uninstall the shared client so publishers stop using a dead or deaf
+/// connection.
+fn clear_client(client_slot: &SharedClient) {
+    if let Ok(mut slot) = client_slot.write() {
+        *slot = None;
     }
 }
 
@@ -522,6 +580,52 @@ mod tests {
         // Wait long enough for a round-trip through the database.
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(sub_a.try_recv().is_none());
+    }
+
+    /// A `LISTEN` that fails on an otherwise healthy connection must not leave
+    /// the bus connected-but-deaf: `serve_connection` has to abort the driver,
+    /// clear the installed client, and return `ListenFailed` so the driver loop
+    /// reconnects, rather than parking on the still-open connection.
+    ///
+    /// The failure is forced by putting the session in an aborted transaction:
+    /// the socket stays open, but every later statement (including `LISTEN`)
+    /// errors until the transaction ends.
+    #[tokio::test]
+    async fn listen_failure_on_live_connection_reconnects() {
+        let config = PgConfig::from(test_db_url().as_str());
+
+        // A real connection whose driver keeps running, so the connection stays
+        // open. `_inbound` keeps the notification channel alive.
+        let (inbound_tx, _inbound) = mpsc::channel(16);
+        let (client, driver) = connect_and_drive(&config, NotifyDrive { inbound_tx })
+            .await
+            .expect("connect");
+        let client = Arc::new(client);
+
+        // Abort the transaction: LISTEN will now fail while the socket is up.
+        let _ = client.batch_execute("BEGIN; SELECT 1 / 0;").await;
+
+        let client_slot: SharedClient = Arc::new(RwLock::new(None));
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(());
+        let mut ready_tx = None;
+
+        let session = timeout(
+            Duration::from_secs(5),
+            serve_connection(
+                client,
+                driver,
+                "LISTEN \"cdk_bus_listen_failure_test\"",
+                &client_slot,
+                &mut ready_tx,
+                &mut shutdown_rx,
+            ),
+        )
+        .await
+        .expect("serve_connection must not hang when LISTEN fails on a live connection");
+
+        assert!(matches!(session, Session::ListenFailed));
+        // The client is uninstalled, so publishers stop using the deaf connection.
+        assert!(client_slot.read().unwrap().is_none());
     }
 
     #[test]
