@@ -23,14 +23,18 @@
 //! the built [`PostgresBus`] (or an unbuilt [`PostgresBusConnector`]) is
 //! dropped, the driver and dispatcher stop and the connection is released.
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use cdk_common::database::Error;
 use cdk_common::pub_sub::{Bus, LocalDelivery, Spec};
+use cdk_common::stream::{BackoffPolicy, SupervisedStream};
 use cdk_sql_common::pool::DatabaseConfig;
+use futures_util::Stream;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -129,25 +133,38 @@ impl PostgresBusConnector {
 
         let (inbound_tx, inbound) = mpsc::channel(INBOUND_CHANNEL_SIZE);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let (shutdown, driver_shutdown) = watch::channel(());
+        let (shutdown, mut supervise_shutdown) = watch::channel(());
         let client: SharedClient = Arc::new(RwLock::new(None));
 
-        let driver_channel = channel.clone();
-        let driver_client = client.clone();
-
-        cdk_common::task::spawn(run_driver(
+        let mut listener = PgListen {
             config,
-            driver_channel,
+            listen_sql: format!("LISTEN \"{channel}\""),
+            client: client.clone(),
             inbound_tx,
-            driver_client,
-            ready_tx,
-            driver_shutdown,
-        ));
+            name: format!("postgres bus:{channel}"),
+            ready: Some(ready_tx),
+        };
+
+        // The reconnect, backoff, and shutdown loop is provided by
+        // `SupervisedStream`. It stops once the `watch::Sender` held by the built
+        // `PostgresBus` (or by this connector on an early error) is dropped, which
+        // the receiver's `changed()` observes.
+        cdk_common::task::spawn(async move {
+            listener
+                .supervise(async move {
+                    let _ = supervise_shutdown.changed().await;
+                })
+                .await;
+        });
 
         match timeout(connect_timeout, ready_rx).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(err))) => return Err(Error::Internal(err)),
-            Ok(Err(_)) => return Err(Error::Internal("postgres bus driver stopped".to_string())),
+            Ok(Err(_)) => {
+                return Err(Error::Internal(
+                    "postgres bus supervisor stopped".to_string(),
+                ))
+            }
             Err(_) => {
                 return Err(Error::Internal(
                     "timeout connecting postgres bus".to_string(),
@@ -292,143 +309,140 @@ impl DriveConnection for NotifyDrive {
     }
 }
 
-/// Maintain a `LISTEN` connection: connect, listen, forward notifications, and
-/// reconnect with capped backoff when the connection drops. Returns when
-/// `shutdown` fires (the bus was dropped).
-async fn run_driver(
-    config: PgConfig,
-    channel: String,
-    inbound_tx: mpsc::Sender<String>,
-    client_slot: SharedClient,
-    ready_tx: oneshot::Sender<Result<(), String>>,
-    mut shutdown: watch::Receiver<()>,
-) {
-    let listen_sql = format!("LISTEN \"{channel}\"");
-    let mut ready_tx = Some(ready_tx);
-    let mut backoff = INITIAL_BACKOFF;
-
-    loop {
-        // `connect_and_drive` spawns the connection driver, so the connection is
-        // already being polled and requests like LISTEN make progress.
-        let drive = NotifyDrive {
-            inbound_tx: inbound_tx.clone(),
-        };
-        let outcome = tokio::select! {
-            biased;
-            _ = shutdown.changed() => break,
-            res = connect_and_drive(&config, drive) => res,
-        };
-
-        match outcome {
-            Ok((client, driver)) => {
-                let session = serve_connection(
-                    Arc::new(client),
-                    driver,
-                    &listen_sql,
-                    &client_slot,
-                    &mut ready_tx,
-                    &mut shutdown,
-                )
-                .await;
-                match session {
-                    Session::Shutdown => break,
-                    // A listening session ran and the connection later ended.
-                    // The endpoint was healthy, so retry from the base backoff.
-                    Session::Disconnected => backoff = INITIAL_BACKOFF,
-                    // Setup failed on this connection. Keep growing the backoff
-                    // so repeated LISTEN failures do not hammer the database.
-                    Session::ListenFailed => {}
-                }
-            }
-            Err(err) => {
-                if let Some(tx) = ready_tx.take() {
-                    let _ = tx.send(Err(err.to_string()));
-                }
-                tracing::warn!("postgres bus: connect failed: {err}");
-            }
-        }
-
-        tokio::select! {
-            biased;
-            _ = shutdown.changed() => break,
-            _ = tokio::time::sleep(backoff) => {}
-        }
-        backoff = (backoff * 2).min(MAX_BACKOFF);
-    }
-}
-
-/// Outcome of serving a single connection in [`run_driver`].
-enum Session {
-    /// The bus was dropped; stop the driver loop.
-    Shutdown,
-    /// A listening session ran and the connection later ended; reconnect.
-    Disconnected,
-    /// The connection came up but `LISTEN` never took effect; reconnect.
-    ListenFailed,
-}
-
-/// Serve one connection: install the client, issue `LISTEN`, then run until the
-/// connection ends or shutdown fires.
+/// The connection half of the Postgres bus.
 ///
-/// A SQL-level `LISTEN` failure does not necessarily close an otherwise healthy
-/// Postgres connection. Treat it as a failed setup for this connection: clear
-/// the installed client, abort the driver, and return [`Session::ListenFailed`]
-/// so the caller reconnects. Serving such a connection would leave the bus
-/// connected and still publishing outbound `pg_notify` while never receiving
-/// inbound peer notifications until the connection dropped for some unrelated
-/// reason.
-async fn serve_connection(
-    client: Arc<Client>,
-    mut driver: JoinHandle<()>,
-    listen_sql: &str,
-    client_slot: &SharedClient,
-    ready_tx: &mut Option<oneshot::Sender<Result<(), String>>>,
-    shutdown: &mut watch::Receiver<()>,
-) -> Session {
-    // LISTEN needs an installed client, so install it first and uninstall it on
-    // failure below, so publishers never use a connection that is not listening.
-    if let Ok(mut slot) = client_slot.write() {
-        *slot = Some(client.clone());
-    }
+/// Opens a `LISTEN` connection and, through [`NotifyDrive`], forwards every
+/// notification into the shared inbound channel. The reconnect, backoff, and
+/// shutdown loop is provided by [`SupervisedStream`]; this type only says how to
+/// (re)open a listening connection and where the payloads go. Decoding and
+/// delivery run in the dispatcher spawned by [`PostgresBusConnector::build`], so
+/// transport supervision stays separate from per-payload handling.
+///
+/// `LISTEN` runs inside [`connect`](SupervisedStream::connect), so a failed
+/// `LISTEN` is a failed connect: the supervisor backs off and reconnects rather
+/// than serving a connection that is up but not listening.
+struct PgListen {
+    config: PgConfig,
+    listen_sql: String,
+    /// Shared with the publisher: each successful connect installs its client
+    /// here so `pg_notify` reuses the live connection.
+    client: SharedClient,
+    /// Every connection's driver forwards notifications here; the dispatcher in
+    /// `build` reads them. Held across reconnects so the channel outlives any
+    /// single connection.
+    inbound_tx: mpsc::Sender<String>,
+    name: String,
+    /// Fired once, carrying the first connect attempt's outcome, so
+    /// [`PostgresBusConnector::connect`] can surface a startup failure and keep
+    /// the fail-fast contract.
+    ready: Option<oneshot::Sender<Result<(), String>>>,
+}
 
-    let listen_result = client.batch_execute(listen_sql).await;
-    if let Some(tx) = ready_tx.take() {
-        let _ = tx.send(
-            listen_result
-                .as_ref()
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-        );
-    }
+impl PgListen {
+    /// Open a fresh connection, `LISTEN`, and install its client for the publish
+    /// path. `LISTEN` runs before the client is installed, so the publish path
+    /// never sees a connection that is not listening; a failed `LISTEN` aborts
+    /// the driver and returns an error so the supervisor reconnects.
+    async fn open(&self) -> Result<ConnectionLiveness, String> {
+        let (client, driver) = connect_and_drive(
+            &self.config,
+            NotifyDrive {
+                inbound_tx: self.inbound_tx.clone(),
+            },
+        )
+        .await
+        .map_err(|err| err.to_string())?;
 
-    if let Err(err) = listen_result {
-        tracing::warn!("postgres bus: LISTEN failed: {err}, dropping connection to reconnect");
-        driver.abort();
-        clear_client(client_slot);
-        return Session::ListenFailed;
-    }
-
-    tokio::select! {
-        biased;
-        _ = shutdown.changed() => {
+        let client = Arc::new(client);
+        if let Err(err) = client.batch_execute(&self.listen_sql).await {
             driver.abort();
-            clear_client(client_slot);
-            Session::Shutdown
+            return Err(err.to_string());
         }
-        // Runs until the connection ends.
-        _ = &mut driver => {
-            clear_client(client_slot);
-            tracing::warn!("postgres bus: connection lost, reconnecting");
-            Session::Disconnected
+
+        if let Ok(mut slot) = self.client.write() {
+            *slot = Some(client);
+        }
+
+        Ok(ConnectionLiveness {
+            driver: Some(driver),
+            client: self.client.clone(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl SupervisedStream for PgListen {
+    type Item = Infallible;
+    type ConnectError = String;
+    type StreamError = Infallible;
+    type Stream = ConnectionLiveness;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn backoff_policy(&self) -> BackoffPolicy {
+        BackoffPolicy {
+            initial: INITIAL_BACKOFF,
+            max: MAX_BACKOFF,
+        }
+    }
+
+    async fn connect(&mut self) -> Result<Self::Stream, Self::ConnectError> {
+        let result = self.open().await;
+        if let Some(ready) = self.ready.take() {
+            let _ = ready.send(result.as_ref().map(|_| ()).map_err(|err| err.clone()));
+        }
+        result
+    }
+
+    /// Never called: the stream carries no items (`Infallible`), it only signals
+    /// connection liveness. Payloads travel the driver-to-inbound-to-dispatcher
+    /// path instead.
+    async fn on_message(&mut self, item: Self::Item) {
+        match item {}
+    }
+}
+
+/// A stream that yields no items and completes when its connection ends.
+///
+/// The bus does not carry notifications through the supervisor's item channel
+/// (the driver forwards them into the inbound channel directly); the supervisor
+/// only needs to know when a connection dies so it can reconnect. This stream
+/// yields `None` once the connection's driver task finishes, and on drop (on
+/// reconnect or shutdown) aborts that task and uninstalls the client so the
+/// publish path stops using a connection that is no longer listening.
+#[allow(missing_debug_implementations)]
+struct ConnectionLiveness {
+    driver: Option<JoinHandle<()>>,
+    client: SharedClient,
+}
+
+impl Stream for ConnectionLiveness {
+    type Item = Result<Infallible, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.driver.as_mut() {
+            Some(driver) => match Pin::new(driver).poll(cx) {
+                Poll::Ready(_) => {
+                    self.driver = None;
+                    Poll::Ready(None)
+                }
+                Poll::Pending => Poll::Pending,
+            },
+            None => Poll::Ready(None),
         }
     }
 }
 
-/// Uninstall the shared client so publishers stop using a dead or deaf
-/// connection.
-fn clear_client(client_slot: &SharedClient) {
-    if let Ok(mut slot) = client_slot.write() {
-        *slot = None;
+impl Drop for ConnectionLiveness {
+    fn drop(&mut self) {
+        if let Some(driver) = self.driver.take() {
+            driver.abort();
+        }
+        if let Ok(mut slot) = self.client.write() {
+            *slot = None;
+        }
     }
 }
 
@@ -583,48 +597,37 @@ mod tests {
     }
 
     /// A `LISTEN` that fails on an otherwise healthy connection must not leave
-    /// the bus connected-but-deaf: `serve_connection` has to abort the driver,
-    /// clear the installed client, and return `ListenFailed` so the driver loop
-    /// reconnects, rather than parking on the still-open connection.
+    /// A failed `LISTEN` on an otherwise healthy connection must surface as a
+    /// failed connect, so `SupervisedStream` backs off and reconnects rather
+    /// than serving a connection that is up but not listening. It must also
+    /// leave the client uninstalled, so the publish path never uses a
+    /// non-listening connection.
     ///
-    /// The failure is forced by putting the session in an aborted transaction:
-    /// the socket stays open, but every later statement (including `LISTEN`)
-    /// errors until the transaction ends.
+    /// The failure is forced with an invalid `LISTEN` statement: the connection
+    /// opens fine, but the statement errors on the server.
     #[tokio::test]
-    async fn listen_failure_on_live_connection_reconnects() {
-        let config = PgConfig::from(test_db_url().as_str());
-
-        // A real connection whose driver keeps running, so the connection stays
-        // open. `_inbound` keeps the notification channel alive.
-        let (inbound_tx, _inbound) = mpsc::channel(16);
-        let (client, driver) = connect_and_drive(&config, NotifyDrive { inbound_tx })
-            .await
-            .expect("connect");
-        let client = Arc::new(client);
-
-        // Abort the transaction: LISTEN will now fail while the socket is up.
-        let _ = client.batch_execute("BEGIN; SELECT 1 / 0;").await;
-
+    async fn listen_failure_errors_connect_and_leaves_client_uninstalled() {
         let client_slot: SharedClient = Arc::new(RwLock::new(None));
-        let (_shutdown_tx, mut shutdown_rx) = watch::channel(());
-        let mut ready_tx = None;
+        let (inbound_tx, _inbound) = mpsc::channel(16);
 
-        let session = timeout(
-            Duration::from_secs(5),
-            serve_connection(
-                client,
-                driver,
-                "LISTEN \"cdk_bus_listen_failure_test\"",
-                &client_slot,
-                &mut ready_tx,
-                &mut shutdown_rx,
-            ),
-        )
-        .await
-        .expect("serve_connection must not hang when LISTEN fails on a live connection");
+        let mut listener = PgListen {
+            config: PgConfig::from(test_db_url().as_str()),
+            // Missing channel name: opens a healthy connection, then errors.
+            listen_sql: "LISTEN".to_string(),
+            client: client_slot.clone(),
+            inbound_tx,
+            name: "postgres bus test".to_string(),
+            ready: None,
+        };
 
-        assert!(matches!(session, Session::ListenFailed));
-        // The client is uninstalled, so publishers stop using the deaf connection.
+        let result = listener.connect().await;
+
+        assert!(
+            result.is_err(),
+            "a failed LISTEN must surface as a connect error"
+        );
+        // The client is never installed, so publishers do not use a
+        // non-listening connection.
         assert!(client_slot.read().unwrap().is_none());
     }
 
