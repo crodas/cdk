@@ -434,11 +434,94 @@ fn validate_channel(channel: &str) -> Result<String, Error> {
 
 #[cfg(test)]
 mod tests {
+    use cdk_common::bus_test;
+    use cdk_common::pub_sub::test::{CustomPubSub, Message, SubscriptionReq};
+    use cdk_common::pub_sub::Pubsub;
+
     use super::*;
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct Ev {
         foo: u64,
+    }
+
+    /// Connection string for the test database, matching the generic database
+    /// tests: `CDK_MINTD_DATABASE_URL`, then `PG_DB_URL`, then a local default.
+    fn test_db_url() -> String {
+        std::env::var("CDK_MINTD_DATABASE_URL")
+            .or_else(|_| std::env::var("PG_DB_URL"))
+            .unwrap_or_else(|_| {
+                "host=localhost user=cdk_user password=cdk_password dbname=cdk_mint port=5432"
+                    .to_owned()
+            })
+    }
+
+    /// Derive a valid, unique `LISTEN`/`NOTIFY` channel from a test id.
+    ///
+    /// The id from [`bus_test!`] begins with `test_<nanos>_`, so truncating to
+    /// the 63-byte Postgres identifier limit keeps the unique `<nanos>` prefix.
+    /// A unique channel per test means one test never receives another's
+    /// `NOTIFY`.
+    fn pg_channel(test_id: &str) -> String {
+        test_id.chars().take(63).collect()
+    }
+
+    /// Connect a Postgres bus on `channel` and wrap it in a `Pubsub`.
+    async fn pg_pubsub(channel: &str) -> Pubsub<CustomPubSub> {
+        let connector =
+            PostgresBusConnector::connect(PgConfig::from(test_db_url().as_str()), channel)
+                .await
+                .expect("connect postgres bus");
+        Pubsub::new_with_bus(CustomPubSub::new_instance(()), move |local| {
+            connector.build(local)
+        })
+    }
+
+    /// Factory for the generic bus suite: one Postgres-backed node per test.
+    async fn provide_pg_bus(test_id: String) -> Pubsub<CustomPubSub> {
+        pg_pubsub(&pg_channel(&test_id)).await
+    }
+
+    bus_test!(provide_pg_bus);
+
+    /// Two mint instances sharing one Postgres database and channel: an event
+    /// published on instance A is delivered through `LISTEN`/`NOTIFY` to a
+    /// subscriber on instance B, and A's own subscriber receives it exactly
+    /// once (the echo Postgres sends back is dropped as a self-echo).
+    #[tokio::test]
+    async fn event_crosses_instances_through_postgres() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let channel = pg_channel(&format!("test_{nanos}_cross_node"));
+
+        let instance_a = pg_pubsub(&channel).await;
+        let instance_b = pg_pubsub(&channel).await;
+
+        let mut sub_a = instance_a.subscribe(SubscriptionReq::Foo(2)).unwrap();
+        let mut sub_b = instance_b.subscribe(SubscriptionReq::Foo(2)).unwrap();
+
+        instance_a.publish(Message { foo: 2, bar: 7 });
+
+        // Delivered to the other instance through Postgres.
+        let received_b = timeout(Duration::from_secs(5), sub_b.recv())
+            .await
+            .expect("event delivered to instance B before timeout");
+        assert_eq!(received_b.map(|m| m.bar), Some(7));
+
+        // Delivered locally on the publishing instance as well.
+        let received_a = timeout(Duration::from_secs(5), sub_a.recv())
+            .await
+            .expect("event delivered to instance A before timeout");
+        assert_eq!(received_a.map(|m| m.bar), Some(7));
+
+        // The self-echo Postgres sends back is dropped: A sees the event once.
+        // Wait long enough for a round-trip through the database.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(sub_a.try_recv().is_none());
     }
 
     #[test]
