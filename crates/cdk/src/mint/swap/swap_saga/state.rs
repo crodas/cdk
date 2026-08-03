@@ -7,6 +7,7 @@ use uuid::Uuid;
 ///
 /// The swap saga starts in this state. Only the `setup_swap` method is available.
 /// The operation ID is generated upfront but the full Operation (with amounts) is created during setup.
+#[derive(Debug)]
 pub struct Initial {
     pub operation_id: Uuid,
 }
@@ -15,6 +16,7 @@ pub struct Initial {
 ///
 /// After successful setup, the saga transitions to this state.
 /// Only the `sign_outputs` method is available.
+#[derive(Debug)]
 pub struct SetupComplete {
     pub blinded_messages: Vec<BlindedMessage>,
     pub ys: Vec<PublicKey>,
@@ -26,6 +28,7 @@ pub struct SetupComplete {
 ///
 /// After successful signing, the saga transitions to this state.
 /// Only the `finalize` method is available.
+#[derive(Debug)]
 pub struct Signed {
     pub blinded_messages: Vec<BlindedMessage>,
     pub ys: Vec<PublicKey>,

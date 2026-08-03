@@ -8,7 +8,7 @@ use cdk_common::wallet::{KeysetLoadPolicy, WalletSaga};
 use uuid::Uuid;
 
 use crate::amount::SplitTarget;
-use crate::nuts::{PreSwap, Proofs, PublicKey, SpendingConditions};
+use crate::nuts::{PreSwap, PublicKey, SpendingConditions};
 use crate::Amount;
 
 /// Initial state - operation ID assigned but no work done yet.
@@ -43,14 +43,4 @@ pub struct Prepared {
     /// Ephemeral key if P2BK was used
     /// The persisted saga for optimistic locking (contains recovery data)
     pub saga: WalletSaga,
-}
-
-/// Finalized state - swap completed successfully.
-///
-/// After successful execution, the saga transitions to this state.
-/// The output proofs can be retrieved and the saga is complete.
-#[derive(Debug)]
-pub struct Finalized {
-    /// Output proofs to send (if amount was specified)
-    pub send_proofs: Option<Proofs>,
 }

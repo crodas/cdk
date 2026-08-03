@@ -1180,9 +1180,13 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
                 })
                 .collect();
 
-            // Now update proofs that match the operation_id
+            // Only proofs this operation still holds are released. One that
+            // reached Spent or PendingSpent in the meantime belongs to a
+            // transaction that already went through and must not be resurrected.
             for (y_bytes, mut proof) in all_proofs {
-                if proof.used_by_operation == Some(*operation_id) {
+                if proof.used_by_operation == Some(*operation_id)
+                    && matches!(proof.state, State::Reserved | State::Pending)
+                {
                     proof.state = State::Unspent;
                     proof.used_by_operation = None;
 

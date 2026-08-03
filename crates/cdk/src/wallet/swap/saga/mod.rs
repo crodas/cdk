@@ -36,18 +36,16 @@ use cdk_common::wallet::{
 };
 use tracing::instrument;
 
-use self::state::{Finalized, Initial, Prepared};
+use self::state::{Initial, Prepared};
 use crate::amount::SplitTarget;
 use crate::dhke::construct_proofs;
 use crate::nuts::nut00::ProofsMethods;
 use crate::nuts::{nut10, Proofs, SpendingConditions, State};
+use crate::saga::Saga;
 use crate::wallet::blind_signature::{
     validate_mint_response_signatures, SignatureAmountValidation,
 };
-use crate::wallet::saga::{
-    add_compensation, clear_compensations, execute_compensations, new_compensations, Compensations,
-    RevertProofReservation as RevertSwapProofReservation,
-};
+use crate::wallet::saga::{RevertProofReservation, WalletSagaContext};
 use crate::wallet::swap::ProofReservation;
 use crate::{Amount, Error, Wallet};
 
@@ -55,28 +53,25 @@ pub(crate) mod resume;
 pub(crate) mod state;
 
 /// Swap saga using typestate pattern for compile-time state transition safety.
-pub(crate) struct SwapSaga<'a, S> {
-    /// Wallet reference
-    wallet: &'a Wallet,
-    /// Compensating actions in LIFO order (most recent first)
-    compensations: Compensations,
-    /// State-specific data
-    state_data: S,
-}
+pub(crate) type SwapSaga<'a, S> = Saga<WalletSagaContext<'a>, S>;
+
+/// A SwapSaga that has not started yet. Constructors name this rather than
+/// the generic alias, so the state they produce is not left to inference.
+pub(crate) type NewSwapSaga<'a> = SwapSaga<'a, Initial>;
 
 impl<'a> SwapSaga<'a, Initial> {
     /// Create a new swap saga in the Initial state.
     pub fn new(wallet: &'a Wallet) -> Self {
         let operation_id = uuid::Uuid::now_v7();
 
-        Self {
-            wallet,
-            compensations: new_compensations(),
-            state_data: Initial {
+        Saga::start(
+            WalletSagaContext::new(wallet),
+            operation_id,
+            Initial {
                 operation_id,
                 keyset_policy: Default::default(),
             },
-        }
+        )
     }
 
     /// Prepare the swap operation.
@@ -103,30 +98,30 @@ impl<'a> SwapSaga<'a, Initial> {
         include_fees: bool,
         proof_reservation: ProofReservation,
     ) -> Result<SwapSaga<'a, Prepared>, Error> {
-        tracing::info!(
-            "Preparing swap with operation {}",
-            self.state_data.operation_id
-        );
+        tracing::info!("Preparing swap with operation {}", self.state.operation_id);
 
-        let keyset_policy = self.state_data.keyset_policy;
+        let keyset_policy = self.state.keyset_policy;
         let active_keyset_id = self
+            .ctx
             .wallet
             .active_keyset_with_policy(keyset_policy)
             .await?
             .id;
         let fee_and_amounts = self
+            .ctx
             .wallet
             .get_keyset_fees_and_amounts_by_id_with_policy(active_keyset_id, keyset_policy)
             .await?;
 
-        let fee_breakdown = self.wallet.get_proofs_fee(&input_proofs).await?;
+        let fee_breakdown = self.ctx.wallet.get_proofs_fee(&input_proofs).await?;
 
         let input_ys = input_proofs.ys()?;
 
         let pre_swap = self
+            .ctx
             .wallet
             .create_swap(
-                &self.state_data.operation_id,
+                &self.state.operation_id,
                 active_keyset_id,
                 &fee_and_amounts,
                 amount,
@@ -144,6 +139,7 @@ impl<'a> SwapSaga<'a, Initial> {
         let input_amount = input_proofs.total_amount()?;
 
         let counter_end = self
+            .ctx
             .wallet
             .localstore
             .increment_keyset_counter(&active_keyset_id, 0)
@@ -154,11 +150,11 @@ impl<'a> SwapSaga<'a, Initial> {
             .ok_or(Error::InsufficientFunds)?;
 
         let saga = WalletSaga::new(
-            self.state_data.operation_id,
+            self.state.operation_id,
             WalletSagaState::Swap(SwapSagaState::ProofsReserved),
             input_amount,
-            self.wallet.mint_url.clone(),
-            self.wallet.unit.clone(),
+            self.ctx.wallet.mint_url.clone(),
+            self.ctx.wallet.unit.clone(),
             OperationData::Swap(SwapOperationData {
                 input_amount,
                 output_amount,
@@ -168,37 +164,28 @@ impl<'a> SwapSaga<'a, Initial> {
             }),
         );
 
-        self.wallet.localstore.add_saga(saga.clone()).await?;
+        self.ctx.wallet.localstore.add_saga(saga.clone()).await?;
 
         // Only register compensation if we own the proof reservation.
         // When called from a parent saga (send, melt, receive) with
         // ProofReservation::Skip, the parent is responsible for its own
         // proof lifecycle management.
         if proof_reservation == ProofReservation::Reserve {
-            add_compensation(
-                &mut self.compensations,
-                Box::new(RevertSwapProofReservation {
-                    localstore: self.wallet.localstore.clone(),
-                    proof_ys: input_ys.clone(),
-                    saga_id: self.state_data.operation_id,
-                }),
-            )
-            .await;
+            self.push_compensation(Box::new(RevertProofReservation {
+                saga_id: self.operation_id,
+            }));
         }
 
-        Ok(SwapSaga {
-            wallet: self.wallet,
-            compensations: self.compensations,
-            state_data: Prepared {
-                operation_id: self.state_data.operation_id,
-                amount,
-                amount_split_target,
-                input_ys,
-                spending_conditions,
-                pre_swap,
-                saga,
-            },
-        })
+        let operation_id = self.operation_id;
+        Ok(self.advance(Prepared {
+            operation_id,
+            amount,
+            amount_split_target,
+            input_ys,
+            spending_conditions,
+            pre_swap,
+            saga,
+        }))
     }
 }
 
@@ -208,37 +195,35 @@ impl<'a> SwapSaga<'a, Prepared> {
     /// Updates saga state for recovery, posts swap to mint, constructs new
     /// proofs from response, updates database, and deletes saga record.
     #[instrument(skip_all)]
-    pub async fn execute(mut self) -> Result<SwapSaga<'a, Finalized>, Error> {
-        tracing::info!(
-            "Executing swap for operation {}",
-            self.state_data.operation_id
-        );
+    pub async fn execute(mut self) -> Result<Option<Proofs>, Error> {
+        tracing::info!("Executing swap for operation {}", self.state.operation_id);
 
-        let mint_url = &self.wallet.mint_url;
-        let unit = &self.wallet.unit;
-        let operation_id = self.state_data.operation_id;
+        let mint_url = &self.ctx.wallet.mint_url;
+        let unit = &self.ctx.wallet.unit;
+        let operation_id = self.state.operation_id;
 
-        let mut saga = self.state_data.saga.clone();
+        let mut saga = self.state.saga.clone();
         saga.update_state(WalletSagaState::Swap(SwapSagaState::SwapRequested));
         if let OperationData::Swap(ref mut data) = saga.data {
-            data.blinded_messages = Some(self.state_data.pre_swap.swap_request.outputs().clone());
+            data.blinded_messages = Some(self.state.pre_swap.swap_request.outputs().clone());
         }
 
-        if !self.wallet.localstore.update_saga(saga).await? {
+        if !self.ctx.wallet.localstore.update_saga(saga).await? {
             return Err(Error::ConcurrentUpdate);
         }
 
         let swap_response = match self
+            .ctx
             .wallet
             .client
-            .post_swap(self.state_data.pre_swap.swap_request.clone())
+            .post_swap(self.state.pre_swap.swap_request.clone())
             .await
         {
             Ok(response) => response,
             Err(err) => {
                 if err.is_definitive_failure() {
                     tracing::error!("Failed to post swap request (definitive): {}", err);
-                    execute_compensations(&mut self.compensations).await?;
+                    self.compensate().await?;
                 } else {
                     tracing::warn!("Failed to post swap request (ambiguous): {}.", err,);
                 }
@@ -246,21 +231,21 @@ impl<'a> SwapSaga<'a, Prepared> {
             }
         };
 
-        let active_keyset_id = self.state_data.pre_swap.pre_mint_secrets.keyset_id;
-        let active_keys = self.wallet.keyset(active_keyset_id).await?.keys;
+        let active_keyset_id = self.state.pre_swap.pre_mint_secrets.keyset_id;
+        let active_keys = self.ctx.wallet.keyset(active_keyset_id).await?.keys;
 
         validate_mint_response_signatures(
-            self.wallet,
+            self.ctx.wallet,
             &swap_response.signatures,
-            self.state_data.pre_swap.swap_request.outputs().iter(),
+            self.state.pre_swap.swap_request.outputs().iter(),
             SignatureAmountValidation::Exact,
         )
         .await?;
 
         let post_swap_proofs = construct_proofs(
             swap_response.signatures,
-            self.state_data.pre_swap.pre_mint_secrets.rs(),
-            self.state_data.pre_swap.pre_mint_secrets.secrets(),
+            self.state.pre_swap.pre_mint_secrets.rs(),
+            self.state.pre_swap.pre_mint_secrets.secrets(),
             &active_keys,
         )?;
 
@@ -269,11 +254,12 @@ impl<'a> SwapSaga<'a, Prepared> {
         let send_proofs;
 
         let fee_and_amounts = self
+            .ctx
             .wallet
             .get_keyset_fees_and_amounts_by_id(active_keyset_id)
             .await?;
 
-        match self.state_data.amount {
+        match self.state.amount {
             Some(amount) => {
                 let (proofs_with_condition, proofs_without_condition): (Proofs, Proofs) =
                     post_swap_proofs.into_iter().partition(|p| {
@@ -281,36 +267,32 @@ impl<'a> SwapSaga<'a, Prepared> {
                         nut10_secret.is_ok()
                     });
 
-                let (mut proofs_to_send, proofs_to_keep) =
-                    match &self.state_data.spending_conditions {
-                        Some(_) => (proofs_with_condition, proofs_without_condition),
-                        None => {
-                            let mut all_proofs = proofs_without_condition;
-                            all_proofs.reverse();
+                let (mut proofs_to_send, proofs_to_keep) = match &self.state.spending_conditions {
+                    Some(_) => (proofs_with_condition, proofs_without_condition),
+                    None => {
+                        let mut all_proofs = proofs_without_condition;
+                        all_proofs.reverse();
 
-                            let mut proofs_to_send = Proofs::new();
-                            let mut proofs_to_keep = Proofs::new();
-                            let mut amount_split = amount.split_targeted(
-                                &self.state_data.amount_split_target,
-                                &fee_and_amounts,
-                            )?;
+                        let mut proofs_to_send = Proofs::new();
+                        let mut proofs_to_keep = Proofs::new();
+                        let mut amount_split = amount
+                            .split_targeted(&self.state.amount_split_target, &fee_and_amounts)?;
 
-                            for proof in all_proofs {
-                                if let Some(idx) =
-                                    amount_split.iter().position(|&a| a == proof.amount)
-                                {
-                                    proofs_to_send.push(proof);
-                                    amount_split.remove(idx);
-                                } else {
-                                    proofs_to_keep.push(proof);
-                                }
+                        for proof in all_proofs {
+                            if let Some(idx) = amount_split.iter().position(|&a| a == proof.amount)
+                            {
+                                proofs_to_send.push(proof);
+                                amount_split.remove(idx);
+                            } else {
+                                proofs_to_keep.push(proof);
                             }
-
-                            (proofs_to_send, proofs_to_keep)
                         }
-                    };
 
-                if let Some(ephemeral_keys) = &self.state_data.pre_swap.p2bk_secret_keys {
+                        (proofs_to_send, proofs_to_keep)
+                    }
+                };
+
+                if let Some(ephemeral_keys) = &self.state.pre_swap.p2bk_secret_keys {
                     for (i, proof) in proofs_to_send.iter_mut().enumerate() {
                         let e_key = if ephemeral_keys.len() == 1 {
                             &ephemeral_keys[0]
@@ -346,18 +328,20 @@ impl<'a> SwapSaga<'a, Prepared> {
         added_proofs.extend(keep_proofs);
 
         // Add new proofs and mark input proofs as Spent (don't delete them)
-        self.wallet
+        self.ctx
+            .wallet
             .localstore
             .update_proofs(added_proofs, vec![])
             .await?;
-        self.wallet
+        self.ctx
+            .wallet
             .localstore
-            .update_proofs_state(self.state_data.input_ys.clone(), State::Spent)
+            .update_proofs_state(self.state.input_ys.clone(), State::Spent)
             .await?;
 
-        clear_compensations(&mut self.compensations).await;
+        self.clear_compensations();
 
-        if let Err(e) = self.wallet.localstore.delete_saga(&operation_id).await {
+        if let Err(e) = self.ctx.wallet.localstore.delete_saga(&operation_id).await {
             tracing::warn!(
                 "Failed to delete swap saga {}: {}. Will be cleaned up on recovery.",
                 operation_id,
@@ -365,26 +349,7 @@ impl<'a> SwapSaga<'a, Prepared> {
             );
         }
 
-        Ok(SwapSaga {
-            wallet: self.wallet,
-            compensations: self.compensations,
-            state_data: Finalized { send_proofs },
-        })
-    }
-}
-
-impl<'a> SwapSaga<'a, Finalized> {
-    /// Consume the saga and return the send proofs
-    pub fn into_send_proofs(self) -> Option<Proofs> {
-        self.state_data.send_proofs
-    }
-}
-
-impl<S: std::fmt::Debug> std::fmt::Debug for SwapSaga<'_, S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SwapSaga")
-            .field("state_data", &self.state_data)
-            .finish_non_exhaustive()
+        Ok(send_proofs)
     }
 }
 
@@ -394,7 +359,7 @@ mod tests {
 
     use cdk_common::nuts::State;
 
-    use super::SwapSaga;
+    use super::NewSwapSaga;
     use crate::amount::SplitTarget;
     use crate::nuts::{BlindSignature, SecretKey as Nut01SecretKey, SwapResponse};
     use crate::wallet::swap::ProofReservation;
@@ -417,7 +382,7 @@ mod tests {
         mock_client.reset_default_mint_state();
         let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
 
-        let saga = SwapSaga::new(&wallet);
+        let saga = NewSwapSaga::new(&wallet);
         let prepared = saga
             .prepare(
                 None,
@@ -432,7 +397,7 @@ mod tests {
             .unwrap();
 
         let reserved = db
-            .get_reserved_proofs(&prepared.state_data.operation_id)
+            .get_reserved_proofs(&prepared.state.operation_id)
             .await
             .unwrap();
         assert_eq!(reserved.len(), 1);
@@ -444,7 +409,7 @@ mod tests {
         assert_eq!(stored[0].state, State::Reserved);
         assert_eq!(
             stored[0].used_by_operation,
-            Some(prepared.state_data.operation_id)
+            Some(prepared.state.operation_id)
         );
     }
 
@@ -480,7 +445,7 @@ mod tests {
             .collect();
         assert_eq!(reserved_proofs.len(), 1);
 
-        let saga = SwapSaga::new(&wallet);
+        let saga = NewSwapSaga::new(&wallet);
         let result = saga
             .prepare(
                 None,
@@ -536,7 +501,7 @@ mod tests {
             .collect();
         assert_eq!(reserved_proofs.len(), 1);
 
-        let saga = SwapSaga::new(&wallet);
+        let saga = NewSwapSaga::new(&wallet);
         let prepared = saga
             .prepare(
                 None,
@@ -563,7 +528,7 @@ mod tests {
         // The swap saga should NOT have registered any proof reversion
         // compensation (since it doesn't own the reservation)
         assert!(
-            prepared.compensations.is_empty(),
+            prepared.compensations().is_empty(),
             "No compensation should be registered when skipping reservation"
         );
     }
@@ -582,7 +547,7 @@ mod tests {
         let wallet = create_test_wallet_with_mock(db, mock_client.clone()).await;
 
         let input_proofs = wallet.get_unspent_proofs().await.unwrap();
-        let prepared = SwapSaga::new(&wallet)
+        let prepared = NewSwapSaga::new(&wallet)
             .prepare(
                 None,
                 SplitTarget::Values(vec![Amount::from(2)]),
@@ -595,7 +560,7 @@ mod tests {
             .await
             .expect("prepare swap saga");
 
-        let outputs = prepared.state_data.pre_swap.swap_request.outputs().clone();
+        let outputs = prepared.state.pre_swap.swap_request.outputs().clone();
         let bad_signatures = outputs
             .iter()
             .map(|blinded_message| BlindSignature {

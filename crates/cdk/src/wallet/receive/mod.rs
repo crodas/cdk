@@ -12,7 +12,7 @@ use crate::{ensure_cdk, Amount, Error, Wallet};
 pub(crate) mod saga;
 
 pub use cdk_common::wallet::ReceiveOptions;
-use saga::ReceiveSaga;
+use saga::NewReceiveSaga;
 
 impl Wallet {
     /// Receive proofs using the saga pattern
@@ -28,12 +28,11 @@ impl Wallet {
         token: Option<String>,
     ) -> Result<Amount, Error> {
         self.retry_on_inactive_keyset(|| async {
-            let saga = ReceiveSaga::new(self);
-            let saga = saga
+            NewReceiveSaga::new(self)
                 .prepare(proofs.clone(), opts.clone(), memo.clone(), token.clone())
-                .await?;
-            let saga = saga.execute().await?;
-            Ok(saga.into_amount())
+                .await?
+                .execute()
+                .await
         })
         .await
     }

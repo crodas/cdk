@@ -171,13 +171,13 @@ async fn test_swap_saga_setup_transition() {
         .expect("Setup should succeed");
 
     assert_eq!(
-        saga.state_data.blinded_messages.len(),
+        saga.state.blinded_messages.len(),
         output_blinded_messages.len(),
         "SetupComplete state should contain blinded messages"
     );
 
     assert_eq!(
-        saga.state_data.ys.len(),
+        saga.state.ys.len(),
         input_proofs.len(),
         "SetupComplete state should contain input ys"
     );
@@ -242,7 +242,7 @@ async fn test_swap_saga_sign_outputs_transition() {
     let saga = saga.sign_outputs().await.expect("Signing should succeed");
 
     assert_eq!(
-        saga.state_data.signatures.len(),
+        saga.state.signatures.len(),
         output_blinded_messages.len(),
         "Signed state should contain signatures for all outputs"
     );
@@ -411,7 +411,7 @@ async fn test_swap_saga_compensation_clears_on_success() {
 
     let saga = SwapSaga::new(&mint, db, pubsub);
 
-    let compensations_before = saga.compensations.len();
+    let compensations_before = saga.compensations().len();
 
     let saga = saga
         .setup_swap(
@@ -423,7 +423,7 @@ async fn test_swap_saga_compensation_clears_on_success() {
         .await
         .expect("Setup should succeed");
 
-    let compensations_after_setup = saga.compensations.len();
+    let compensations_after_setup = saga.compensations().len();
     assert_eq!(
         compensations_after_setup, 1,
         "Should have one compensation after setup"
@@ -431,7 +431,7 @@ async fn test_swap_saga_compensation_clears_on_success() {
 
     let saga = saga.sign_outputs().await.expect("Signing should succeed");
 
-    let compensations_after_sign = saga.compensations.len();
+    let compensations_after_sign = saga.compensations().len();
     assert_eq!(
         compensations_after_sign, 1,
         "Should still have one compensation after signing"
@@ -647,10 +647,7 @@ async fn test_swap_saga_drop_after_signing() {
         let saga = saga.sign_outputs().await.expect("Signing should succeed");
 
         // Verify we're in Signed state (has signatures)
-        assert_eq!(
-            saga.state_data.signatures.len(),
-            output_blinded_messages.len()
-        );
+        assert_eq!(saga.state.signatures.len(), output_blinded_messages.len());
 
         // saga is dropped here - signatures are lost!
     }
@@ -741,6 +738,64 @@ async fn test_swap_saga_compensation_on_signing_failure() {
     assert!(
         signatures.iter().all(|s| s.is_none()),
         "No signatures should exist (never created)"
+    );
+}
+
+/// Setup announces the inputs as Pending, so rollback has to announce that they
+/// are spendable again. Without it a subscriber is left waiting on a swap that
+/// will never complete.
+#[tokio::test]
+async fn test_swap_saga_compensation_publishes_unspent() {
+    let mint = create_test_mint().await.unwrap();
+    let amount = Amount::from(100);
+    let (input_proofs, input_verification) = create_swap_inputs(&mint, amount).await;
+    let (output_blinded_messages, _) = create_test_blinded_messages(&mint, amount).await.unwrap();
+
+    let ys = input_proofs.ys().unwrap();
+    let mut subscription = mint
+        .pubsub_manager()
+        .subscribe(crate::subscription::Params {
+            kind: cdk_common::nuts::nut17::Kind::ProofState,
+            filters: ys.iter().map(|y| y.to_string()).collect(),
+            id: Arc::new("compensation_publishes_unspent".into()),
+        })
+        .expect("valid subscription");
+
+    let saga = SwapSaga::new(&mint, mint.localstore(), mint.pubsub_manager())
+        .setup_swap(
+            &input_proofs,
+            &output_blinded_messages,
+            None,
+            input_verification,
+        )
+        .await
+        .expect("Setup should succeed");
+
+    set_fail_for("GENERAL");
+    let result = saga.sign_outputs().await;
+    clear_fail_for("GENERAL");
+    assert!(result.is_err(), "Signing should fail");
+
+    let mut seen = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv()).await
+    {
+        if let cdk_common::NotificationPayload::ProofState(proof_state) = event.into_inner() {
+            seen.push(proof_state.state);
+        }
+        if seen.iter().filter(|s| **s == State::Unspent).count() == ys.len() {
+            break;
+        }
+    }
+
+    assert!(
+        seen.contains(&State::Pending),
+        "setup should have announced Pending, saw {seen:?}"
+    );
+    assert_eq!(
+        seen.iter().filter(|s| **s == State::Unspent).count(),
+        ys.len(),
+        "rollback should announce Unspent for every input, saw {seen:?}"
     );
 }
 
@@ -1040,10 +1095,7 @@ async fn test_swap_saga_compensation_on_finalize_add_signatures_failure() {
     let saga = saga.sign_outputs().await.expect("Signing should succeed");
 
     // Verify we're in Signed state
-    assert_eq!(
-        saga.state_data.signatures.len(),
-        output_blinded_messages.len()
-    );
+    assert_eq!(saga.state.signatures.len(), output_blinded_messages.len());
 
     // Enable test failure mode for ADD_SIGNATURES (thread-local, won't affect parallel tests)
     set_fail_for("ADD_SIGNATURES");
@@ -1119,10 +1171,7 @@ async fn test_swap_saga_compensation_on_finalize_update_proofs_failure() {
     let saga = saga.sign_outputs().await.expect("Signing should succeed");
 
     // Verify we're in Signed state
-    assert_eq!(
-        saga.state_data.signatures.len(),
-        output_blinded_messages.len()
-    );
+    assert_eq!(saga.state.signatures.len(), output_blinded_messages.len());
 
     // Enable test failure mode for UPDATE_PROOFS (thread-local, won't affect parallel tests)
     set_fail_for("UPDATE_PROOFS");
@@ -1186,7 +1235,7 @@ async fn test_saga_state_persistence_after_setup() {
         .await
         .expect("Setup should succeed");
 
-    let operation_id = saga.state_data.operation.id();
+    let operation_id = saga.state.operation.id();
 
     // Verify saga exists in database
     let saga = {
@@ -1266,7 +1315,7 @@ async fn test_saga_deletion_on_success() {
         .await
         .expect("Setup should succeed");
 
-    let operation_id = *saga.state_data.operation.id();
+    let operation_id = *saga.state.operation.id();
 
     // Verify saga exists after setup
     let saga_after_setup = {
@@ -1368,7 +1417,7 @@ async fn test_get_incomplete_sagas_basic() {
         )
         .await
         .expect("Setup should succeed");
-    let op_id_1 = *saga_1.state_data.operation.id();
+    let op_id_1 = *saga_1.state.operation.id();
 
     // Should have 1 incomplete saga
     let incomplete_after_1 = db
@@ -1389,7 +1438,7 @@ async fn test_get_incomplete_sagas_basic() {
         )
         .await
         .expect("Setup should succeed");
-    let op_id_2 = *saga_2.state_data.operation.id();
+    let op_id_2 = *saga_2.state.operation.id();
 
     // Should have 2 incomplete sagas
     let incomplete_after_2 = db
@@ -1458,7 +1507,7 @@ async fn test_saga_content_validation() {
         .await
         .expect("Setup should succeed");
 
-    let operation_id = *saga.state_data.operation.id();
+    let operation_id = *saga.state.operation.id();
 
     // Query saga
     let saga = {
@@ -1551,7 +1600,7 @@ async fn test_saga_state_updates_persisted() {
         .await
         .expect("Setup should succeed");
 
-    let operation_id = *saga.state_data.operation.id();
+    let operation_id = *saga.state.operation.id();
 
     // Query saga
     let state_after_setup = {
@@ -2109,7 +2158,7 @@ async fn test_crash_recovery_without_compensation() {
             .await
             .expect("Setup should succeed");
 
-        operation_id = *saga.state_data.operation.id();
+        operation_id = *saga.state.operation.id();
 
         // CRITICAL: Drop saga WITHOUT calling compensate_all()
         // This simulates a crash where in-memory compensations are lost
@@ -2202,7 +2251,7 @@ async fn test_crash_recovery_after_setup_only() {
             .await
             .expect("Setup should succeed");
 
-        operation_id = *saga.state_data.operation.id();
+        operation_id = *saga.state.operation.id();
 
         // Verify saga was persisted
         let saga = {
@@ -2289,15 +2338,12 @@ async fn test_crash_recovery_after_signing() {
             .await
             .expect("Setup should succeed");
 
-        operation_id = *saga.state_data.operation.id();
+        operation_id = *saga.state.operation.id();
 
         let saga = saga.sign_outputs().await.expect("Signing should succeed");
 
         // Verify we have signatures in memory
-        assert_eq!(
-            saga.state_data.signatures.len(),
-            output_blinded_messages.len()
-        );
+        assert_eq!(saga.state.signatures.len(), output_blinded_messages.len());
 
         // Drop without finalize (crash) - signatures lost
         drop(saga);
@@ -2389,7 +2435,7 @@ async fn test_recovery_multiple_incomplete_sagas() {
             .setup_swap(&proofs_a, &outputs_a, None, verification_a)
             .await
             .expect("Setup A should succeed");
-        op_id_a = *saga.state_data.operation.id();
+        op_id_a = *saga.state.operation.id();
         drop(saga);
     }
 
@@ -2401,7 +2447,7 @@ async fn test_recovery_multiple_incomplete_sagas() {
             .setup_swap(&proofs_b, &outputs_b, None, verification_b)
             .await
             .expect("Setup B should succeed");
-        op_id_b = *saga.state_data.operation.id();
+        op_id_b = *saga.state.operation.id();
         let saga = saga.sign_outputs().await.expect("Sign B should succeed");
         drop(saga);
     }
@@ -2414,7 +2460,7 @@ async fn test_recovery_multiple_incomplete_sagas() {
             .setup_swap(&proofs_c, &outputs_c, None, verification_c)
             .await
             .expect("Setup C should succeed");
-        op_id_c = *saga.state_data.operation.id();
+        op_id_c = *saga.state.operation.id();
         let saga = saga.sign_outputs().await.expect("Sign C should succeed");
         let _response = saga.finalize().await.expect("Finalize C should succeed");
     }
@@ -2516,7 +2562,7 @@ async fn test_recovery_idempotence() {
             .setup_swap(&input_proofs, &output_blinded_messages, None, verification)
             .await
             .expect("Setup should succeed");
-        operation_id = *saga.state_data.operation.id();
+        operation_id = *saga.state.operation.id();
         drop(saga);
     }
 
@@ -2612,7 +2658,7 @@ async fn test_orphaned_saga_cleanup() {
         .await
         .expect("Setup should succeed");
 
-    let operation_id = *saga.state_data.operation.id();
+    let operation_id = *saga.state.operation.id();
     let ys = input_proofs.ys().unwrap();
     let blinded_secrets: Vec<_> = output_blinded_messages
         .iter()
@@ -2706,7 +2752,7 @@ async fn test_recovery_with_orphaned_proofs() {
             .await
             .expect("Setup should succeed");
 
-        let op_id = *saga.state_data.operation.id();
+        let op_id = *saga.state.operation.id();
 
         // Drop saga (crash simulation)
         drop(saga);
@@ -2814,7 +2860,7 @@ async fn test_recovery_with_partial_state() {
             .await
             .expect("Setup should succeed");
 
-        let op_id = *saga.state_data.operation.id();
+        let op_id = *saga.state.operation.id();
 
         // Drop saga (crash simulation)
         drop(saga);
@@ -2906,7 +2952,7 @@ async fn test_recovery_with_missing_blinded_messages() {
             .await
             .expect("Setup should succeed");
 
-        let op_id = *saga.state_data.operation.id();
+        let op_id = *saga.state.operation.id();
         drop(saga); // Crash
 
         op_id
@@ -2983,7 +3029,7 @@ async fn test_saga_deletion_failure_handling() {
         .await
         .expect("Setup should succeed");
 
-    let operation_id = *saga.state_data.operation.id();
+    let operation_id = *saga.state.operation.id();
     let ys = input_proofs.ys().unwrap();
 
     let saga = saga.sign_outputs().await.expect("Signing should succeed");

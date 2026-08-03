@@ -3,14 +3,11 @@
 //! When a saga step fails, compensating actions execute in reverse order (LIFO)
 //! to undo completed steps and restore the database to its pre-saga state.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use cdk_common::database::{self, WalletDatabase};
 use tracing::instrument;
 
 use crate::nuts::PublicKey;
-use crate::wallet::saga::CompensatingAction;
+use crate::wallet::saga::{CompensatingAction, WalletSagaContext};
 use crate::Error;
 
 /// Compensation action to remove pending proofs that were stored during receive.
@@ -19,8 +16,6 @@ use crate::Error;
 /// in Pending state (before the swap is executed). It removes those proofs
 /// and deletes the saga record.
 pub struct RemovePendingProofs {
-    /// Database reference
-    pub localstore: Arc<dyn WalletDatabase<database::Error> + Send + Sync>,
     /// Y values (public keys) of the pending proofs to remove
     pub proof_ys: Vec<PublicKey>,
     /// Saga ID for cleanup
@@ -29,20 +24,20 @@ pub struct RemovePendingProofs {
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl CompensatingAction for RemovePendingProofs {
+impl<'a> CompensatingAction<WalletSagaContext<'a>> for RemovePendingProofs {
     #[instrument(skip_all)]
-    async fn execute(&self) -> Result<(), Error> {
+    async fn execute(&self, ctx: &WalletSagaContext<'a>) -> Result<(), Error> {
         tracing::info!(
             "Compensation: Removing {} pending proofs from receive",
             self.proof_ys.len()
         );
 
-        self.localstore
+        ctx.localstore()
             .update_proofs(vec![], self.proof_ys.clone())
             .await
             .map_err(Error::Database)?;
 
-        if let Err(e) = self.localstore.delete_saga(&self.saga_id).await {
+        if let Err(e) = ctx.localstore().delete_saga(&self.saga_id).await {
             tracing::warn!(
                 "Compensation: Failed to delete saga {}: {}. Will be cleaned up on recovery.",
                 self.saga_id,
@@ -70,6 +65,7 @@ mod tests {
     use super::*;
     use crate::wallet::saga::test_utils::*;
     use crate::wallet::saga::CompensatingAction;
+    use crate::wallet::saga::WalletSagaContext;
 
     /// Create a test wallet saga for receive operations
     fn test_receive_saga(mint_url: cdk_common::mint_url::MintUrl) -> WalletSaga {
@@ -92,6 +88,8 @@ mod tests {
     #[tokio::test]
     async fn test_remove_pending_proofs_is_idempotent() {
         let db = create_test_db().await;
+        let wallet = test_wallet(db.clone()).await;
+        let ctx = WalletSagaContext::new(&wallet);
         let mint_url = test_mint_url();
         let keyset_id = test_keyset_id();
 
@@ -104,14 +102,13 @@ mod tests {
         db.add_saga(saga).await.unwrap();
 
         let compensation = RemovePendingProofs {
-            localstore: db.clone(),
             proof_ys: vec![proof_y],
             saga_id,
         };
 
         // Execute twice - should succeed both times
-        compensation.execute().await.unwrap();
-        compensation.execute().await.unwrap();
+        compensation.execute(&ctx).await.unwrap();
+        compensation.execute(&ctx).await.unwrap();
 
         // Proofs should still be gone
         let all_proofs = db.get_proofs(None, None, None, None).await.unwrap();
@@ -121,6 +118,8 @@ mod tests {
     #[tokio::test]
     async fn test_remove_pending_proofs_handles_missing_saga() {
         let db = create_test_db().await;
+        let wallet = test_wallet(db.clone()).await;
+        let ctx = WalletSagaContext::new(&wallet);
         let mint_url = test_mint_url();
         let keyset_id = test_keyset_id();
 
@@ -132,13 +131,12 @@ mod tests {
         let saga_id = uuid::Uuid::new_v4();
 
         let compensation = RemovePendingProofs {
-            localstore: db.clone(),
             proof_ys: vec![proof_y],
             saga_id,
         };
 
         // Should succeed even without saga
-        compensation.execute().await.unwrap();
+        compensation.execute(&ctx).await.unwrap();
 
         // Proofs should be removed
         let all_proofs = db.get_proofs(None, None, None, None).await.unwrap();
@@ -148,6 +146,8 @@ mod tests {
     #[tokio::test]
     async fn test_remove_pending_proofs_only_affects_specified_proofs() {
         let db = create_test_db().await;
+        let wallet = test_wallet(db.clone()).await;
+        let ctx = WalletSagaContext::new(&wallet);
         let mint_url = test_mint_url();
         let keyset_id = test_keyset_id();
 
@@ -166,11 +166,10 @@ mod tests {
 
         // Only remove the first proof
         let compensation = RemovePendingProofs {
-            localstore: db.clone(),
             proof_ys: vec![proof_y_1],
             saga_id,
         };
-        compensation.execute().await.unwrap();
+        compensation.execute(&ctx).await.unwrap();
 
         // Second proof should still exist
         let remaining_proofs = db.get_proofs(None, None, None, None).await.unwrap();

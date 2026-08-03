@@ -32,6 +32,7 @@ use crate::mint_url::MintUrl;
 use crate::nuts::CurrencyUnit;
 use crate::wallet::OperationKind;
 use crate::Amount;
+use crate::Error;
 
 mod issue;
 mod melt;
@@ -244,4 +245,70 @@ impl WalletSaga {
             .as_secs();
         self.version += 1;
     }
+}
+
+/// Reads a saga's state and data as one operation's types.
+///
+/// [`WalletSagaState`] and [`OperationData`] are parallel enums that always
+/// agree in practice, but nothing in the types says so, and every recovery entry
+/// point has to say what it expects. Each accessor names one operation and
+/// reports the mismatch once.
+macro_rules! saga_accessor {
+    ($name:ident, $kind:literal, $state:ident, $state_ty:ty, $data:ident, $data_ty:ty) => {
+        #[doc = concat!("Read this saga as a ", $kind, " saga.")]
+        ///
+        /// Returns an error if it belongs to a different operation.
+        pub fn $name(&self) -> Result<(&$state_ty, &$data_ty), Error> {
+            match (&self.state, &self.data) {
+                (WalletSagaState::$state(state), OperationData::$data(data)) => Ok((state, data)),
+                _ => Err(Error::Custom(format!(
+                    concat!("Saga {} is not a ", $kind, " saga"),
+                    self.id
+                ))),
+            }
+        }
+    };
+}
+
+impl WalletSaga {
+    saga_accessor!(
+        as_send,
+        "send",
+        Send,
+        SendSagaState,
+        Send,
+        SendOperationData
+    );
+    saga_accessor!(
+        as_receive,
+        "receive",
+        Receive,
+        ReceiveSagaState,
+        Receive,
+        ReceiveOperationData
+    );
+    saga_accessor!(
+        as_swap,
+        "swap",
+        Swap,
+        SwapSagaState,
+        Swap,
+        SwapOperationData
+    );
+    saga_accessor!(
+        as_issue,
+        "issue",
+        Issue,
+        IssueSagaState,
+        Mint,
+        MintOperationData
+    );
+    saga_accessor!(
+        as_melt,
+        "melt",
+        Melt,
+        MeltSagaState,
+        Melt,
+        MeltOperationData
+    );
 }

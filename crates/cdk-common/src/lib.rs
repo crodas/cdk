@@ -34,6 +34,8 @@ pub mod mint_quote;
 #[cfg(feature = "mint")]
 pub mod payment;
 pub mod pub_sub;
+#[cfg(any(feature = "mint", feature = "wallet"))]
+pub mod saga;
 #[cfg(feature = "mint")]
 pub mod state;
 pub mod stream;

@@ -912,13 +912,7 @@ impl PreparedMelt {
 
     /// Cancel the prepared melt and release reserved proofs
     pub async fn cancel(&self) -> Result<(), FfiError> {
-        self.wallet
-            .cancel_prepared_melt(
-                self.operation_id,
-                self.proofs.clone(),
-                self.proofs_to_swap.clone(),
-            )
-            .await?;
+        self.wallet.cancel_prepared_melt(self.operation_id).await?;
         Ok(())
     }
 }

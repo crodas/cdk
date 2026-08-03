@@ -49,11 +49,12 @@ use self::state::{Finalized, Initial, MeltRequested, PaymentPending, Prepared};
 use super::MeltConfirmOptions;
 use crate::nuts::nut00::{KnownMethod, ProofsMethods};
 use crate::nuts::{MeltRequest, PreMintSecrets, Proofs, State};
+use crate::saga::Saga;
 use crate::util::unix_time;
 use crate::wallet::blind_signature::{
     validate_mint_response_signatures, SignatureAmountValidation,
 };
-use crate::wallet::saga::{add_compensation, new_compensations, Compensations};
+use crate::wallet::saga::WalletSagaContext;
 use crate::{ensure_cdk, Amount, Error, Wallet};
 
 pub(crate) mod compensation;
@@ -61,7 +62,8 @@ pub(crate) mod resume;
 pub(crate) mod state;
 
 /// Result of an async melt execution
-pub enum MeltSagaResult<'a> {
+#[derive(Debug)]
+pub(crate) enum MeltSagaResult<'a> {
     /// Melt finalized (paid)
     Finalized(MeltSaga<'a, Finalized>),
     /// Melt pending
@@ -73,21 +75,35 @@ pub enum MeltSagaResult<'a> {
 /// Uses the typestate pattern to enforce valid state transitions at compile-time.
 /// Each state (Initial, Prepared, Confirmed) is a distinct type, and operations
 /// are only available on the appropriate type.
-pub(crate) struct MeltSaga<'a, S> {
-    /// Wallet reference
-    pub(crate) wallet: &'a Wallet,
-    /// Compensating actions in LIFO order (most recent first)
-    pub(crate) compensations: Compensations,
-    /// State-specific data
-    pub(crate) state_data: S,
+pub(crate) type MeltSaga<'a, S> = Saga<WalletSagaContext<'a>, S>;
+
+/// A MeltSaga that has not started yet. Constructors name this rather than
+/// the generic alias, so the state they produce is not left to inference.
+pub(crate) type NewMeltSaga<'a> = MeltSaga<'a, Initial>;
+
+/// A MeltSaga rebuilt from a persisted prepared melt.
+pub(crate) type PreparedMeltSaga<'a> = MeltSaga<'a, Prepared>;
+
+/// Release the quote and proofs a melt reserved, best-effort.
+///
+/// The caller has already decided the melt is not happening, so a failure here
+/// is logged and left for recovery rather than surfaced.
+async fn release_melt(wallet: &Wallet, operation_id: Uuid) {
+    let _ = wallet
+        .compensate_saga(vec![
+            Box::new(ReleaseMeltQuote { operation_id }),
+            Box::new(RevertProofReservation {
+                saga_id: operation_id,
+            }),
+        ])
+        .await;
 }
 
 /// Shared helper function to perform the actual melt finalization.
 /// Used by `execute_async` and `PaymentPending::finalize`.
 #[allow(clippy::too_many_arguments)]
-async fn finalize_melt_common<'a>(
-    wallet: &'a Wallet,
-    compensations: Compensations,
+async fn finalize_melt_common(
+    wallet: &Wallet,
     operation_id: Uuid,
     quote_info: &MeltQuote,
     final_proofs: &Proofs,
@@ -97,7 +113,7 @@ async fn finalize_melt_common<'a>(
     change: Option<Vec<crate::nuts::BlindSignature>>,
     metadata: HashMap<String, String>,
     keyset_policy: KeysetLoadPolicy,
-) -> Result<MeltSaga<'a, Finalized>, Error> {
+) -> Result<Finalized, Error> {
     let active_keyset_id = wallet.active_keyset_with_policy(keyset_policy).await?.id;
     let active_keys = wallet
         .keyset_with_policy(active_keyset_id, keyset_policy)
@@ -218,17 +234,13 @@ async fn finalize_melt_common<'a>(
             e
         );
     }
-    Ok(MeltSaga {
-        wallet,
-        compensations,
-        state_data: Finalized {
-            quote_id: quote_info.id.clone(),
-            state,
-            amount: quote_info.amount,
-            fee,
-            payment_proof,
-            change: change_proofs,
-        },
+    Ok(Finalized {
+        quote_id: quote_info.id.clone(),
+        state,
+        amount: quote_info.amount,
+        fee,
+        payment_proof,
+        change: change_proofs,
     })
 }
 
@@ -237,19 +249,20 @@ impl<'a> MeltSaga<'a, Initial> {
     pub fn new(wallet: &'a Wallet) -> Self {
         let operation_id = uuid::Uuid::now_v7();
 
-        Self {
-            wallet,
-            compensations: new_compensations(),
-            state_data: Initial {
+        Saga::start(
+            WalletSagaContext::new(wallet),
+            operation_id,
+            Initial {
                 operation_id,
                 keyset_policy: Default::default(),
             },
-        }
+        )
     }
 
     /// Initialize melt operation (common steps for prepare methods)
     async fn initialize_melt(&mut self, quote_id: &str) -> Result<MeltQuote, Error> {
         let quote_info = self
+            .ctx
             .wallet
             .localstore
             .get_melt_quote(quote_id)
@@ -262,20 +275,16 @@ impl<'a> MeltSaga<'a, Initial> {
         );
 
         // Reserve the quote to prevent concurrent operations from using it
-        self.wallet
+        self.ctx
+            .wallet
             .localstore
-            .reserve_melt_quote(quote_id, &self.state_data.operation_id)
+            .reserve_melt_quote(quote_id, &self.state.operation_id)
             .await?;
 
         // Register compensation to release quote on failure
-        add_compensation(
-            &mut self.compensations,
-            Box::new(ReleaseMeltQuote {
-                localstore: self.wallet.localstore.clone(),
-                operation_id: self.state_data.operation_id,
-            }),
-        )
-        .await;
+        self.push_compensation(Box::new(ReleaseMeltQuote {
+            operation_id: self.state.operation_id,
+        }));
 
         Ok(quote_info)
     }
@@ -297,7 +306,7 @@ impl<'a> MeltSaga<'a, Initial> {
         tracing::info!(
             "Preparing melt for quote {} with operation {}",
             quote_id,
-            self.state_data.operation_id
+            self.state.operation_id
         );
 
         let quote_info = self.initialize_melt(quote_id).await?;
@@ -307,9 +316,10 @@ impl<'a> MeltSaga<'a, Initial> {
             .checked_add(quote_info.fee_reserve)
             .ok_or(Error::AmountOverflow)?;
 
-        let keyset_policy = self.state_data.keyset_policy;
+        let keyset_policy = self.state.keyset_policy;
 
         let active_keyset_ids = self
+            .ctx
             .wallet
             .keysets(keyset_policy)
             .await?
@@ -318,11 +328,12 @@ impl<'a> MeltSaga<'a, Initial> {
             .map(|k| k.id)
             .collect();
         let keyset_fees_and_amounts = self
+            .ctx
             .wallet
             .get_keyset_fees_and_amounts_with_policy(keyset_policy)
             .await?;
 
-        let available_proofs = self.wallet.get_unspent_proofs().await?;
+        let available_proofs = self.ctx.wallet.get_unspent_proofs().await?;
 
         let exact_input_proofs = Wallet::select_proofs(
             inputs_needed_amount,
@@ -335,9 +346,10 @@ impl<'a> MeltSaga<'a, Initial> {
 
         if proofs_total == inputs_needed_amount {
             let proof_ys = exact_input_proofs.ys()?;
-            let operation_id = self.state_data.operation_id;
+            let operation_id = self.state.operation_id;
 
-            self.wallet
+            self.ctx
+                .wallet
                 .localstore
                 .reserve_proofs(proof_ys.clone(), &operation_id)
                 .await?;
@@ -346,8 +358,8 @@ impl<'a> MeltSaga<'a, Initial> {
                 operation_id,
                 WalletSagaState::Melt(MeltSagaState::ProofsReserved),
                 quote_info.amount,
-                self.wallet.mint_url.clone(),
-                self.wallet.unit.clone(),
+                self.ctx.wallet.mint_url.clone(),
+                self.ctx.wallet.unit.clone(),
                 OperationData::Melt(MeltOperationData {
                     quote_id: quote_id.to_string(),
                     amount: quote_info.amount,
@@ -361,49 +373,48 @@ impl<'a> MeltSaga<'a, Initial> {
                 }),
             );
 
-            self.wallet.localstore.add_saga(saga.clone()).await?;
+            self.ctx.wallet.localstore.add_saga(saga.clone()).await?;
 
-            add_compensation(
-                &mut self.compensations,
-                Box::new(RevertProofReservation {
-                    localstore: self.wallet.localstore.clone(),
-                    proof_ys,
-                    saga_id: operation_id,
-                }),
-            )
-            .await;
+            self.push_compensation(Box::new(RevertProofReservation {
+                saga_id: operation_id,
+            }));
 
-            let input_fee = self.wallet.get_proofs_fee(&exact_input_proofs).await?.total;
+            let input_fee = self
+                .ctx
+                .wallet
+                .get_proofs_fee(&exact_input_proofs)
+                .await?
+                .total;
 
-            return Ok(MeltSaga {
-                wallet: self.wallet,
-                compensations: self.compensations,
-                state_data: Prepared {
-                    operation_id: self.state_data.operation_id,
-                    quote: quote_info,
-                    proofs: exact_input_proofs,
-                    proofs_to_swap: Proofs::new(),
-                    swap_fee: Amount::ZERO,
-                    input_fee,
-                    input_fee_without_swap: input_fee,
-                    keyset_policy,
-                    saga,
-                },
-            });
+            let operation_id = self.operation_id;
+            return Ok(self.advance(Prepared {
+                operation_id,
+                quote: quote_info,
+                proofs: exact_input_proofs,
+                proofs_to_swap: Proofs::new(),
+                swap_fee: Amount::ZERO,
+                input_fee,
+                input_fee_without_swap: input_fee,
+                keyset_policy,
+                saga,
+            }));
         }
 
         let active_keyset_id = self
+            .ctx
             .wallet
             .active_keyset_with_policy(keyset_policy)
             .await?
             .id;
         let fee_and_amounts = self
+            .ctx
             .wallet
             .get_keyset_fees_and_amounts_by_id_with_policy(active_keyset_id, keyset_policy)
             .await?;
 
         let estimated_output_count = inputs_needed_amount.split(&fee_and_amounts)?.len();
         let estimated_melt_fee = self
+            .ctx
             .wallet
             .get_keyset_count_fee_with_policy(
                 &active_keyset_id,
@@ -428,13 +439,14 @@ impl<'a> MeltSaga<'a, Initial> {
 
         let proofs_to_send = Proofs::new();
         let proofs_to_swap = input_proofs;
-        let swap_fee = self.wallet.get_proofs_fee(&proofs_to_swap).await?.total;
+        let swap_fee = self.ctx.wallet.get_proofs_fee(&proofs_to_swap).await?.total;
 
         let proof_ys = proofs_to_swap.ys()?;
-        let operation_id = self.state_data.operation_id;
+        let operation_id = self.state.operation_id;
 
         if !proof_ys.is_empty() {
-            self.wallet
+            self.ctx
+                .wallet
                 .localstore
                 .reserve_proofs(proof_ys.clone(), &operation_id)
                 .await?;
@@ -444,8 +456,8 @@ impl<'a> MeltSaga<'a, Initial> {
             operation_id,
             WalletSagaState::Melt(MeltSagaState::ProofsReserved),
             quote_info.amount,
-            self.wallet.mint_url.clone(),
-            self.wallet.unit.clone(),
+            self.ctx.wallet.mint_url.clone(),
+            self.ctx.wallet.unit.clone(),
             OperationData::Melt(MeltOperationData {
                 quote_id: quote_id.to_string(),
                 amount: quote_info.amount,
@@ -459,35 +471,26 @@ impl<'a> MeltSaga<'a, Initial> {
             }),
         );
 
-        self.wallet.localstore.add_saga(saga.clone()).await?;
+        self.ctx.wallet.localstore.add_saga(saga.clone()).await?;
 
-        add_compensation(
-            &mut self.compensations,
-            Box::new(RevertProofReservation {
-                localstore: self.wallet.localstore.clone(),
-                proof_ys,
-                saga_id: operation_id,
-            }),
-        )
-        .await;
+        self.push_compensation(Box::new(RevertProofReservation {
+            saga_id: operation_id,
+        }));
 
         let input_fee_without_swap = swap_fee;
 
-        Ok(MeltSaga {
-            wallet: self.wallet,
-            compensations: self.compensations,
-            state_data: Prepared {
-                operation_id: self.state_data.operation_id,
-                quote: quote_info,
-                proofs: proofs_to_send,
-                proofs_to_swap,
-                swap_fee,
-                input_fee,
-                input_fee_without_swap,
-                keyset_policy,
-                saga,
-            },
-        })
+        let operation_id = self.operation_id;
+        Ok(self.advance(Prepared {
+            operation_id,
+            quote: quote_info,
+            proofs: proofs_to_send,
+            proofs_to_swap,
+            swap_fee,
+            input_fee,
+            input_fee_without_swap,
+            keyset_policy,
+            saga,
+        }))
     }
 
     /// Prepare the melt operation with specific proofs (no automatic selection).
@@ -509,7 +512,7 @@ impl<'a> MeltSaga<'a, Initial> {
         tracing::info!(
             "Preparing melt with specific proofs for quote {} with operation {}",
             quote_id,
-            self.state_data.operation_id
+            self.state.operation_id
         );
 
         let quote_info = self.initialize_melt(quote_id).await?;
@@ -523,8 +526,7 @@ impl<'a> MeltSaga<'a, Initial> {
             return Err(Error::InsufficientFunds);
         }
 
-        let operation_id = self.state_data.operation_id;
-        let proof_ys = proofs.ys()?;
+        let operation_id = self.state.operation_id;
 
         // Since proofs may be external (not in our database), add them first
         // while preserving the operation link needed for recovery.
@@ -534,16 +536,17 @@ impl<'a> MeltSaga<'a, Initial> {
             .map(|p| {
                 ProofInfo::new_with_operations(
                     p,
-                    self.wallet.mint_url.clone(),
+                    self.ctx.wallet.mint_url.clone(),
                     State::Reserved,
-                    self.wallet.unit.clone(),
+                    self.ctx.wallet.unit.clone(),
                     Some(operation_id),
                     None,
                 )
             })
             .collect::<Result<Vec<ProofInfo>, _>>()?;
 
-        self.wallet
+        self.ctx
+            .wallet
             .localstore
             .update_proofs(proofs_info, vec![])
             .await?;
@@ -552,8 +555,8 @@ impl<'a> MeltSaga<'a, Initial> {
             operation_id,
             WalletSagaState::Melt(MeltSagaState::ProofsReserved),
             quote_info.amount,
-            self.wallet.mint_url.clone(),
-            self.wallet.unit.clone(),
+            self.ctx.wallet.mint_url.clone(),
+            self.ctx.wallet.unit.clone(),
             OperationData::Melt(MeltOperationData {
                 quote_id: quote_id.to_string(),
                 amount: quote_info.amount,
@@ -567,35 +570,27 @@ impl<'a> MeltSaga<'a, Initial> {
             }),
         );
 
-        self.wallet.localstore.add_saga(saga.clone()).await?;
+        self.ctx.wallet.localstore.add_saga(saga.clone()).await?;
 
-        add_compensation(
-            &mut self.compensations,
-            Box::new(RevertProofReservation {
-                localstore: self.wallet.localstore.clone(),
-                proof_ys,
-                saga_id: operation_id,
-            }),
-        )
-        .await;
+        self.push_compensation(Box::new(RevertProofReservation {
+            saga_id: operation_id,
+        }));
 
-        let input_fee = self.wallet.get_proofs_fee(&proofs).await?.total;
+        let input_fee = self.ctx.wallet.get_proofs_fee(&proofs).await?.total;
 
-        Ok(MeltSaga {
-            wallet: self.wallet,
-            compensations: self.compensations,
-            state_data: Prepared {
-                operation_id: self.state_data.operation_id,
-                quote: quote_info,
-                proofs,
-                proofs_to_swap: Proofs::new(),
-                swap_fee: Amount::ZERO,
-                input_fee,
-                input_fee_without_swap: input_fee,
-                keyset_policy: self.state_data.keyset_policy,
-                saga,
-            },
-        })
+        let operation_id = self.operation_id;
+        let keyset_policy = self.state.keyset_policy;
+        Ok(self.advance(Prepared {
+            operation_id,
+            quote: quote_info,
+            proofs,
+            proofs_to_swap: Proofs::new(),
+            swap_fee: Amount::ZERO,
+            input_fee,
+            input_fee_without_swap: input_fee,
+            keyset_policy,
+            saga,
+        }))
     }
 }
 
@@ -618,10 +613,10 @@ impl<'a> MeltSaga<'a, Prepared> {
         input_fee_without_swap: Amount,
         saga: WalletSaga,
     ) -> Self {
-        Self {
-            wallet,
-            compensations: new_compensations(),
-            state_data: Prepared {
+        Saga::start(
+            WalletSagaContext::new(wallet),
+            operation_id,
+            Prepared {
                 operation_id,
                 quote,
                 proofs,
@@ -632,42 +627,42 @@ impl<'a> MeltSaga<'a, Prepared> {
                 keyset_policy: Default::default(),
                 saga,
             },
-        }
+        )
     }
 
     /// Get the operation ID
     pub fn operation_id(&self) -> uuid::Uuid {
-        self.state_data.operation_id
+        self.state.operation_id
     }
 
     /// Get the quote
     pub fn quote(&self) -> &MeltQuote {
-        &self.state_data.quote
+        &self.state.quote
     }
 
     /// Get the proofs that will be used
     pub fn proofs(&self) -> &Proofs {
-        &self.state_data.proofs
+        &self.state.proofs
     }
 
     /// Get the proofs that need to be swapped
     pub fn proofs_to_swap(&self) -> &Proofs {
-        &self.state_data.proofs_to_swap
+        &self.state.proofs_to_swap
     }
 
     /// Get the swap fee
     pub fn swap_fee(&self) -> Amount {
-        self.state_data.swap_fee
+        self.state.swap_fee
     }
 
     /// Get the input fee
     pub fn input_fee(&self) -> Amount {
-        self.state_data.input_fee
+        self.state.input_fee
     }
 
     /// Get the input fee if swap is skipped
     pub fn input_fee_without_swap(&self) -> Amount {
-        self.state_data.input_fee_without_swap
+        self.state.input_fee_without_swap
     }
 
     /// Build the melt request with options and transition to MeltRequested state.
@@ -686,9 +681,9 @@ impl<'a> MeltSaga<'a, Prepared> {
         mut self,
         options: MeltConfirmOptions,
     ) -> Result<MeltSaga<'a, MeltRequested>, Error> {
-        let operation_id = self.state_data.operation_id;
-        let quote_info = self.state_data.quote.clone();
-        let input_fee = self.state_data.input_fee;
+        let operation_id = self.state.operation_id;
+        let quote_info = self.state.quote.clone();
+        let input_fee = self.state.input_fee;
 
         tracing::info!(
             "Building melt request for quote {} with operation {} (skip_swap: {})",
@@ -697,25 +692,26 @@ impl<'a> MeltSaga<'a, Prepared> {
             options.skip_swap
         );
 
-        let keyset_policy = self.state_data.keyset_policy;
+        let keyset_policy = self.state.keyset_policy;
         let active_keyset_id = self
+            .ctx
             .wallet
             .active_keyset_with_policy(keyset_policy)
             .await?
             .id;
-        let mut final_proofs = self.state_data.proofs.clone();
+        let mut final_proofs = self.state.proofs.clone();
 
         // Handle proofs_to_swap based on skip_swap option
-        if !self.state_data.proofs_to_swap.is_empty() {
+        if !self.state.proofs_to_swap.is_empty() {
             if options.skip_swap {
                 // Skip swap: use proofs_to_swap directly
                 // The mint will return change from the melt
                 tracing::debug!(
                     "Skipping swap, using {} proofs directly (total: {})",
-                    self.state_data.proofs_to_swap.len(),
-                    self.state_data.proofs_to_swap.total_amount()?,
+                    self.state.proofs_to_swap.len(),
+                    self.state.proofs_to_swap.total_amount()?,
                 );
-                final_proofs.extend(self.state_data.proofs_to_swap.clone());
+                final_proofs.extend(self.state.proofs_to_swap.clone());
             } else {
                 // Current behavior: swap first to get optimal denominations
                 let target_swap_amount = quote_info
@@ -727,17 +723,18 @@ impl<'a> MeltSaga<'a, Prepared> {
 
                 tracing::debug!(
                     "Swapping {} proofs (total: {}) for target amount {}",
-                    self.state_data.proofs_to_swap.len(),
-                    self.state_data.proofs_to_swap.total_amount()?,
+                    self.state.proofs_to_swap.len(),
+                    self.state.proofs_to_swap.total_amount()?,
                     target_swap_amount
                 );
 
                 if let Some(swapped) = self
+                    .ctx
                     .wallet
                     .swap_no_reserve(
                         Some(target_swap_amount),
                         SplitTarget::None,
-                        self.state_data.proofs_to_swap.clone(),
+                        self.state.proofs_to_swap.clone(),
                         None,
                         false,
                         false,
@@ -750,7 +747,7 @@ impl<'a> MeltSaga<'a, Prepared> {
         }
 
         // Recalculate the actual input_fee based on final_proofs
-        let actual_input_fee = self.wallet.get_proofs_fee(&final_proofs).await?.total;
+        let actual_input_fee = self.ctx.wallet.get_proofs_fee(&final_proofs).await?.total;
         let inputs_needed_amount = quote_info
             .amount
             .checked_add(quote_info.fee_reserve)
@@ -761,7 +758,7 @@ impl<'a> MeltSaga<'a, Prepared> {
         let proofs_total = final_proofs.total_amount()?;
         if proofs_total < inputs_needed_amount {
             // Insufficient funds - execute compensations
-            self.compensate().await;
+            self.compensate().await?;
             return Err(Error::InsufficientFunds);
         }
 
@@ -772,30 +769,25 @@ impl<'a> MeltSaga<'a, Prepared> {
             .map(|p| {
                 ProofInfo::new_with_operations(
                     p,
-                    self.wallet.mint_url.clone(),
+                    self.ctx.wallet.mint_url.clone(),
                     State::Pending,
-                    self.wallet.unit.clone(),
+                    self.ctx.wallet.unit.clone(),
                     Some(operation_id),
                     None,
                 )
             })
             .collect::<Result<Vec<ProofInfo>, _>>()?;
 
-        self.wallet
+        self.ctx
+            .wallet
             .localstore
             .update_proofs(proofs_info, vec![])
             .await?;
 
         // Add compensation to revert the new proofs if the saga fails later
-        add_compensation(
-            &mut self.compensations,
-            Box::new(RevertProofReservation {
-                localstore: self.wallet.localstore.clone(),
-                proof_ys: final_proofs.ys()?,
-                saga_id: operation_id,
-            }),
-        )
-        .await;
+        self.push_compensation(Box::new(RevertProofReservation {
+            saga_id: operation_id,
+        }));
 
         // Calculate change accounting for input fees
         let change_amount = proofs_total - quote_info.amount - actual_input_fee;
@@ -807,6 +799,7 @@ impl<'a> MeltSaga<'a, Prepared> {
                 ((u64::from(change_amount) as f64).log2().ceil() as u64).max(1) as u32;
 
             let new_counter = self
+                .ctx
                 .wallet
                 .localstore
                 .increment_keyset_counter(&active_keyset_id, num_secrets)
@@ -817,13 +810,14 @@ impl<'a> MeltSaga<'a, Prepared> {
             PreMintSecrets::from_seed_blank(
                 active_keyset_id,
                 count,
-                &self.wallet.seed,
+                &self.ctx.wallet.seed,
                 change_amount,
             )?
         };
 
         // Get counter range for recovery
         let counter_end = self
+            .ctx
             .wallet
             .localstore
             .increment_keyset_counter(&active_keyset_id, 0)
@@ -839,7 +833,7 @@ impl<'a> MeltSaga<'a, Prepared> {
         let final_proof_ys = final_proofs.ys()?;
 
         // Update saga state to MeltRequested BEFORE making the melt call
-        let mut saga = self.state_data.saga.clone();
+        let mut saga = self.state.saga.clone();
         saga.update_state(WalletSagaState::Melt(MeltSagaState::MeltRequested));
         if let OperationData::Melt(ref mut data) = saga.data {
             data.counter_start = Some(counter_start);
@@ -853,89 +847,44 @@ impl<'a> MeltSaga<'a, Prepared> {
             data.change_blinded_messages = change_blinded_messages.clone();
         }
 
-        if !self.wallet.localstore.update_saga(saga.clone()).await? {
+        if !self.ctx.wallet.localstore.update_saga(saga.clone()).await? {
             return Err(Error::ConcurrentUpdate);
         }
 
-        Ok(MeltSaga {
-            wallet: self.wallet,
-            compensations: self.compensations,
-            state_data: MeltRequested {
-                operation_id,
-                quote: quote_info,
-                final_proofs,
-                premint_secrets,
-            },
-        })
-    }
-
-    /// Execute compensations and cancel the melt.
-    async fn compensate(self) {
-        // Move compensations out of self to iterate while owning self
-        let mut compensations = self.compensations;
-        while let Some(action) = compensations.pop_front() {
-            if let Err(e) = action.execute().await {
-                tracing::warn!("Compensation {} failed: {}", action.name(), e);
-            }
-        }
+        Ok(self.advance(MeltRequested {
+            operation_id,
+            quote: quote_info,
+            final_proofs,
+            premint_secrets,
+        }))
     }
 
     /// Cancel the prepared melt and release reserved proofs.
     pub async fn cancel(self) -> Result<(), Error> {
-        self.compensate().await;
-        Ok(())
-    }
-}
-
-impl std::fmt::Debug for MeltSaga<'_, Prepared> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MeltSaga<Prepared>")
-            .field("operation_id", &self.state_data.operation_id)
-            .field("quote_id", &self.state_data.quote.id)
-            .field("amount", &self.state_data.quote.amount)
-            .field(
-                "proofs",
-                &self
-                    .state_data
-                    .proofs
-                    .iter()
-                    .map(|p| p.amount)
-                    .collect::<Vec<_>>(),
-            )
-            .field(
-                "proofs_to_swap",
-                &self
-                    .state_data
-                    .proofs_to_swap
-                    .iter()
-                    .map(|p| p.amount)
-                    .collect::<Vec<_>>(),
-            )
-            .field("swap_fee", &self.state_data.swap_fee)
-            .field("input_fee", &self.state_data.input_fee)
-            .finish()
-    }
-}
-
-impl std::fmt::Debug for MeltSaga<'_, PaymentPending> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MeltSaga<PaymentPending>")
-            .field("operation_id", &self.state_data.operation_id)
-            .field("quote_id", &self.state_data.quote.id)
-            .field("amount", &self.state_data.quote.amount)
-            .finish()
+        self.compensate().await
     }
 }
 
 impl<'a> MeltSaga<'a, MeltRequested> {
+    /// The mint has the payment in flight; hand the saga to the pending path so
+    /// recovery can resolve it later.
+    fn into_pending(self) -> MeltSagaResult<'a> {
+        MeltSagaResult::Pending(Box::new(self.map_state(|state| PaymentPending {
+            operation_id: state.operation_id,
+            quote: state.quote,
+            final_proofs: state.final_proofs,
+            premint_secrets: state.premint_secrets,
+        })))
+    }
+
     /// Execute the melt request with async support.
     #[instrument(skip_all)]
     pub async fn execute_async(
         self,
         metadata: HashMap<String, String>,
     ) -> Result<MeltSagaResult<'a>, Error> {
-        let operation_id = self.state_data.operation_id;
-        let quote_info = &self.state_data.quote;
+        let operation_id = self.state.operation_id;
+        let quote_info = &self.state.quote;
 
         tracing::info!(
             "Executing async melt request for quote {} with operation {}",
@@ -945,11 +894,11 @@ impl<'a> MeltSaga<'a, MeltRequested> {
 
         let request = MeltRequest::new(
             quote_info.id.clone(),
-            self.state_data.final_proofs.clone(),
-            if self.state_data.premint_secrets.is_empty() {
+            self.state.final_proofs.clone(),
+            if self.state.premint_secrets.is_empty() {
                 None
             } else {
-                Some(self.state_data.premint_secrets.blinded_messages())
+                Some(self.state.premint_secrets.blinded_messages())
             },
         )
         .prefer_async(true);
@@ -961,6 +910,7 @@ impl<'a> MeltSaga<'a, MeltRequested> {
         };
 
         let melt_result = self
+            .ctx
             .wallet
             .client
             .post_melt(&quote_info.payment_method, request)
@@ -982,7 +932,12 @@ impl<'a> MeltSaga<'a, MeltRequested> {
                     error
                 );
 
-                match self.wallet.internal_check_melt_status(&quote_info.id).await {
+                match self
+                    .ctx
+                    .wallet
+                    .internal_check_melt_status(&quote_info.id)
+                    .await
+                {
                     Ok(response) => match response.state() {
                         MeltQuoteState::Failed
                         | MeltQuoteState::Unknown
@@ -1010,16 +965,7 @@ impl<'a> MeltSaga<'a, MeltRequested> {
                                     response.state()
                                 );
                                 self.handle_pending().await;
-                                return Ok(MeltSagaResult::Pending(Box::new(MeltSaga {
-                                    wallet: self.wallet,
-                                    compensations: self.compensations,
-                                    state_data: PaymentPending {
-                                        operation_id: self.state_data.operation_id,
-                                        quote: self.state_data.quote,
-                                        final_proofs: self.state_data.final_proofs.clone(),
-                                        premint_secrets: self.state_data.premint_secrets.clone(),
-                                    },
-                                })));
+                                return Ok(self.into_pending());
                             }
 
                             tracing::info!(
@@ -1037,12 +983,11 @@ impl<'a> MeltSaga<'a, MeltRequested> {
                             );
                             let standard_response = response.into_standard()?;
                             let finalized = finalize_melt_common(
-                                self.wallet,
-                                self.compensations,
-                                self.state_data.operation_id,
-                                &self.state_data.quote,
-                                &self.state_data.final_proofs,
-                                &self.state_data.premint_secrets,
+                                self.ctx.wallet,
+                                self.state.operation_id,
+                                &self.state.quote,
+                                &self.state.final_proofs,
+                                &self.state.premint_secrets,
                                 standard_response.state,
                                 standard_response.payment_preimage,
                                 standard_response.change,
@@ -1050,7 +995,7 @@ impl<'a> MeltSaga<'a, MeltRequested> {
                                 Default::default(),
                             )
                             .await?;
-                            return Ok(MeltSagaResult::Finalized(finalized));
+                            return Ok(MeltSagaResult::Finalized(self.advance(finalized)));
                         }
                         MeltQuoteState::Pending => {
                             tracing::info!(
@@ -1058,16 +1003,7 @@ impl<'a> MeltSaga<'a, MeltRequested> {
                                 quote_info.id
                             );
                             self.handle_pending().await;
-                            return Ok(MeltSagaResult::Pending(Box::new(MeltSaga {
-                                wallet: self.wallet,
-                                compensations: self.compensations,
-                                state_data: PaymentPending {
-                                    operation_id: self.state_data.operation_id,
-                                    quote: self.state_data.quote,
-                                    final_proofs: self.state_data.final_proofs.clone(),
-                                    premint_secrets: self.state_data.premint_secrets.clone(),
-                                },
-                            })));
+                            return Ok(self.into_pending());
                         }
                     },
                     Err(check_err) => {
@@ -1077,16 +1013,7 @@ impl<'a> MeltSaga<'a, MeltRequested> {
                             check_err
                         );
                         self.handle_pending().await;
-                        return Ok(MeltSagaResult::Pending(Box::new(MeltSaga {
-                            wallet: self.wallet,
-                            compensations: self.compensations,
-                            state_data: PaymentPending {
-                                operation_id: self.state_data.operation_id,
-                                quote: self.state_data.quote,
-                                final_proofs: self.state_data.final_proofs.clone(),
-                                premint_secrets: self.state_data.premint_secrets.clone(),
-                            },
-                        })));
+                        return Ok(self.into_pending());
                     }
                 }
             }
@@ -1095,12 +1022,11 @@ impl<'a> MeltSaga<'a, MeltRequested> {
         match melt_response.state() {
             MeltQuoteState::Paid => {
                 let finalized = finalize_melt_common(
-                    self.wallet,
-                    self.compensations,
-                    self.state_data.operation_id,
-                    &self.state_data.quote,
-                    &self.state_data.final_proofs,
-                    &self.state_data.premint_secrets,
+                    self.ctx.wallet,
+                    self.state.operation_id,
+                    &self.state.quote,
+                    &self.state.final_proofs,
+                    &self.state.premint_secrets,
                     melt_response.state(),
                     melt_response.payment_proof().map(|s| s.to_string()),
                     melt_response.change().cloned(),
@@ -1108,20 +1034,11 @@ impl<'a> MeltSaga<'a, MeltRequested> {
                     Default::default(),
                 )
                 .await?;
-                Ok(MeltSagaResult::Finalized(finalized))
+                Ok(MeltSagaResult::Finalized(self.advance(finalized)))
             }
             MeltQuoteState::Pending => {
                 self.handle_pending().await;
-                Ok(MeltSagaResult::Pending(Box::new(MeltSaga {
-                    wallet: self.wallet,
-                    compensations: self.compensations,
-                    state_data: PaymentPending {
-                        operation_id: self.state_data.operation_id,
-                        quote: self.state_data.quote,
-                        final_proofs: self.state_data.final_proofs.clone(),
-                        premint_secrets: self.state_data.premint_secrets.clone(),
-                    },
-                })))
+                Ok(self.into_pending())
             }
             MeltQuoteState::Failed => {
                 // Safety: even on a `Failed` response, if the mint has
@@ -1138,16 +1055,7 @@ impl<'a> MeltSaga<'a, MeltRequested> {
                         quote_info.id
                     );
                     self.handle_pending().await;
-                    return Ok(MeltSagaResult::Pending(Box::new(MeltSaga {
-                        wallet: self.wallet,
-                        compensations: self.compensations,
-                        state_data: PaymentPending {
-                            operation_id: self.state_data.operation_id,
-                            quote: self.state_data.quote,
-                            final_proofs: self.state_data.final_proofs.clone(),
-                            premint_secrets: self.state_data.premint_secrets.clone(),
-                        },
-                    })));
+                    return Ok(self.into_pending());
                 }
                 self.handle_failure().await;
                 Err(Error::PaymentFailed)
@@ -1160,16 +1068,7 @@ impl<'a> MeltSaga<'a, MeltRequested> {
                         quote_info.id
                     );
                     self.handle_pending().await;
-                    return Ok(MeltSagaResult::Pending(Box::new(MeltSaga {
-                        wallet: self.wallet,
-                        compensations: self.compensations,
-                        state_data: PaymentPending {
-                            operation_id: self.state_data.operation_id,
-                            quote: self.state_data.quote,
-                            final_proofs: self.state_data.final_proofs.clone(),
-                            premint_secrets: self.state_data.premint_secrets.clone(),
-                        },
-                    })));
+                    return Ok(self.into_pending());
                 }
 
                 tracing::warn!(
@@ -1185,23 +1084,14 @@ impl<'a> MeltSaga<'a, MeltRequested> {
                     quote_info.id
                 );
                 self.handle_pending().await;
-                Ok(MeltSagaResult::Pending(Box::new(MeltSaga {
-                    wallet: self.wallet,
-                    compensations: self.compensations,
-                    state_data: PaymentPending {
-                        operation_id: self.state_data.operation_id,
-                        quote: self.state_data.quote,
-                        final_proofs: self.state_data.final_proofs.clone(),
-                        premint_secrets: self.state_data.premint_secrets.clone(),
-                    },
-                })))
+                Ok(self.into_pending())
             }
         }
     }
 
     /// Handle pending payment state.
     async fn handle_pending(&self) {
-        let quote_info = &self.state_data.quote;
+        let quote_info = &self.state.quote;
 
         tracing::info!(
             "Melt quote {} is pending - proofs kept in pending state",
@@ -1211,29 +1101,14 @@ impl<'a> MeltSaga<'a, MeltRequested> {
 
     /// Handle failed payment - release proofs and clean up.
     async fn handle_failure(&self) {
-        let operation_id = self.state_data.operation_id;
-        let final_proofs = &self.state_data.final_proofs;
-
-        if let Ok(all_ys) = final_proofs.ys() {
-            let _ = self
-                .wallet
-                .localstore
-                .update_proofs_state(all_ys, State::Unspent)
-                .await;
-        }
-        let _ = self
-            .wallet
-            .localstore
-            .release_melt_quote(&operation_id)
-            .await;
-        let _ = self.wallet.localstore.delete_saga(&operation_id).await;
+        release_melt(self.ctx.wallet, self.state.operation_id).await;
     }
 }
 
 impl<'a> MeltSaga<'a, PaymentPending> {
     /// Get the quote
     pub fn quote(&self) -> &MeltQuote {
-        &self.state_data.quote
+        &self.state.quote
     }
 
     /// Finalize the melt with the response from subscription
@@ -1244,83 +1119,67 @@ impl<'a> MeltSaga<'a, PaymentPending> {
         change: Option<Vec<crate::nuts::BlindSignature>>,
         metadata: HashMap<String, String>,
     ) -> Result<MeltSaga<'a, Finalized>, Error> {
-        finalize_melt_common(
-            self.wallet,
-            self.compensations,
-            self.state_data.operation_id,
-            &self.state_data.quote,
-            &self.state_data.final_proofs,
-            &self.state_data.premint_secrets,
+        let finalized = finalize_melt_common(
+            self.ctx.wallet,
+            self.state.operation_id,
+            &self.state.quote,
+            &self.state.final_proofs,
+            &self.state.premint_secrets,
             state,
             payment_proof,
             change,
             metadata,
             Default::default(),
         )
-        .await
+        .await?;
+
+        Ok(self.advance(finalized))
     }
     /// Handle failed payment - release proofs and clean up.
     pub async fn handle_failure(&self) {
-        let operation_id = self.state_data.operation_id;
-        let final_proofs = &self.state_data.final_proofs;
-
         tracing::info!(
             "Handling failure for melt operation {}. Restoring {} proofs. Total amount: {}",
-            operation_id,
-            final_proofs.len(),
-            final_proofs.total_amount().unwrap_or(Amount::ZERO)
+            self.state.operation_id,
+            self.state.final_proofs.len(),
+            self.state
+                .final_proofs
+                .total_amount()
+                .unwrap_or(Amount::ZERO)
         );
 
-        if let Ok(all_ys) = final_proofs.ys() {
-            if let Err(e) = self
-                .wallet
-                .localstore
-                .update_proofs_state(all_ys, State::Unspent)
-                .await
-            {
-                tracing::error!("Failed to restore proofs for failed melt: {}", e);
-            } else {
-                tracing::info!("Successfully restored proofs to Unspent");
-            }
-        }
-        let _ = self
-            .wallet
-            .localstore
-            .release_melt_quote(&operation_id)
-            .await;
-        let _ = self.wallet.localstore.delete_saga(&operation_id).await;
+        release_melt(self.ctx.wallet, self.state.operation_id).await;
     }
 }
 
 impl<'a> MeltSaga<'a, Finalized> {
     /// Get the quote ID
     pub fn quote_id(&self) -> &str {
-        &self.state_data.quote_id
+        &self.state.quote_id
     }
 
     /// Get the melt quote state
     pub fn state(&self) -> MeltQuoteState {
-        self.state_data.state
+        self.state.state
     }
 
     /// Get the amount that was melted
     pub fn amount(&self) -> Amount {
-        self.state_data.amount
+        self.state.amount
     }
 
     /// Get the fee paid
     pub fn fee_paid(&self) -> Amount {
-        self.state_data.fee
+        self.state.fee
     }
 
     /// Get the payment proof (e.g., Lightning preimage)
     pub fn payment_proof(&self) -> Option<&str> {
-        self.state_data.payment_proof.as_deref()
+        self.state.payment_proof.as_deref()
     }
 
     /// Consume the saga and return the change proofs
     pub fn into_change(self) -> Option<Proofs> {
-        self.state_data.change
+        self.state.change
     }
 }
 
@@ -1337,9 +1196,8 @@ mod tests {
     use cdk_common::{MeltQuoteOnchainResponse, MeltQuoteResponse, MeltQuoteState, PaymentMethod};
     use uuid::Uuid;
 
-    use super::{finalize_melt_common, MeltSaga, MeltSagaResult};
+    use super::{finalize_melt_common, MeltSagaResult, NewMeltSaga};
     use crate::nuts::{BlindSignature, PreMintSecrets};
-    use crate::wallet::saga::new_compensations;
     use crate::wallet::test_utils::{
         create_test_db, create_test_wallet_with_mock, test_keyset_id, test_melt_quote,
         test_mint_url, test_proof_info, MockMintConnector,
@@ -1365,14 +1223,14 @@ mod tests {
         mock_client.reset_default_mint_state();
         let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
 
-        let saga = MeltSaga::new(&wallet);
+        let saga = NewMeltSaga::new(&wallet);
         let prepared = saga
             .prepare_with_proofs(&quote_id, vec![proof], HashMap::new())
             .await
             .unwrap();
 
         let reserved = db
-            .get_reserved_proofs(&prepared.state_data.operation_id)
+            .get_reserved_proofs(&prepared.state.operation_id)
             .await
             .unwrap();
         assert_eq!(reserved.len(), 1);
@@ -1384,7 +1242,7 @@ mod tests {
         assert_eq!(stored[0].state, State::Reserved);
         assert_eq!(
             stored[0].used_by_operation,
-            Some(prepared.state_data.operation_id)
+            Some(prepared.state.operation_id)
         );
     }
 
@@ -1407,13 +1265,13 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("purpose".to_string(), "ffi-pending".to_string());
 
-        let prepared = MeltSaga::new(&wallet)
+        let prepared = NewMeltSaga::new(&wallet)
             .prepare(&quote_id, metadata.clone())
             .await
             .unwrap();
 
         let saga = db
-            .get_saga(&prepared.state_data.operation_id)
+            .get_saga(&prepared.state.operation_id)
             .await
             .unwrap()
             .expect("saga should be stored");
@@ -1443,13 +1301,13 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("purpose".to_string(), "ffi-pending-proofs".to_string());
 
-        let prepared = MeltSaga::new(&wallet)
+        let prepared = NewMeltSaga::new(&wallet)
             .prepare_with_proofs(&quote_id, vec![proof], metadata.clone())
             .await
             .unwrap();
 
         let saga = db
-            .get_saga(&prepared.state_data.operation_id)
+            .get_saga(&prepared.state.operation_id)
             .await
             .unwrap()
             .expect("saga should be stored");
@@ -1508,13 +1366,13 @@ mod tests {
         mock_client.reset_default_mint_state();
         let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
 
-        let saga = MeltSaga::new(&wallet);
+        let saga = NewMeltSaga::new(&wallet);
         let prepared = saga.prepare(&quote_id, HashMap::new()).await.unwrap();
 
-        assert_eq!(prepared.state_data.proofs_to_swap.len(), 1);
+        assert_eq!(prepared.state.proofs_to_swap.len(), 1);
 
         let reserved = db
-            .get_reserved_proofs(&prepared.state_data.operation_id)
+            .get_reserved_proofs(&prepared.state.operation_id)
             .await
             .unwrap();
         assert_eq!(reserved.len(), 1);
@@ -1526,7 +1384,7 @@ mod tests {
         assert_eq!(stored[0].state, State::Reserved);
         assert_eq!(
             stored[0].used_by_operation,
-            Some(prepared.state_data.operation_id)
+            Some(prepared.state.operation_id)
         );
     }
 
@@ -1571,7 +1429,7 @@ mod tests {
         )));
         let wallet = create_test_wallet_with_mock(db.clone(), mock_client.clone()).await;
 
-        let saga = MeltSaga::new(&wallet);
+        let saga = NewMeltSaga::new(&wallet);
         let requested = saga
             .prepare_with_proofs(&quote_id, vec![proof], HashMap::new())
             .await
@@ -1581,7 +1439,7 @@ mod tests {
             .unwrap();
 
         let stored_saga = db
-            .get_saga(&requested.state_data.operation_id)
+            .get_saga(&requested.state.operation_id)
             .await
             .unwrap()
             .expect("melt saga must be stored");
@@ -1672,7 +1530,7 @@ mod tests {
             create_test_wallet_with_mock(db.clone(), mock_client).await,
         ));
 
-        let requested = MeltSaga::new(wallet)
+        let requested = NewMeltSaga::new(wallet)
             .prepare_with_proofs(&quote_id, vec![proof], HashMap::new())
             .await
             .unwrap()
@@ -1687,7 +1545,7 @@ mod tests {
     async fn test_execute_async_unpaid_response_compensates_instead_of_finalizing() {
         let (db, proof_y, requested) =
             requested_onchain_melt_with_response(MeltQuoteState::Unpaid).await;
-        let operation_id = requested.state_data.operation_id;
+        let operation_id = requested.state.operation_id;
 
         let result = requested.execute_async(HashMap::new()).await;
         assert!(matches!(result, Err(Error::PaymentFailed)));
@@ -1705,7 +1563,7 @@ mod tests {
     async fn test_execute_async_unknown_response_stays_pending_instead_of_finalizing() {
         let (db, proof_y, requested) =
             requested_onchain_melt_with_response(MeltQuoteState::Unknown).await;
-        let operation_id = requested.state_data.operation_id;
+        let operation_id = requested.state.operation_id;
 
         let result = requested.execute_async(HashMap::new()).await.unwrap();
         assert!(matches!(result, MeltSagaResult::Pending(_)));
@@ -1747,7 +1605,6 @@ mod tests {
 
         let result = finalize_melt_common(
             &wallet,
-            new_compensations(),
             Uuid::new_v4(),
             &quote,
             &final_proofs,
@@ -1784,7 +1641,6 @@ mod tests {
 
         let result = finalize_melt_common(
             &wallet,
-            new_compensations(),
             Uuid::new_v4(),
             &quote,
             &final_proofs,
@@ -1799,7 +1655,7 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(
-            result.unwrap().into_change().expect("change proofs")[0].amount,
+            result.unwrap().change.expect("change proofs")[0].amount,
             Amount::from(8)
         );
     }
@@ -1825,7 +1681,6 @@ mod tests {
 
         finalize_melt_common(
             &wallet,
-            new_compensations(),
             operation_id,
             &quote,
             &final_proofs,

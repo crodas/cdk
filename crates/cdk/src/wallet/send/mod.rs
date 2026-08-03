@@ -16,7 +16,7 @@ use crate::{Amount, Error, Wallet};
 
 pub(crate) mod saga;
 
-use saga::SendSaga;
+use saga::{NewSendSaga, PreparedSendSaga, TokenCreatedSendSaga};
 
 /// Prepared send transaction
 ///
@@ -162,9 +162,10 @@ impl Wallet {
         opts: SendOptions,
     ) -> Result<PreparedSend<'_>, Error> {
         let saga = if opts.send_kind.is_offline() {
-            SendSaga::new(self).with_keyset_policy(cdk_common::wallet::KeysetLoadPolicy::CacheOnly)
+            NewSendSaga::new(self)
+                .with_keyset_policy(cdk_common::wallet::KeysetLoadPolicy::CacheOnly)
         } else {
-            SendSaga::new(self)
+            NewSendSaga::new(self)
         };
         let prepared_saga = saga.prepare(amount, opts).await?;
 
@@ -206,7 +207,7 @@ impl Wallet {
             .await?
             .ok_or(Error::Custom("Saga not found".to_string()))?;
 
-        let saga = SendSaga::from_prepared(
+        let saga = PreparedSendSaga::from_prepared(
             self,
             operation_id,
             amount,
@@ -238,7 +239,7 @@ impl Wallet {
             .await?
             .ok_or(Error::Custom("Saga not found".to_string()))?;
 
-        let saga = SendSaga::from_prepared(
+        let saga = PreparedSendSaga::from_prepared(
             self,
             operation_id,
             Amount::ZERO,           // Dummy
@@ -283,30 +284,9 @@ impl Wallet {
             .await?
             .ok_or(Error::Custom("Saga not found".to_string()))?;
 
-        if let cdk_common::wallet::WalletSagaState::Send(
-            cdk_common::wallet::SendSagaState::TokenCreated,
-        ) = saga_record.state
-        {
-            if let cdk_common::wallet::OperationData::Send(data) = saga_record.data.clone() {
-                let proofs = data.proofs.ok_or(Error::Custom(
-                    "No proofs found in pending send saga".to_string(),
-                ))?;
-
-                let saga = SendSaga {
-                    wallet: self,
-                    compensations: crate::wallet::saga::new_compensations(),
-                    state_data: saga::state::TokenCreated {
-                        operation_id,
-                        proofs,
-                        saga: saga_record,
-                    },
-                };
-
-                return saga.revoke().await;
-            }
-        }
-
-        Err(Error::Custom("Operation is not a pending send".to_string()))
+        TokenCreatedSendSaga::from_saga_record(self, saga_record)?
+            .revoke()
+            .await
     }
 
     /// Returns true if the token has been claimed by the recipient.
@@ -331,30 +311,9 @@ impl Wallet {
             return Ok(false);
         }
 
-        if let cdk_common::wallet::WalletSagaState::Send(
-            cdk_common::wallet::SendSagaState::TokenCreated,
-        ) = saga_record.state
-        {
-            if let cdk_common::wallet::OperationData::Send(data) = saga_record.data.clone() {
-                let proofs = data.proofs.ok_or(Error::Custom(
-                    "No proofs found in pending send saga".to_string(),
-                ))?;
-
-                let saga = SendSaga {
-                    wallet: self,
-                    compensations: crate::wallet::saga::new_compensations(),
-                    state_data: saga::state::TokenCreated {
-                        operation_id,
-                        proofs,
-                        saga: saga_record,
-                    },
-                };
-
-                return saga.check_status().await;
-            }
-        }
-
-        Err(Error::Custom("Operation is not a pending send".to_string()))
+        TokenCreatedSendSaga::from_saga_record(self, saga_record)?
+            .check_status()
+            .await
     }
 }
 

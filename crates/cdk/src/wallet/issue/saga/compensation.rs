@@ -9,36 +9,34 @@
 //! 2. The secrets can be recovered via the restore process
 //! 3. Reversing could cause issues if concurrent operations used adjacent counters
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use cdk_common::database::{self, WalletDatabase};
 use tracing::instrument;
 use uuid::Uuid;
 
-use crate::wallet::saga::CompensatingAction;
+use crate::wallet::saga::{CompensatingAction, WalletSagaContext};
+// The mint flow's only other rollback is deleting the saga record: counter
+// increments are deliberately left in place (see the module docs).
+pub(crate) use crate::wallet::saga::DeleteSaga;
 use crate::Error;
 
 /// Compensation action to release a mint quote reservation.
 /// Clears the used_by_operation field on the quote.
 pub struct ReleaseMintQuote {
-    /// Database reference
-    pub localstore: Arc<dyn WalletDatabase<database::Error> + Send + Sync>,
     /// Operation ID that reserved the quote
     pub operation_id: Uuid,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl CompensatingAction for ReleaseMintQuote {
+impl<'a> CompensatingAction<WalletSagaContext<'a>> for ReleaseMintQuote {
     #[instrument(skip_all)]
-    async fn execute(&self) -> Result<(), Error> {
+    async fn execute(&self, ctx: &WalletSagaContext<'a>) -> Result<(), Error> {
         tracing::info!(
             "Compensation: Releasing mint quote reserved by operation {}",
             self.operation_id
         );
 
-        self.localstore
+        ctx.localstore()
             .release_mint_quote(&self.operation_id)
             .await
             .map_err(Error::Database)?;
@@ -48,44 +46,6 @@ impl CompensatingAction for ReleaseMintQuote {
 
     fn name(&self) -> &'static str {
         "ReleaseMintQuote"
-    }
-}
-
-/// Compensation action for mint operations.
-/// Deletes the saga on failure. Counter increments are intentionally not reversed
-/// as they don't cause data loss and secrets can be recovered via restore.
-pub struct MintCompensation {
-    /// Database reference
-    pub localstore: Arc<dyn WalletDatabase<database::Error> + Send + Sync>,
-    /// Quote ID (for logging)
-    pub quote_id: String,
-    /// Saga ID for cleanup
-    pub saga_id: uuid::Uuid,
-}
-
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl CompensatingAction for MintCompensation {
-    #[instrument(skip_all)]
-    async fn execute(&self) -> Result<(), Error> {
-        tracing::info!(
-            "Compensation: Mint operation for quote {} failed, no rollback needed",
-            self.quote_id
-        );
-
-        if let Err(e) = self.localstore.delete_saga(&self.saga_id).await {
-            tracing::warn!(
-                "Compensation: Failed to delete saga {}: {}. Will be cleaned up on recovery.",
-                self.saga_id,
-                e
-            );
-        }
-
-        Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "MintCompensation"
     }
 }
 
@@ -101,6 +61,7 @@ mod tests {
     use super::*;
     use crate::wallet::saga::test_utils::*;
     use crate::wallet::saga::CompensatingAction;
+    use crate::wallet::saga::WalletSagaContext;
 
     /// Create a test wallet saga for issue operations
     fn test_issue_saga(mint_url: cdk_common::mint_url::MintUrl) -> WalletSaga {
@@ -141,6 +102,8 @@ mod tests {
     #[tokio::test]
     async fn test_release_mint_quote_is_idempotent() {
         let db = create_test_db().await;
+        let wallet = test_wallet(db.clone()).await;
+        let ctx = WalletSagaContext::new(&wallet);
         let mint_url = test_mint_url();
         let operation_id = uuid::Uuid::new_v4();
 
@@ -148,14 +111,11 @@ mod tests {
         quote.used_by_operation = Some(operation_id.to_string());
         db.add_mint_quote(quote.clone()).await.unwrap();
 
-        let compensation = ReleaseMintQuote {
-            localstore: db.clone(),
-            operation_id,
-        };
+        let compensation = ReleaseMintQuote { operation_id };
 
         // Execute twice
-        compensation.execute().await.unwrap();
-        compensation.execute().await.unwrap();
+        compensation.execute(&ctx).await.unwrap();
+        compensation.execute(&ctx).await.unwrap();
 
         let retrieved_quote = db.get_mint_quote(&quote.id).await.unwrap().unwrap();
         assert!(retrieved_quote.used_by_operation.is_none());
@@ -164,41 +124,38 @@ mod tests {
     #[tokio::test]
     async fn test_release_mint_quote_handles_no_matching_quote() {
         let db = create_test_db().await;
+        let wallet = test_wallet(db.clone()).await;
+        let ctx = WalletSagaContext::new(&wallet);
         let operation_id = uuid::Uuid::new_v4();
 
         // Don't add any quote - compensation should still succeed
-        let compensation = ReleaseMintQuote {
-            localstore: db.clone(),
-            operation_id,
-        };
+        let compensation = ReleaseMintQuote { operation_id };
 
         // Should not error even with no matching quote
-        let result = compensation.execute().await;
+        let result = compensation.execute(&ctx).await;
         assert!(result.is_ok());
     }
 
     // =========================================================================
-    // MintCompensation Tests
+    // DeleteSaga Tests
     // =========================================================================
 
     #[tokio::test]
     async fn test_mint_compensation_is_idempotent() {
         let db = create_test_db().await;
+        let wallet = test_wallet(db.clone()).await;
+        let ctx = WalletSagaContext::new(&wallet);
         let mint_url = test_mint_url();
 
         let saga = test_issue_saga(mint_url);
         let saga_id = saga.id;
         db.add_saga(saga).await.unwrap();
 
-        let compensation = MintCompensation {
-            localstore: db.clone(),
-            quote_id: "test_quote".to_string(),
-            saga_id,
-        };
+        let compensation = DeleteSaga { saga_id };
 
         // Execute twice - should succeed both times
-        compensation.execute().await.unwrap();
-        compensation.execute().await.unwrap();
+        compensation.execute(&ctx).await.unwrap();
+        compensation.execute(&ctx).await.unwrap();
 
         assert!(db.get_saga(&saga_id).await.unwrap().is_none());
     }
@@ -206,16 +163,14 @@ mod tests {
     #[tokio::test]
     async fn test_mint_compensation_handles_missing_saga() {
         let db = create_test_db().await;
+        let wallet = test_wallet(db.clone()).await;
+        let ctx = WalletSagaContext::new(&wallet);
         let saga_id = uuid::Uuid::new_v4();
 
-        let compensation = MintCompensation {
-            localstore: db.clone(),
-            quote_id: "test_quote".to_string(),
-            saga_id,
-        };
+        let compensation = DeleteSaga { saga_id };
 
         // Should succeed even without saga
-        let result = compensation.execute().await;
+        let result = compensation.execute(&ctx).await;
         assert!(result.is_ok());
     }
 }

@@ -11,13 +11,13 @@
 //!    If the mint cached the response (NUT-19), we get signatures immediately.
 //! 2. **Fallback**: If replay fails, check if inputs are spent and use `/restore`.
 
-use cdk_common::wallet::{OperationData, SwapOperationData, SwapSagaState, WalletSaga};
+use cdk_common::wallet::{SwapOperationData, SwapSagaState, WalletSaga};
 use tracing::instrument;
 
 use crate::dhke::hash_to_curve;
 use crate::nuts::{PreMintSecrets, State};
 use crate::wallet::recovery::{RecoveryAction, RecoveryHelpers};
-use crate::wallet::saga::{CompensatingAction, RevertProofReservation};
+use crate::wallet::saga::RevertProofReservation;
 use crate::{Error, Wallet};
 
 impl Wallet {
@@ -36,25 +36,7 @@ impl Wallet {
         &self,
         saga: &WalletSaga,
     ) -> Result<RecoveryAction, Error> {
-        let state = match &saga.state {
-            cdk_common::wallet::WalletSagaState::Swap(s) => s,
-            _ => {
-                return Err(Error::Custom(format!(
-                    "Invalid saga state type for swap saga {}",
-                    saga.id
-                )))
-            }
-        };
-
-        let data = match &saga.data {
-            OperationData::Swap(d) => d,
-            _ => {
-                return Err(Error::Custom(format!(
-                    "Invalid operation data type for swap saga {}",
-                    saga.id
-                )))
-            }
-        };
+        let (state, data) = saga.as_swap()?;
 
         match state {
             SwapSagaState::ProofsReserved => {
@@ -277,16 +259,8 @@ impl Wallet {
 
     /// Compensate a swap saga by releasing reserved proofs.
     async fn compensate_swap(&self, saga_id: &uuid::Uuid) -> Result<(), Error> {
-        let reserved_proofs = self.localstore.get_reserved_proofs(saga_id).await?;
-        let proof_ys = reserved_proofs.iter().map(|p| p.y).collect();
-
-        RevertProofReservation {
-            localstore: self.localstore.clone(),
-            proof_ys,
-            saga_id: *saga_id,
-        }
-        .execute()
-        .await
+        self.compensate_saga(vec![Box::new(RevertProofReservation { saga_id: *saga_id })])
+            .await
     }
 }
 

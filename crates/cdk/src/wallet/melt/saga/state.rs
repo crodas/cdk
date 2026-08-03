@@ -17,6 +17,8 @@
 //! Note: `PaymentPending` is a persistence state in `WalletSaga`, not a typestate.
 //! When payment is pending, the saga returns an error and recovery handles it later.
 
+use core::fmt;
+
 use cdk_common::wallet::{KeysetLoadPolicy, WalletSaga};
 use cdk_common::MeltQuoteState;
 use uuid::Uuid;
@@ -57,6 +59,7 @@ pub struct Prepared {
 }
 
 /// MeltRequested state - melt request has been built and is ready to send.
+#[derive(Debug)]
 pub struct MeltRequested {
     /// Unique operation identifier
     pub operation_id: Uuid,
@@ -69,6 +72,7 @@ pub struct MeltRequested {
 }
 
 /// Finalized state - melt completed successfully.
+#[derive(Debug)]
 pub struct Finalized {
     /// Quote ID
     pub quote_id: String,
@@ -94,4 +98,38 @@ pub struct PaymentPending {
     pub final_proofs: Proofs,
     /// Pre-mint secrets for change
     pub premint_secrets: PreMintSecrets,
+}
+
+impl fmt::Debug for Prepared {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Prepared")
+            .field("operation_id", &self.operation_id)
+            .field("quote_id", &self.quote.id)
+            .field("amount", &self.quote.amount)
+            .field(
+                "proofs",
+                &self.proofs.iter().map(|p| p.amount).collect::<Vec<_>>(),
+            )
+            .field(
+                "proofs_to_swap",
+                &self
+                    .proofs_to_swap
+                    .iter()
+                    .map(|p| p.amount)
+                    .collect::<Vec<_>>(),
+            )
+            .field("swap_fee", &self.swap_fee)
+            .field("input_fee", &self.input_fee)
+            .finish()
+    }
+}
+
+impl fmt::Debug for PaymentPending {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PaymentPending")
+            .field("operation_id", &self.operation_id)
+            .field("quote_id", &self.quote.id)
+            .field("amount", &self.quote.amount)
+            .finish()
+    }
 }

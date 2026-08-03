@@ -1600,11 +1600,15 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
+        // Only proofs this operation still holds are released. One that reached
+        // SPENT or PENDING_SPENT in the meantime belongs to a transaction that
+        // already went through and must not be resurrected.
         query(
             r#"
             UPDATE proof
             SET state = 'UNSPENT', used_by_operation = NULL
             WHERE used_by_operation = :operation_id
+              AND state IN ('RESERVED', 'PENDING')
             "#,
         )?
         .bind("operation_id", operation_id.to_string())

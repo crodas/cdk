@@ -13,8 +13,7 @@
 use std::collections::HashMap;
 
 use cdk_common::wallet::{
-    IssueSagaState, MintOperationData, OperationData, ProofInfo, Transaction, TransactionDirection,
-    WalletSaga,
+    IssueSagaState, MintOperationData, ProofInfo, Transaction, TransactionDirection, WalletSaga,
 };
 use cdk_common::{Amount, PaymentMethod};
 use tracing::instrument;
@@ -25,10 +24,9 @@ use crate::util::unix_time;
 use crate::wallet::blind_signature::{
     validate_mint_response_signatures, SignatureAmountValidation,
 };
-use crate::wallet::issue::saga::compensation::ReleaseMintQuote;
+use crate::wallet::issue::saga::compensation::{DeleteSaga, ReleaseMintQuote};
 use crate::wallet::issue::saga::state::PreparedMintRequest;
 use crate::wallet::recovery::{RecoveryAction, RecoveryHelpers};
-use crate::wallet::saga::CompensatingAction;
 use crate::{Error, Wallet};
 
 fn is_mint_limit_error(error: &Error) -> bool {
@@ -49,25 +47,7 @@ impl Wallet {
         &self,
         saga: &WalletSaga,
     ) -> Result<RecoveryAction, Error> {
-        let state = match &saga.state {
-            cdk_common::wallet::WalletSagaState::Issue(s) => s,
-            _ => {
-                return Err(Error::Custom(format!(
-                    "Invalid saga state type for issue saga {}",
-                    saga.id
-                )))
-            }
-        };
-
-        let data = match &saga.data {
-            OperationData::Mint(d) => d,
-            _ => {
-                return Err(Error::Custom(format!(
-                    "Invalid operation data type for issue saga {}",
-                    saga.id
-                )))
-            }
-        };
+        let (state, data) = saga.as_issue()?;
 
         match state {
             IssueSagaState::SecretsPrepared => {
@@ -544,23 +524,14 @@ impl Wallet {
 
     /// Compensate an issue saga by releasing the quote and deleting the saga.
     async fn compensate_issue(&self, saga_id: &uuid::Uuid) -> Result<(), Error> {
-        // Release the mint quote reservation (best-effort, continue on error)
-        if let Err(e) = (ReleaseMintQuote {
-            localstore: self.localstore.clone(),
-            operation_id: *saga_id,
-        }
-        .execute()
-        .await)
-        {
-            tracing::warn!(
-                "Failed to release mint quote for saga {}: {}. Continuing with saga cleanup.",
-                saga_id,
-                e
-            );
-        }
-
-        self.localstore.delete_saga(saga_id).await?;
-        Ok(())
+        // Issue reserves a quote, not proofs, so there is nothing else to undo.
+        self.compensate_saga(vec![
+            Box::new(ReleaseMintQuote {
+                operation_id: *saga_id,
+            }),
+            Box::new(DeleteSaga { saga_id: *saga_id }),
+        ])
+        .await
     }
 }
 

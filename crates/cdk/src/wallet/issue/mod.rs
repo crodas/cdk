@@ -7,7 +7,7 @@ pub(crate) mod saga;
 use cdk_common::nut00::KnownMethod;
 use cdk_common::nut04::MintMethodOptions;
 use cdk_common::{MintQuoteRequest, MintQuoteResponse, PaymentMethod};
-pub(crate) use saga::MintSaga;
+pub(crate) use saga::NewMintSaga;
 use tracing::instrument;
 
 use crate::amount::SplitTarget;
@@ -501,7 +501,7 @@ impl Wallet {
         spending_conditions: Option<SpendingConditions>,
     ) -> Result<Proofs, Error> {
         self.retry_on_inactive_keyset(|| async {
-            let saga = MintSaga::new(self);
+            let saga = NewMintSaga::new(self);
             let saga = saga
                 .prepare(
                     quote_id,
@@ -510,7 +510,7 @@ impl Wallet {
                 )
                 .await?;
             let saga = saga.execute().await?;
-            Ok(saga.into_proofs())
+            Ok(saga)
         })
         .await
     }
@@ -672,7 +672,7 @@ impl Wallet {
         external_keys: Option<std::collections::HashMap<String, SecretKey>>,
     ) -> Result<Proofs, Error> {
         // Create saga and prepare batch
-        let saga = MintSaga::new(self);
+        let saga = NewMintSaga::new(self);
 
         let prepared = saga
             .prepare_batch(
@@ -686,7 +686,7 @@ impl Wallet {
         // Execute the mint
         let finalized = prepared.execute().await?;
 
-        Ok(finalized.into_proofs())
+        Ok(finalized)
     }
 }
 

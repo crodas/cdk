@@ -11,12 +11,11 @@
 //!   If the mint cached the response (NUT-19), signatures are returned immediately.
 //! - **Fallback**: If replay fails, check if inputs are spent and use `/restore`.
 
-use cdk_common::wallet::{OperationData, ReceiveOperationData, ReceiveSagaState, WalletSaga};
+use cdk_common::wallet::{ReceiveOperationData, ReceiveSagaState, WalletSaga};
 use tracing::instrument;
 
 use crate::wallet::receive::saga::compensation::RemovePendingProofs;
 use crate::wallet::recovery::{RecoveryAction, RecoveryHelpers};
-use crate::wallet::saga::CompensatingAction;
 use crate::{Error, Wallet};
 
 impl Wallet {
@@ -30,25 +29,7 @@ impl Wallet {
         &self,
         saga: &WalletSaga,
     ) -> Result<RecoveryAction, Error> {
-        let state = match &saga.state {
-            cdk_common::wallet::WalletSagaState::Receive(s) => s,
-            _ => {
-                return Err(Error::Custom(format!(
-                    "Invalid saga state type for receive saga {}",
-                    saga.id
-                )))
-            }
-        };
-
-        let data = match &saga.data {
-            OperationData::Receive(d) => d,
-            _ => {
-                return Err(Error::Custom(format!(
-                    "Invalid operation data type for receive saga {}",
-                    saga.id
-                )))
-            }
-        };
+        let (state, data) = saga.as_receive()?;
 
         match state {
             ReceiveSagaState::ProofsPending => {
@@ -176,15 +157,14 @@ impl Wallet {
 
     /// Compensate a receive saga by removing pending proofs.
     async fn compensate_receive(&self, saga_id: &uuid::Uuid) -> Result<(), Error> {
-        let pending_proofs = self.localstore.get_reserved_proofs(saga_id).await?;
-        let proof_ys = pending_proofs.iter().map(|p| p.y).collect();
+        // Receive proofs were never ours to keep, so they are removed rather
+        // than released back to Unspent.
+        let proof_ys = self.saga_proof_ys(saga_id).await?;
 
-        RemovePendingProofs {
-            localstore: self.localstore.clone(),
+        self.compensate_saga(vec![Box::new(RemovePendingProofs {
             proof_ys,
             saga_id: *saga_id,
-        }
-        .execute()
+        })])
         .await
     }
 }

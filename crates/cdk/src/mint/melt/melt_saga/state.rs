@@ -9,6 +9,7 @@ use crate::mint::MeltQuote;
 ///
 /// The melt saga starts in this state. Only the `setup_melt` method is available.
 /// The operation ID is generated upfront but the full Operation (with amounts) is created during setup.
+#[derive(Debug)]
 pub struct Initial {
     pub operation_id: Uuid,
 }
@@ -22,6 +23,7 @@ pub struct Initial {
 /// Input proof Y values, blinded messages, operation, and fee breakdown are
 /// persisted to the database during setup and retrieved from there during
 /// finalization via the single shared finalization path.
+#[derive(Debug)]
 pub struct SetupComplete {
     pub quote: MeltQuote,
 }
@@ -32,6 +34,7 @@ pub struct SetupComplete {
 /// Only the `finalize` method is available, which delegates to the shared
 /// `finalize_melt_quote` function — the single finalization path that handles
 /// operation recording, saga deletion, and all cleanup atomically.
+#[derive(Debug)]
 pub struct PaymentConfirmed {
     pub quote: MeltQuote,
     pub payment_result: MakePaymentResponse,

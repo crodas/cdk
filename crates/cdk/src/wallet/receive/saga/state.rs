@@ -8,8 +8,7 @@
 //! ```text
 //! Initial
 //!   └─> prepare() -> Prepared
-//!                      └─> execute() -> Finalized
-//!                                         └─> amount(), into_amount()
+//!                      └─> execute() -> Amount
 //! ```
 
 use std::collections::HashMap;
@@ -52,12 +51,4 @@ pub struct Prepared {
     pub active_keyset_id: Id,
     /// P2PK signing keys (from options + wallet database lookups)
     pub p2pk_signing_keys: HashMap<XOnlyPublicKey, SecretKey>,
-}
-
-/// Finalized state - receive operation completed successfully.
-/// The received amount can be retrieved from this state.
-#[derive(Debug)]
-pub struct Finalized {
-    /// Total amount received (after fees)
-    pub amount: Amount,
 }

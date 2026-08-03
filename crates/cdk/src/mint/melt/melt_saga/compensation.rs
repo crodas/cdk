@@ -4,22 +4,12 @@
 //! to undo all completed steps and restore the database to its pre-saga state.
 
 use async_trait::async_trait;
-use cdk_common::database::DynMintDatabase;
+use cdk_common::saga::CompensatingAction;
 use cdk_common::{Error, PublicKey, QuoteId};
 use tracing::instrument;
 use uuid::Uuid;
 
-use crate::mint::subscription::PubSubManager;
-
-/// Trait for compensating actions in the saga pattern.
-///
-/// Compensating actions are registered as steps complete and executed in reverse
-/// order (LIFO) if the saga fails. Each action should be idempotent.
-#[async_trait]
-pub trait CompensatingAction: Send + Sync {
-    async fn execute(&self, db: &DynMintDatabase, pubsub: &PubSubManager) -> Result<(), Error>;
-    fn name(&self) -> &'static str;
-}
+use crate::mint::saga::MintSagaContext;
 
 /// Compensation action to remove melt setup and reset quote state.
 ///
@@ -46,20 +36,12 @@ pub struct RemoveMeltSetup {
 }
 
 #[async_trait]
-impl CompensatingAction for RemoveMeltSetup {
+impl<M: Send + Sync> CompensatingAction<MintSagaContext<M>> for RemoveMeltSetup {
     #[instrument(skip_all)]
-    async fn execute(&self, db: &DynMintDatabase, pubsub: &PubSubManager) -> Result<(), Error> {
-        tracing::info!(
-            "Compensation: Removing melt setup for quote {} ({} proofs, {} blinded messages, saga {})",
-            self.quote_id,
-            self.input_ys.len(),
-            self.blinded_secrets.len(),
-            self.operation_id
-        );
-
+    async fn execute(&self, ctx: &MintSagaContext<M>) -> Result<(), Error> {
         super::super::shared::rollback_melt_quote(
-            db,
-            pubsub,
+            &ctx.db,
+            &ctx.pubsub,
             &self.quote_id,
             &self.input_ys,
             &self.blinded_secrets,

@@ -1448,6 +1448,61 @@ where
     assert!(reserved.is_empty());
 }
 
+/// Releasing an operation's proofs must not resurrect ones that were already
+/// spent, and must leave proofs belonging to other operations alone.
+pub async fn release_proofs_skips_settled_proofs<DB>(db: DB)
+where
+    DB: Database<crate::database::Error>,
+{
+    let mint_url = test_mint_url();
+    let keyset_id = test_keyset_id();
+    let reserved = test_proof_info(keyset_id, 100, mint_url.clone());
+    let settled = test_proof_info(keyset_id, 200, mint_url.clone());
+    let other_operation = test_proof_info(keyset_id, 300, mint_url.clone());
+
+    db.update_proofs(
+        vec![reserved.clone(), settled.clone(), other_operation.clone()],
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let operation_id = uuid::Uuid::new_v4();
+    db.reserve_proofs(vec![reserved.y, settled.y], &operation_id)
+        .await
+        .unwrap();
+
+    let another_operation_id = uuid::Uuid::new_v4();
+    db.reserve_proofs(vec![other_operation.y], &another_operation_id)
+        .await
+        .unwrap();
+
+    // The operation spent one of its proofs before it was rolled back.
+    let mut spent = db.get_proofs_by_ys(vec![settled.y]).await.unwrap();
+    spent[0].state = State::Spent;
+    db.update_proofs(spent, vec![]).await.unwrap();
+
+    db.release_proofs(&operation_id).await.unwrap();
+
+    let released = db.get_proofs_by_ys(vec![reserved.y]).await.unwrap();
+    assert_eq!(released[0].state, State::Unspent);
+    assert_eq!(
+        released[0].used_by_operation, None,
+        "a released proof must no longer point at its operation"
+    );
+
+    let still_spent = db.get_proofs_by_ys(vec![settled.y]).await.unwrap();
+    assert_eq!(
+        still_spent[0].state,
+        State::Spent,
+        "a spent proof must not be resurrected by a rollback"
+    );
+
+    let untouched = db.get_proofs_by_ys(vec![other_operation.y]).await.unwrap();
+    assert_eq!(untouched[0].state, State::Reserved);
+    assert_eq!(untouched[0].used_by_operation, Some(another_operation_id));
+}
+
 /// Test getting proofs reserved by an operation
 pub async fn get_reserved_proofs<DB>(db: DB)
 where
@@ -1574,6 +1629,7 @@ macro_rules! wallet_db_test {
             get_incomplete_sagas,
             reserve_proofs,
             release_proofs,
+            release_proofs_skips_settled_proofs,
             get_reserved_proofs,
             reserve_proofs_already_reserved
         );

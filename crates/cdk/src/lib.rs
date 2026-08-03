@@ -56,6 +56,8 @@ pub use cdk_common::{
 pub mod event;
 pub mod fees;
 pub mod invoice;
+#[cfg(any(feature = "wallet", feature = "mint"))]
+pub mod saga;
 
 #[doc(hidden)]
 pub use bitcoin::secp256k1;

@@ -66,8 +66,8 @@ async fn test_onchain_setup_uses_selected_fee_option_for_balance() {
         .await
         .unwrap();
 
-    assert_eq!(setup.state_data.quote.selected_fee_index, Some(0));
-    assert_eq!(setup.state_data.quote.fee_reserve().value(), 500);
+    assert_eq!(setup.state.quote.selected_fee_index, Some(0));
+    assert_eq!(setup.state.quote.fee_reserve().value(), 500);
 
     let stored = mint
         .localstore()
@@ -161,8 +161,8 @@ async fn test_onchain_setup_accepts_change_outputs() {
         .await
         .expect("onchain melt setup must accept change outputs");
 
-    assert_eq!(setup.state_data.quote.selected_fee_index, Some(0));
-    assert_eq!(setup.state_data.quote.fee_reserve().value(), 500);
+    assert_eq!(setup.state.quote.selected_fee_index, Some(0));
+    assert_eq!(setup.state.quote.fee_reserve().value(), 500);
 }
 
 /// Test: onchain melt setup accepts inputs greater than amount plus selected fee reserve.
@@ -201,8 +201,8 @@ async fn test_onchain_setup_accepts_overfunded_inputs() {
         .await
         .expect("onchain melt setup must accept overfunded inputs");
 
-    assert_eq!(setup.state_data.quote.selected_fee_index, Some(0));
-    assert_eq!(setup.state_data.quote.fee_reserve().value(), 500);
+    assert_eq!(setup.state.quote.selected_fee_index, Some(0));
+    assert_eq!(setup.state.quote.fee_reserve().value(), 500);
 }
 
 /// Test: onchain melt setup rejects a request with no selected `fee_index`.
@@ -2533,7 +2533,7 @@ async fn test_finalize_melt_quote_duplicate_success_is_idempotent() {
     else {
         panic!("Expected Confirmed")
     };
-    let payment_result = confirmed_saga.state_data.payment_result.clone();
+    let payment_result = confirmed_saga.state.payment_result.clone();
 
     let first_change = confirmed_saga.finalize().await.unwrap();
 
@@ -2592,7 +2592,7 @@ async fn test_finalize_melt_quote_conflicting_success_is_rejected() {
     else {
         panic!("Expected Confirmed")
     };
-    let payment_result = confirmed_saga.state_data.payment_result.clone();
+    let payment_result = confirmed_saga.state.payment_result.clone();
 
     confirmed_saga.finalize().await.unwrap();
 

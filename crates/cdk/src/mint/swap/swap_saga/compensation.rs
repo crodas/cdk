@@ -1,16 +1,10 @@
 use async_trait::async_trait;
-use cdk_common::database::DynMintDatabase;
+use cdk_common::saga::CompensatingAction;
 use cdk_common::{Error, PublicKey};
 use tracing::instrument;
 use uuid::Uuid;
 
-use crate::mint::subscription::PubSubManager;
-
-#[async_trait]
-pub trait CompensatingAction: Send + Sync {
-    async fn execute(&self, db: &DynMintDatabase, pubsub: &PubSubManager) -> Result<(), Error>;
-    fn name(&self) -> &'static str;
-}
+use crate::mint::saga::MintSagaContext;
 
 /// Compensation action to remove swap setup (both proofs and blinded messages).
 ///
@@ -31,45 +25,17 @@ pub struct RemoveSwapSetup {
 }
 
 #[async_trait]
-impl CompensatingAction for RemoveSwapSetup {
+impl<M: Send + Sync> CompensatingAction<MintSagaContext<M>> for RemoveSwapSetup {
     #[instrument(skip_all)]
-    async fn execute(&self, db: &DynMintDatabase, _pubsub: &PubSubManager) -> Result<(), Error> {
-        if self.blinded_secrets.is_empty() && self.input_ys.is_empty() {
-            return Ok(());
-        }
-
-        tracing::info!(
-            "Compensation: Removing swap setup ({} blinded messages, {} proofs, saga {})",
-            self.blinded_secrets.len(),
-            self.input_ys.len(),
-            self.operation_id
-        );
-
-        let mut tx = db.begin_transaction().await?;
-
-        // Remove blinded messages (outputs)
-        if !self.blinded_secrets.is_empty() {
-            tx.delete_blinded_messages(&self.blinded_secrets).await?;
-        }
-
-        // Remove proofs (inputs)
-        if !self.input_ys.is_empty() {
-            tx.remove_proofs(&self.input_ys, None).await?;
-        }
-
-        // Delete saga state record
-        if let Err(e) = tx.delete_saga(&self.operation_id).await {
-            tracing::warn!(
-                "Failed to delete saga {} during compensation: {}",
-                self.operation_id,
-                e
-            );
-            // Continue anyway - saga cleanup is best-effort
-        }
-
-        tx.commit().await?;
-
-        Ok(())
+    async fn execute(&self, ctx: &MintSagaContext<M>) -> Result<(), Error> {
+        super::super::shared::rollback_swap_setup(
+            &ctx.db,
+            &ctx.pubsub,
+            &self.blinded_secrets,
+            &self.input_ys,
+            &self.operation_id,
+        )
+        .await
     }
 
     fn name(&self) -> &'static str {

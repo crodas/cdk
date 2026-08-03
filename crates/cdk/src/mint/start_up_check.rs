@@ -9,7 +9,7 @@ use cdk_common::mint::{OperationKind, Saga};
 use cdk_common::{PublicKey, QuoteId, State};
 
 use super::{Error, Mint};
-use crate::mint::swap::swap_saga::compensation::{CompensatingAction, RemoveSwapSetup};
+use crate::mint::swap::shared::rollback_swap_setup;
 use crate::mint::{MeltQuote, MeltQuoteState};
 use crate::types::PaymentProcessorKey;
 
@@ -254,18 +254,16 @@ impl Mint {
                 SwapSagaRecoveryAction::Compensate => {}
             }
 
-            // Use the same compensation logic as in-process failures
-            // Saga deletion is included in the compensation transaction
-            let compensation = RemoveSwapSetup {
-                blinded_secrets,
-                input_ys,
-                operation_id: saga.operation_id,
-            };
-
-            // Execute compensation (includes saga deletion)
-            if let Err(e) = compensation
-                .execute(&self.localstore, &self.pubsub_manager)
-                .await
+            // Same rollback the in-process compensation uses; saga deletion is
+            // included in its transaction
+            if let Err(e) = rollback_swap_setup(
+                &self.localstore,
+                &self.pubsub_manager,
+                &blinded_secrets,
+                &input_ys,
+                &saga.operation_id,
+            )
+            .await
             {
                 tracing::error!(
                     "Failed to compensate saga {}: {}. Continuing...",

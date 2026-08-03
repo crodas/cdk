@@ -1,15 +1,16 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use cdk_common::database::DynMintDatabase;
-use cdk_common::mint::{Operation, Saga, SwapSagaState};
+use cdk_common::mint::{Operation, Saga as PersistedSaga, SwapSagaState};
 use cdk_common::nuts::BlindedMessage;
 use cdk_common::{database, Error, Proofs, ProofsMethods, PublicKey, QuoteId, State};
 use tracing::instrument;
 
-use self::compensation::{CompensatingAction, RemoveSwapSetup};
+use self::compensation::RemoveSwapSetup;
 use self::state::{Initial, SetupComplete, Signed};
+use crate::mint::saga::MintSagaContext;
 use crate::mint::subscription::PubSubManager;
+use crate::saga::Saga;
 use crate::Mint;
 
 pub mod compensation;
@@ -64,9 +65,9 @@ mod tests;
 ///
 /// # Compensation Order (LIFO)
 ///
-/// Compensations are stored in a VecDeque and executed in LIFO (Last-In-First-Out) order
-/// using `push_front` + iteration. This ensures that actions are undone in the reverse
-/// order they were performed, which is critical for maintaining data consistency.
+/// Compensations are executed in LIFO (Last-In-First-Out) order, so actions are
+/// undone in the reverse order they were performed, which is critical for
+/// maintaining data consistency.
 ///
 /// Example: If we perform actions A → B → C in the forward path, compensations must
 /// execute as C' → B' → A' to properly reverse the operations without violating
@@ -90,29 +91,27 @@ mod tests;
 /// - State-specific data (e.g., signatures) only exists in the appropriate state type
 /// - No runtime state checks or `Option<T>` unwrapping needed
 /// - IDE autocomplete only shows valid operations for each state
-pub struct SwapSaga<'a, S> {
-    mint: &'a super::Mint,
-    db: DynMintDatabase,
-    pubsub: Arc<PubSubManager>,
-    /// Compensating actions in LIFO order (most recent first)
-    compensations: VecDeque<Box<dyn CompensatingAction>>,
-    /// Operation ID (used for saga tracking, generated upfront)
-    operation_id: uuid::Uuid,
-    state_data: S,
-}
+pub type SwapSaga<'a, S> = Saga<SwapSagaContext<'a>, S>;
+
+/// The swap saga runs inside the request, so it borrows the mint.
+pub type SwapSagaContext<'a> = MintSagaContext<&'a Mint>;
 
 impl<'a> SwapSaga<'a, Initial> {
+    /// Start a swap saga with a freshly generated operation ID.
     pub fn new(mint: &'a super::Mint, db: DynMintDatabase, pubsub: Arc<PubSubManager>) -> Self {
         let operation_id = uuid::Uuid::now_v7();
 
-        Self {
-            mint,
-            db,
-            pubsub,
-            compensations: VecDeque::new(),
+        Saga::start(
+            MintSagaContext::new(
+                mint,
+                db,
+                pubsub,
+                #[cfg(feature = "prometheus")]
+                None,
+            ),
             operation_id,
-            state_data: Initial { operation_id },
-        }
+            Initial { operation_id },
+        )
     }
 
     /// Sets up the swap by atomically verifying balance and reserving inputs/outputs.
@@ -147,13 +146,18 @@ impl<'a> SwapSaga<'a, Initial> {
         quote_id: Option<QuoteId>,
         input_verification: crate::mint::Verification,
     ) -> Result<SwapSaga<'a, SetupComplete>, Error> {
-        let output_verification = self.mint.verify_outputs(blinded_messages).map_err(|err| {
-            tracing::debug!("Output verification failed: {:?}", err);
-            err
-        })?;
+        let output_verification =
+            self.ctx
+                .mint
+                .verify_outputs(blinded_messages)
+                .map_err(|err| {
+                    tracing::debug!("Output verification failed: {:?}", err);
+                    err
+                })?;
 
         // Verify balance within the transaction
-        self.mint
+        self.ctx
+            .mint
             .verify_transaction_balanced(
                 input_verification.clone(),
                 output_verification.clone(),
@@ -165,12 +169,12 @@ impl<'a> SwapSaga<'a, Initial> {
         let total_redeemed = input_verification.amount;
         let total_issued = output_verification.amount;
 
-        let fee_breakdown = self.mint.get_proofs_fee(input_proofs).await?;
+        let fee_breakdown = self.ctx.mint.get_proofs_fee(input_proofs).await?;
 
         // Create Operation with actual amounts now that we know them
         // Convert typed amounts to untyped for Operation::new
         let operation = Operation::new(
-            self.state_data.operation_id,
+            self.state.operation_id,
             cdk_common::mint::OperationKind::Swap,
             total_issued.clone().into(),
             total_redeemed.clone().into(),
@@ -179,7 +183,7 @@ impl<'a> SwapSaga<'a, Initial> {
             None, // payment_method (not applicable for swap)
         );
 
-        let mut tx = self.db.begin_transaction().await?;
+        let mut tx = self.ctx.db.begin_transaction().await?;
 
         // Add input proofs to DB
         let mut new_proofs = match tx
@@ -228,7 +232,7 @@ impl<'a> SwapSaga<'a, Initial> {
             .collect();
 
         // Persist saga state for crash recovery (atomic with TX1)
-        let saga = Saga::new_swap(self.operation_id, SwapSagaState::SetupComplete);
+        let saga = PersistedSaga::new_swap(self.operation_id, SwapSagaState::SetupComplete);
 
         if let Err(err) = tx.add_saga(&saga).await {
             tx.rollback().await?;
@@ -238,29 +242,20 @@ impl<'a> SwapSaga<'a, Initial> {
         tx.commit().await?;
         // Publish proof state changes
         for pk in &ys {
-            self.pubsub.proof_state((*pk, State::Pending));
+            self.ctx.pubsub.proof_state((*pk, State::Pending));
         }
-        // Register compensation (uses LIFO via push_front)
-        self.compensations.push_front(Box::new(RemoveSwapSetup {
-            blinded_secrets: blinded_secrets.clone(),
+        self.push_compensation(Box::new(RemoveSwapSetup {
+            blinded_secrets,
             input_ys: ys.clone(),
             operation_id: self.operation_id,
         }));
 
-        // Transition to SetupComplete state
-        Ok(SwapSaga {
-            mint: self.mint,
-            db: self.db,
-            pubsub: self.pubsub,
-            compensations: self.compensations,
-            operation_id: self.operation_id,
-            state_data: SetupComplete {
-                blinded_messages: blinded_messages_vec,
-                ys,
-                operation,
-                fee_breakdown,
-            },
-        })
+        Ok(self.advance(SetupComplete {
+            blinded_messages: blinded_messages_vec,
+            ys,
+            operation,
+            fee_breakdown,
+        }))
     }
 }
 
@@ -287,32 +282,25 @@ impl<'a> SwapSaga<'a, SetupComplete> {
     #[instrument(skip_all)]
     pub async fn sign_outputs(self) -> Result<SwapSaga<'a, Signed>, Error> {
         match self
+            .ctx
             .mint
-            .blind_sign(self.state_data.blinded_messages.clone())
+            .blind_sign(self.state.blinded_messages.clone())
             .await
         {
             Ok(signatures) => {
-                // Transition to Signed state
                 // Note: We don't update saga state here because the "signed" state
                 // is not used by recovery logic - saga state remains "SetupComplete"
                 // until the swap is finalized or compensated
-                Ok(SwapSaga {
-                    mint: self.mint,
-                    db: self.db,
-                    pubsub: self.pubsub,
-                    compensations: self.compensations,
-                    operation_id: self.operation_id,
-                    state_data: Signed {
-                        blinded_messages: self.state_data.blinded_messages,
-                        ys: self.state_data.ys,
-                        signatures,
-                        operation: self.state_data.operation,
-                        fee_breakdown: self.state_data.fee_breakdown,
-                    },
-                })
+                Ok(self.map_state(|state| Signed {
+                    blinded_messages: state.blinded_messages,
+                    ys: state.ys,
+                    signatures,
+                    operation: state.operation,
+                    fee_breakdown: state.fee_breakdown,
+                }))
             }
             Err(err) => {
-                self.compensate_all().await?;
+                self.compensate().await?;
                 Err(err)
             }
         }
@@ -353,13 +341,13 @@ impl SwapSaga<'_, Signed> {
     #[instrument(skip_all)]
     pub async fn finalize(mut self) -> Result<cdk_common::nuts::SwapResponse, Error> {
         let blinded_secrets: Vec<PublicKey> = self
-            .state_data
+            .state
             .blinded_messages
             .iter()
             .map(|bm| bm.blinded_secret)
             .collect();
 
-        let mut tx = self.db.begin_transaction().await?;
+        let mut tx = self.ctx.db.begin_transaction().await?;
 
         // Add blind signatures to outputs
         // TODO: WE should move the should fail to the db so the there is not this extra rollback.
@@ -368,7 +356,7 @@ impl SwapSaga<'_, Signed> {
         {
             if crate::test_helpers::mint::should_fail_for("ADD_SIGNATURES") {
                 tx.rollback().await?;
-                self.compensate_all().await?;
+                self.compensate().await?;
                 return Err(Error::Database(database::Error::Database(
                     "Test failure: ADD_SIGNATURES".into(),
                 )));
@@ -376,11 +364,11 @@ impl SwapSaga<'_, Signed> {
         }
 
         if let Err(err) = tx
-            .add_blind_signatures(&blinded_secrets, &self.state_data.signatures, None)
+            .add_blind_signatures(&blinded_secrets, &self.state.signatures, None)
             .await
         {
             tx.rollback().await?;
-            self.compensate_all().await?;
+            self.compensate().await?;
             return Err(err.into());
         }
 
@@ -391,37 +379,34 @@ impl SwapSaga<'_, Signed> {
         {
             if crate::test_helpers::mint::should_fail_for("UPDATE_PROOFS") {
                 tx.rollback().await?;
-                self.compensate_all().await?;
+                self.compensate().await?;
                 return Err(Error::Database(database::Error::Database(
                     "Test failure: UPDATE_PROOFS".into(),
                 )));
             }
         }
 
-        let mut proofs = match tx.get_proofs(&self.state_data.ys).await {
+        let mut proofs = match tx.get_proofs(&self.state.ys).await {
             Ok(proofs) => proofs,
             Err(err) => {
                 tx.rollback().await?;
-                self.compensate_all().await?;
+                self.compensate().await?;
                 return Err(err.into());
             }
         };
 
         if let Err(err) = Mint::update_proofs_state(&mut tx, &mut proofs, State::Spent).await {
             tx.rollback().await?;
-            self.compensate_all().await?;
+            self.compensate().await?;
             return Err(err);
         }
 
         if let Err(err) = tx
-            .add_completed_operation(
-                &self.state_data.operation,
-                &self.state_data.fee_breakdown.per_keyset,
-            )
+            .add_completed_operation(&self.state.operation, &self.state.fee_breakdown.per_keyset)
             .await
         {
             tx.rollback().await?;
-            self.compensate_all().await?;
+            self.compensate().await?;
             return Err(err.into());
         }
 
@@ -438,44 +423,12 @@ impl SwapSaga<'_, Signed> {
 
         tx.commit().await?;
         // Publish proof state changes
-        for pk in &self.state_data.ys {
-            self.pubsub.proof_state((*pk, State::Spent));
+        for pk in &self.state.ys {
+            self.ctx.pubsub.proof_state((*pk, State::Spent));
         }
-        // Clear compensations - swap is complete
-        self.compensations.clear();
+        // Swap is complete, nothing left to undo
+        self.clear_compensations();
 
-        Ok(cdk_common::nuts::SwapResponse::new(
-            self.state_data.signatures,
-        ))
-    }
-}
-
-impl<S> SwapSaga<'_, S> {
-    /// Execute all compensating actions and consume the saga.
-    ///
-    /// This method takes ownership of self to ensure the saga cannot be used
-    /// after compensation has been triggered.
-    #[instrument(skip_all)]
-    async fn compensate_all(self) -> Result<(), Error> {
-        let mut compensations = self.compensations;
-
-        if compensations.is_empty() {
-            return Ok(());
-        }
-
-        tracing::warn!("Running {} compensating actions", compensations.len());
-
-        while let Some(compensation) = compensations.pop_front() {
-            tracing::debug!("Running compensation: {}", compensation.name());
-            if let Err(e) = compensation.execute(&self.db, &self.pubsub).await {
-                tracing::error!(
-                    "Compensation {} failed: {}. Continuing...",
-                    compensation.name(),
-                    e
-                );
-            }
-        }
-
-        Ok(())
+        Ok(cdk_common::nuts::SwapResponse::new(self.state.signatures))
     }
 }

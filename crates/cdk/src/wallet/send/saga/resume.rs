@@ -4,12 +4,12 @@
 //! by a crash. It determines the actual state by querying the mint and
 //! either completes the operation or compensates.
 
-use cdk_common::wallet::{OperationData, SendSagaState, WalletSaga};
+use cdk_common::wallet::{SendSagaState, WalletSaga};
 use tracing::instrument;
 
 use crate::nuts::State;
 use crate::wallet::recovery::{RecoveryAction, RecoveryHelpers};
-use crate::wallet::saga::{CompensatingAction, RevertProofReservation};
+use crate::wallet::saga::RevertProofReservation;
 use crate::{Error, Wallet};
 
 impl Wallet {
@@ -19,25 +19,7 @@ impl Wallet {
         &self,
         saga: &WalletSaga,
     ) -> Result<RecoveryAction, Error> {
-        let state = match &saga.state {
-            cdk_common::wallet::WalletSagaState::Send(s) => s,
-            _ => {
-                return Err(Error::Custom(format!(
-                    "Invalid saga state type for send saga {}",
-                    saga.id
-                )))
-            }
-        };
-
-        let _data = match &saga.data {
-            OperationData::Send(d) => d,
-            _ => {
-                return Err(Error::Custom(format!(
-                    "Invalid operation data type for send saga {}",
-                    saga.id
-                )))
-            }
-        };
+        let (state, _data) = saga.as_send()?;
 
         match state {
             SendSagaState::ProofsReserved => {
@@ -181,10 +163,12 @@ impl Wallet {
 
     /// Compensate a send saga by releasing reserved proofs.
     async fn compensate_send(&self, saga_id: &uuid::Uuid) -> Result<(), Error> {
-        let reserved_proofs = self.localstore.get_reserved_proofs(saga_id).await?;
-        let proof_ys = reserved_proofs.iter().map(|p| p.y).collect();
-
-        let mut pending_spent_proofs: Vec<_> = reserved_proofs
+        // Releasing only covers Reserved and Pending proofs, so a proof left in
+        // PendingSpent by an interrupted confirm has to be normalized first.
+        let mut pending_spent_proofs: Vec<_> = self
+            .localstore
+            .get_reserved_proofs(saga_id)
+            .await?
             .into_iter()
             .filter(|p| p.state == State::PendingSpent)
             .collect();
@@ -204,13 +188,8 @@ impl Wallet {
                 .await?;
         }
 
-        RevertProofReservation {
-            localstore: self.localstore.clone(),
-            proof_ys,
-            saga_id: *saga_id,
-        }
-        .execute()
-        .await
+        self.compensate_saga(vec![Box::new(RevertProofReservation { saga_id: *saga_id })])
+            .await
     }
 }
 

@@ -36,6 +36,7 @@ mod keysets;
 mod ln;
 mod melt;
 mod proofs;
+pub mod saga;
 mod saga_recovery;
 mod start_up_check;
 mod subscription;

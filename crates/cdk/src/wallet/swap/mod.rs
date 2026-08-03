@@ -14,7 +14,7 @@ use crate::{Amount, Error, Wallet};
 
 pub(crate) mod saga;
 
-use saga::SwapSaga;
+use saga::NewSwapSaga;
 
 /// Controls whether swap operations should reserve proofs in the database.
 ///
@@ -100,8 +100,7 @@ impl Wallet {
         tracing::info!("Swapping");
 
         self.retry_on_inactive_keyset(|| async {
-            let saga = SwapSaga::new(self);
-            let saga = saga
+            NewSwapSaga::new(self)
                 .prepare(
                     amount,
                     amount_split_target.clone(),
@@ -111,9 +110,9 @@ impl Wallet {
                     include_fees,
                     proof_reservation,
                 )
-                .await?;
-            let saga = saga.execute().await?;
-            Ok(saga.into_send_proofs())
+                .await?
+                .execute()
+                .await
         })
         .await
     }

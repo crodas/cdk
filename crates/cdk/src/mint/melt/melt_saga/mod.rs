@@ -1,8 +1,9 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use cdk_common::database::DynMintDatabase;
-use cdk_common::mint::{MeltFinalizationData, MeltSagaState, Operation, Saga, SagaStateEnum};
+use cdk_common::mint::{
+    MeltFinalizationData, MeltSagaState, Operation, Saga as PersistedSaga, SagaStateEnum,
+};
 use cdk_common::nut00::KnownMethod;
 use cdk_common::nuts::MeltQuoteState;
 use cdk_common::payment::OutgoingPaymentOptions;
@@ -12,16 +13,17 @@ use cdk_common::{
 };
 #[cfg(feature = "prometheus")]
 use cdk_prometheus::MintMetricGuard;
-use tokio::sync::Mutex;
 use tracing::instrument;
 
-use self::compensation::{CompensatingAction, RemoveMeltSetup};
+use self::compensation::RemoveMeltSetup;
 use self::state::{Initial, PaymentConfirmed, SettlementDecision, SetupComplete};
 use crate::cdk_payment::MakePaymentResponse;
 use crate::mint::melt::shared;
+use crate::mint::saga::MintSagaContext;
 use crate::mint::subscription::PubSubManager;
 use crate::mint::verification::Verification;
 use crate::mint::MeltRequest;
+use crate::saga::Saga;
 use crate::{MeltQuoteResponse, Mint};
 
 mod compensation;
@@ -126,38 +128,27 @@ mod tests;
 /// - State-specific data (e.g., payment_result) only exists in the appropriate state type
 /// - No runtime state checks or `Option<T>` unwrapping needed
 /// - IDE autocomplete only shows valid operations for each state
-pub struct MeltSaga<S> {
-    mint: Arc<super::Mint>,
-    db: DynMintDatabase,
-    pubsub: Arc<PubSubManager>,
-    /// Compensating actions in LIFO order (most recent first)
-    compensations: Arc<Mutex<VecDeque<Box<dyn CompensatingAction>>>>,
-    /// Operation ID (used for saga tracking, generated upfront)
-    operation_id: uuid::Uuid,
-    /// Tracks melt metrics through the saga lifecycle.
-    #[cfg(feature = "prometheus")]
-    metrics: Option<MintMetricGuard>,
-    /// State-specific data
-    state_data: S,
-}
+pub type MeltSaga<S> = Saga<MeltSagaContext, S>;
+
+/// The melt flow is moved into a spawned task, so it owns the mint.
+pub type MeltSagaContext = MintSagaContext<Arc<Mint>>;
 
 impl MeltSaga<Initial> {
+    /// Start a melt saga with a freshly generated operation ID.
     pub fn new(mint: Arc<super::Mint>, db: DynMintDatabase, pubsub: Arc<PubSubManager>) -> Self {
-        #[cfg(feature = "prometheus")]
-        let metrics = Some(MintMetricGuard::new("melt_bolt11"));
-
         let operation_id = uuid::Uuid::now_v7();
 
-        Self {
-            mint,
-            db,
-            pubsub,
-            compensations: Arc::new(Mutex::new(VecDeque::new())),
+        Saga::start(
+            MintSagaContext::new(
+                mint,
+                db,
+                pubsub,
+                #[cfg(feature = "prometheus")]
+                Some(MintMetricGuard::new("melt_bolt11")),
+            ),
             operation_id,
-            #[cfg(feature = "prometheus")]
-            metrics,
-            state_data: Initial { operation_id },
-        }
+            Initial { operation_id },
+        )
     }
 
     /// Sets up the melt by atomically verifying and reserving inputs/outputs.
@@ -192,7 +183,7 @@ impl MeltSaga<Initial> {
     /// - `UnitMismatch`: Input unit doesn't match quote unit
     #[instrument(skip_all)]
     pub async fn setup_melt(
-        self,
+        mut self,
         melt_request: &MeltRequest<QuoteId>,
         input_verification: Verification,
         payment_method: cdk_common::PaymentMethod,
@@ -204,7 +195,7 @@ impl MeltSaga<Initial> {
 
         if let Some(outputs) = melt_request.outputs() {
             if !outputs.is_empty() {
-                let output_verification = self.mint.verify_outputs(outputs)?;
+                let output_verification = self.ctx.mint.verify_outputs(outputs)?;
                 if input_unit.as_ref() != Some(output_verification.amount.unit()) {
                     return Err(Error::UnitMismatch);
                 }
@@ -215,7 +206,7 @@ impl MeltSaga<Initial> {
         // and HTLC (including SIGALL)
         melt_request.verify_spending_conditions()?;
 
-        let mut tx = self.db.begin_transaction().await?;
+        let mut tx = self.ctx.db.begin_transaction().await?;
 
         let mut quote =
             match shared::load_melt_quotes_exclusively(&mut tx, melt_request.quote()).await {
@@ -227,13 +218,13 @@ impl MeltSaga<Initial> {
             };
 
         // Calculate fee to create Operation with actual amounts
-        let fee_breakdown = self.mint.get_proofs_fee(melt_request.inputs()).await?;
+        let fee_breakdown = self.ctx.mint.get_proofs_fee(melt_request.inputs()).await?;
 
         // Create Operation with actual amounts now that we know them
         // total_redeemed = input_amount (proofs being burnt)
         // fee_collected = fee
         let operation = Operation::new(
-            self.state_data.operation_id,
+            self.state.operation_id,
             cdk_common::mint::OperationKind::Melt,
             Amount::ZERO, // total_issued (change will be calculated later)
             input_amount.clone().into(), // total_redeemed (convert to untyped)
@@ -330,7 +321,7 @@ impl MeltSaga<Initial> {
             }
         };
 
-        let inputs_fee_breakdown = self.mint.get_proofs_fee(melt_request.inputs()).await?;
+        let inputs_fee_breakdown = self.ctx.mint.get_proofs_fee(melt_request.inputs()).await?;
         let inputs_fee = inputs_fee_breakdown.total.with_unit(quote.unit.clone());
         let fee_reserve = quote.fee_reserve();
 
@@ -384,7 +375,7 @@ impl MeltSaga<Initial> {
             .collect();
 
         // Persist saga state for crash recovery (atomic with TX1)
-        let saga = Saga::new_melt(
+        let saga = PersistedSaga::new_melt(
             self.operation_id,
             MeltSagaState::SetupComplete,
             quote.id.to_string(),
@@ -398,40 +389,26 @@ impl MeltSaga<Initial> {
         tx.commit().await?;
         // Publish proof state changes
         for pk in input_ys.iter() {
-            self.pubsub.proof_state((*pk, State::Pending));
+            self.ctx.pubsub.proof_state((*pk, State::Pending));
         }
 
         // Publish melt quote status change AFTER transaction commits
-        self.pubsub
+        self.ctx
+            .pubsub
             .melt_quote_status(&quote, None, None, MeltQuoteState::Pending);
 
-        // Register compensation (uses LIFO via push_front)
-        let compensations = Arc::clone(&self.compensations);
-        compensations
-            .lock()
-            .await
-            .push_front(Box::new(RemoveMeltSetup {
-                input_ys: input_ys.clone(),
-                blinded_secrets,
-                quote_id: quote.id.clone(),
-                operation_id: self.operation_id,
-            }));
+        self.push_compensation(Box::new(RemoveMeltSetup {
+            input_ys: input_ys.clone(),
+            blinded_secrets,
+            quote_id: quote.id.clone(),
+            operation_id: self.operation_id,
+        }));
 
-        // Transition to SetupComplete state
         // Extract inner MeltQuote from Acquired wrapper - the lock was only meaningful
         // within the transaction that just committed
-        Ok(MeltSaga {
-            mint: self.mint,
-            db: self.db,
-            pubsub: self.pubsub,
-            compensations: self.compensations,
-            operation_id: self.operation_id,
-            #[cfg(feature = "prometheus")]
-            metrics: self.metrics,
-            state_data: SetupComplete {
-                quote: quote.inner(),
-            },
-        })
+        Ok(self.advance(SetupComplete {
+            quote: quote.inner(),
+        }))
     }
 }
 
@@ -473,13 +450,13 @@ impl MeltSaga<SetupComplete> {
         self,
         melt_request: &MeltRequest<QuoteId>,
     ) -> Result<(Self, SettlementDecision), Error> {
-        let mut tx = self.db.begin_transaction().await?;
+        let mut tx = self.ctx.db.begin_transaction().await?;
 
         let mut mint_quote = match tx
-            .get_mint_quote_by_request(&self.state_data.quote.request.to_string())
+            .get_mint_quote_by_request(&self.state.quote.request.to_string())
             .await
         {
-            Ok(Some(mint_quote)) if mint_quote.unit == self.state_data.quote.unit => mint_quote,
+            Ok(Some(mint_quote)) if mint_quote.unit == self.state.quote.unit => mint_quote,
             Ok(_) => {
                 tx.rollback().await?;
                 tracing::debug!("Not an internal payment or unit mismatch");
@@ -488,7 +465,7 @@ impl MeltSaga<SetupComplete> {
             Err(err) => {
                 tx.rollback().await?;
                 tracing::debug!("Error checking for mint quote: {}", err);
-                self.compensate_all().await?;
+                self.compensate_melt().await?;
                 return Err(Error::Internal);
             }
         };
@@ -499,7 +476,7 @@ impl MeltSaga<SetupComplete> {
             && mint_quote.payment_method == crate::mint::PaymentMethod::Known(KnownMethod::Bolt11)
         {
             tx.rollback().await?;
-            self.compensate_all().await?;
+            self.compensate_melt().await?;
             return Err(Error::RequestAlreadyPaid);
         }
 
@@ -519,12 +496,12 @@ impl MeltSaga<SetupComplete> {
                     amount
                 );
                 tx.rollback().await?;
-                self.compensate_all().await?;
+                self.compensate_melt().await?;
                 return Err(Error::InsufficientFunds);
             }
         }
 
-        let amount = self.state_data.quote.amount();
+        let amount = self.state.quote.amount();
 
         tracing::info!(
             "Mint quote {} paid {} from internal payment.",
@@ -540,16 +517,17 @@ impl MeltSaga<SetupComplete> {
         )
         .await?;
 
-        mint_quote.add_payment(amount.clone(), self.state_data.quote.id.to_string(), None)?;
+        mint_quote.add_payment(amount.clone(), self.state.quote.id.to_string(), None)?;
         tx.update_mint_quote(&mut mint_quote).await?;
 
         tx.commit().await?;
-        self.pubsub
+        self.ctx
+            .pubsub
             .mint_quote_payment(&mint_quote, mint_quote.amount_paid());
 
         tracing::info!(
             "Melt quote {} paid Mint quote {}",
-            self.state_data.quote.id,
+            self.state.quote.id,
             mint_quote.id
         );
 
@@ -616,73 +594,65 @@ impl MeltSaga<SetupComplete> {
                     MeltQuoteState::Unpaid | MeltQuoteState::Failed => {
                         tracing::info!(
                             "Lightning payment for quote {} failed.",
-                            self.state_data.quote.id
+                            self.state.quote.id
                         );
-                        self.compensate_all().await?;
+                        self.compensate_melt().await?;
                         return Err(Error::PaymentFailed);
                     }
                     MeltQuoteState::Unknown => {
                         tracing::warn!(
                             "Lightning payment for quote {} unknown.",
-                            self.state_data.quote.id
+                            self.state.quote.id
                         );
                         self.persist_pending_payment_lookup_id(&response.payment_lookup_id)
                             .await;
                         return Ok(PaymentOutcome::Pending {
                             #[cfg(feature = "prometheus")]
-                            metrics: self.metrics,
+                            metrics: self.ctx.metrics,
                         });
                     }
                     MeltQuoteState::Pending => {
                         tracing::warn!(
                             "LN payment pending, proofs remain pending for quote: {}",
-                            self.state_data.quote.id
+                            self.state.quote.id
                         );
                         self.persist_pending_payment_lookup_id(&response.payment_lookup_id)
                             .await;
                         return Ok(PaymentOutcome::Pending {
                             #[cfg(feature = "prometheus")]
-                            metrics: self.metrics,
+                            metrics: self.ctx.metrics,
                         });
                     }
                 }
             }
         };
 
-        // Transition to PaymentConfirmed state
-        Ok(PaymentOutcome::Confirmed(Box::new(MeltSaga {
-            mint: self.mint,
-            db: self.db,
-            pubsub: self.pubsub,
-            compensations: self.compensations,
-            operation_id: self.operation_id,
-            #[cfg(feature = "prometheus")]
-            metrics: self.metrics,
-            state_data: PaymentConfirmed {
-                quote: self.state_data.quote,
+        Ok(PaymentOutcome::Confirmed(Box::new(self.map_state(
+            |state| PaymentConfirmed {
+                quote: state.quote,
                 payment_result,
             },
-        })))
+        ))))
     }
 
     fn handle_internal_payment(&self, amount: Amount<CurrencyUnit>) -> MakePaymentResponse {
         tracing::info!(
             "Payment settled internally for {} {}",
             amount,
-            self.state_data.quote.unit
+            self.state.quote.unit
         );
         MakePaymentResponse {
             status: MeltQuoteState::Paid,
             total_spent: amount,
             payment_proof: None,
             payment_lookup_id: self
-                .state_data
+                .state
                 .quote
                 .request_lookup_id
                 .clone()
                 .unwrap_or_else(|| {
                     cdk_common::payment::PaymentIdentifier::CustomId(
-                        self.state_data.quote.id.to_string(),
+                        self.state.quote.id.to_string(),
                     )
                 }),
         }
@@ -691,17 +661,18 @@ impl MeltSaga<SetupComplete> {
     async fn attempt_external_payment(&self) -> Result<MakePaymentResponse, Error> {
         // Get LN payment processor
         let ln = self
+            .ctx
             .mint
             .payment_processors
             .get(&crate::types::PaymentProcessorKey::new(
-                self.state_data.quote.unit.clone(),
-                self.state_data.quote.payment_method.clone(),
+                self.state.quote.unit.clone(),
+                self.state.quote.payment_method.clone(),
             ))
             .ok_or_else(|| {
                 tracing::info!(
                     "Could not get ln backend for {}, {}",
-                    self.state_data.quote.unit,
-                    self.state_data.quote.payment_method
+                    self.state.quote.unit,
+                    self.state.quote.payment_method
                 );
                 Error::UnsupportedUnit
             })?;
@@ -709,7 +680,7 @@ impl MeltSaga<SetupComplete> {
         // Update saga state to PaymentAttempted BEFORE making payment
         // This ensures crash recovery knows payment may have been attempted
         {
-            let mut tx = self.db.begin_transaction().await?;
+            let mut tx = self.ctx.db.begin_transaction().await?;
             tx.update_saga(
                 &self.operation_id,
                 SagaStateEnum::Melt(MeltSagaState::PaymentAttempted),
@@ -728,7 +699,7 @@ impl MeltSaga<SetupComplete> {
         >,
     ) -> Result<MakePaymentResponse, Error> {
         // Make payment with idempotent verification
-        let quote = &self.state_data.quote;
+        let quote = &self.state.quote;
         let payment_options = OutgoingPaymentOptions::from_melt_quote_with_fee(quote.clone())?;
 
         match ln.make_payment(&quote.unit, payment_options).await {
@@ -748,9 +719,9 @@ impl MeltSaga<SetupComplete> {
         tracing::warn!(
             "Got {} status when paying melt quote {} for {} {}. Verifying with backend...",
             pay.status,
-            self.state_data.quote.id,
-            self.state_data.quote.amount(),
-            self.state_data.quote.unit
+            self.state.quote.id,
+            self.state.quote.amount(),
+            self.state.quote.unit
         );
 
         let mut check_response = self.check_payment_state(ln, &pay.payment_lookup_id).await?;
@@ -796,29 +767,24 @@ impl MeltSaga<SetupComplete> {
             // Other error - check if payment actually succeeded
             tracing::error!(
                 "Error returned attempting to pay: {} {}",
-                self.state_data.quote.id,
+                self.state.quote.id,
                 err
             );
         }
 
-        let lookup_id = self
-            .state_data
-            .quote
-            .request_lookup_id
-            .as_ref()
-            .ok_or_else(|| {
-                tracing::error!(
-                    "No payment id, cannot verify payment status for {} after error",
-                    self.state_data.quote.id
-                );
-                Error::Internal
-            })?;
+        let lookup_id = self.state.quote.request_lookup_id.as_ref().ok_or_else(|| {
+            tracing::error!(
+                "No payment id, cannot verify payment status for {} after error",
+                self.state.quote.id
+            );
+            Error::Internal
+        })?;
 
         let mut check_response = self.check_payment_state(ln, lookup_id).await?;
 
         tracing::info!(
             "Initial payment attempt for {} errored. Follow up check status: {}",
-            self.state_data.quote.id,
+            self.state.quote.id,
             check_response.status
         );
 
@@ -850,14 +816,14 @@ impl MeltSaga<SetupComplete> {
         &self,
         payment_lookup_id: &cdk_common::payment::PaymentIdentifier,
     ) {
-        let quote_id = &self.state_data.quote.id;
+        let quote_id = &self.state.quote.id;
 
-        if self.state_data.quote.request_lookup_id.as_ref() == Some(payment_lookup_id) {
+        if self.state.quote.request_lookup_id.as_ref() == Some(payment_lookup_id) {
             return;
         }
 
         let result: Result<(), Error> = async {
-            let mut tx = self.db.begin_transaction().await?;
+            let mut tx = self.ctx.db.begin_transaction().await?;
 
             let mut quote = tx
                 .get_melt_quote(quote_id)
@@ -961,22 +927,20 @@ impl MeltSaga<PaymentConfirmed> {
     pub async fn finalize(mut self) -> Result<MeltQuoteResponse<QuoteId>, Error> {
         tracing::info!("TX2: Finalizing melt (mark spent + change)");
 
-        let total_spent: Amount<CurrencyUnit> = self.state_data.payment_result.total_spent;
-        let total_spent =
-            shared::total_spent_for_quote_unit(&total_spent, &self.state_data.quote.unit).map_err(
-                |e| {
-                    tracing::error!("Failed to convert total_spent to quote unit: {:?}", e);
-                    Error::UnitMismatch
-                },
-            )?;
+        let total_spent: Amount<CurrencyUnit> = self.state.payment_result.total_spent.clone();
+        let total_spent = shared::total_spent_for_quote_unit(&total_spent, &self.state.quote.unit)
+            .map_err(|e| {
+                tracing::error!("Failed to convert total_spent to quote unit: {:?}", e);
+                Error::UnitMismatch
+            })?;
 
-        let payment_proof = self.state_data.payment_result.payment_proof.clone();
-        let payment_lookup_id = &self.state_data.payment_result.payment_lookup_id;
+        let payment_proof = self.state.payment_result.payment_proof.clone();
+        let payment_lookup_id = &self.state.payment_result.payment_lookup_id;
 
         // Persist Finalizing state so crash recovery knows TX1 may have completed.
         // This must happen before finalize_melt_quote which will commit TX1 internally.
         {
-            let mut tx = self.db.begin_transaction().await?;
+            let mut tx = self.ctx.db.begin_transaction().await?;
             let finalization_data = MeltFinalizationData {
                 total_spent: total_spent.clone(),
                 payment_lookup_id: payment_lookup_id.clone(),
@@ -998,10 +962,10 @@ impl MeltSaga<PaymentConfirmed> {
         // - Saga deletion
         // - Melt request cleanup
         let change = shared::finalize_melt_quote(
-            &self.mint,
-            &self.db,
-            &self.pubsub,
-            &self.state_data.quote,
+            &self.ctx.mint,
+            &self.ctx.db,
+            &self.ctx.pubsub,
+            &self.state.quote,
             total_spent,
             payment_proof.clone(),
             payment_lookup_id,
@@ -1013,22 +977,22 @@ impl MeltSaga<PaymentConfirmed> {
             // Startup check will retry finalization on next recovery cycle
             tracing::error!(
                 "Finalize failed for paid melt quote {} - will retry on startup: {}",
-                self.state_data.quote.id,
+                self.state.quote.id,
                 err
             );
             err
         })?;
 
-        self.compensations.lock().await.clear();
+        self.clear_compensations();
 
         #[cfg(feature = "prometheus")]
-        if let Some(metrics) = self.metrics.take() {
+        if let Some(metrics) = self.ctx.metrics.take() {
             metrics.record(true);
         }
 
-        self.state_data.quote.payment_proof = payment_proof;
-        self.state_data.quote.state = MeltQuoteState::Paid;
-        let response = self.state_data.quote.into_response(change);
+        self.state.quote.payment_proof = payment_proof;
+        self.state.quote.state = MeltQuoteState::Paid;
+        let response = self.state.quote.into_response(change);
 
         Ok(response)
     }
@@ -1040,6 +1004,7 @@ impl MeltSaga<PaymentConfirmed> {
 /// that completed (and is ready to finalize) and one that the backend reports
 /// as still in flight (and must be resolved asynchronously via the pending
 /// melt wait loop or a payment event).
+#[derive(Debug)]
 pub enum PaymentOutcome {
     /// Payment was confirmed by the backend; the saga is ready to be finalized.
     Confirmed(Box<MeltSaga<PaymentConfirmed>>),
@@ -1055,41 +1020,17 @@ pub enum PaymentOutcome {
 }
 
 impl<S> MeltSaga<S> {
-    /// Execute all compensating actions and consume the saga.
+    /// Roll back and record the melt as failed.
     ///
-    /// This method takes ownership of self to ensure the saga cannot be used
-    /// after compensation has been triggered.
-    ///
-    /// This is called internally by saga methods when they need to compensate.
+    /// The metric is only recorded when there is something to undo, matching the
+    /// forward path: a saga that never got past setup never started a melt.
     #[instrument(skip_all)]
-    async fn compensate_all(self) -> Result<(), Error> {
-        #[cfg(feature = "prometheus")]
-        let metrics = self.metrics;
-
-        let mut compensations = self.compensations.lock().await;
-
-        if compensations.is_empty() {
+    async fn compensate_melt(mut self) -> Result<(), Error> {
+        if self.compensations().is_empty() {
             return Ok(());
         }
 
-        #[cfg(feature = "prometheus")]
-        if let Some(metrics) = metrics {
-            metrics.record(false);
-        }
-
-        tracing::warn!("Running {} compensating actions", compensations.len());
-
-        while let Some(compensation) = compensations.pop_front() {
-            tracing::debug!("Running compensation: {}", compensation.name());
-            if let Err(e) = compensation.execute(&self.db, &self.pubsub).await {
-                tracing::error!(
-                    "Compensation {} failed: {}. Continuing...",
-                    compensation.name(),
-                    e
-                );
-            }
-        }
-
-        Ok(())
+        self.ctx.record_failure();
+        self.compensate().await
     }
 }

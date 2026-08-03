@@ -5,6 +5,7 @@ use tracing::instrument;
 use super::{Mint, SwapRequest, SwapResponse};
 use crate::Error;
 
+pub mod shared;
 pub mod swap_saga;
 
 #[cfg(test)]

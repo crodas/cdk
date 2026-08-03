@@ -5,8 +5,7 @@
 //! either completes the operation or compensates.
 
 use cdk_common::wallet::{
-    MeltOperationData, MeltSagaState, OperationData, Transaction, TransactionDirection,
-    TransactionId, WalletSaga,
+    MeltOperationData, MeltSagaState, Transaction, TransactionDirection, TransactionId, WalletSaga,
 };
 use cdk_common::{Amount, MeltQuoteState};
 use tracing::instrument;
@@ -17,7 +16,7 @@ use crate::util::unix_time;
 use crate::wallet::melt::saga::compensation::ReleaseMeltQuote;
 use crate::wallet::melt::MeltQuoteStatusResponse;
 use crate::wallet::recovery::OutputRecoveryResult;
-use crate::wallet::saga::{CompensatingAction, RevertProofReservation};
+use crate::wallet::saga::RevertProofReservation;
 use crate::{Error, Wallet};
 
 impl Wallet {
@@ -36,25 +35,7 @@ impl Wallet {
         &self,
         saga: &WalletSaga,
     ) -> Result<Option<FinalizedMelt>, Error> {
-        let state = match &saga.state {
-            cdk_common::wallet::WalletSagaState::Melt(s) => s,
-            _ => {
-                return Err(Error::Custom(format!(
-                    "Invalid saga state type for melt saga {}",
-                    saga.id
-                )))
-            }
-        };
-
-        let data = match &saga.data {
-            OperationData::Melt(d) => d,
-            _ => {
-                return Err(Error::Custom(format!(
-                    "Invalid operation data type for melt saga {}",
-                    saga.id
-                )))
-            }
-        };
+        let (state, data) = saga.as_melt()?;
 
         match state {
             MeltSagaState::ProofsReserved => {
@@ -387,47 +368,27 @@ impl Wallet {
 
     /// Compensate a melt saga by releasing proofs and the melt quote.
     async fn compensate_melt(&self, saga_id: &uuid::Uuid) -> Result<(), Error> {
-        // Release melt quote (best-effort, continue on error)
-        if let Err(e) = (ReleaseMeltQuote {
-            localstore: self.localstore.clone(),
-            operation_id: *saga_id,
-        }
-        .execute()
-        .await)
-        {
-            tracing::warn!(
-                "Failed to release melt quote for saga {}: {}. Continuing with saga cleanup.",
-                saga_id,
-                e
-            );
-        }
-
-        // Release proofs and delete saga
-        let reserved_proofs = self.localstore.get_reserved_proofs(saga_id).await?;
-        let proof_ys = reserved_proofs.iter().map(|p| p.y).collect();
-
-        RevertProofReservation {
-            localstore: self.localstore.clone(),
-            proof_ys,
-            saga_id: *saga_id,
-        }
-        .execute()
-        .await?;
-
-        Ok(())
+        self.compensate_saga(vec![
+            Box::new(ReleaseMeltQuote {
+                operation_id: *saga_id,
+            }),
+            Box::new(RevertProofReservation { saga_id: *saga_id }),
+        ])
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use cdk_common::wallet::OperationData;
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use bip39::Mnemonic;
     use cdk_common::nuts::{CurrencyUnit, PaymentMethod, State};
     use cdk_common::wallet::{
-        MeltOperationData, MeltSagaState, OperationData, Transaction, TransactionDirection,
-        WalletSaga, WalletSagaState,
+        MeltOperationData, MeltSagaState, Transaction, TransactionDirection, WalletSaga,
+        WalletSagaState,
     };
     use cdk_common::{Amount, MeltQuoteBolt11Response, MeltQuoteState, RestoreResponse};
 

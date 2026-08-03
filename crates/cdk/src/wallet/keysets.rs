@@ -332,7 +332,7 @@ mod tests {
     /// fee calculation, and active keyset selection for swap outputs.
     #[tokio::test]
     async fn receive_prepares_swap_for_inactive_keyset_proofs() {
-        use crate::wallet::receive::saga::ReceiveSaga;
+        use crate::wallet::receive::saga::NewReceiveSaga;
         use crate::wallet::ReceiveOptions;
 
         let inactive_ks = make_inactive_keyset();
@@ -353,7 +353,7 @@ mod tests {
         // Build proofs as if they came from the inactive keyset
         let proofs = vec![test_proof(inactive_id, 2), test_proof(inactive_id, 1)];
 
-        let saga = ReceiveSaga::new(&wallet);
+        let saga = NewReceiveSaga::new(&wallet);
         // Prepare decodes proofs, looks up the inactive keyset for DLEQ
         // verification, calculates fees, and selects the active keyset for
         // swap outputs. If inactive keysets are not properly loaded, this

@@ -2032,14 +2032,18 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
     async fn release_proofs(&self, operation_id: &uuid::Uuid) -> Result<(), DatabaseError> {
         let op_id_str = operation_id.to_string();
 
-        // Update all proofs reserved by this operation back to Unspent
+        // Only proofs this operation still holds are released. One that reached
+        // Spent or PendingSpent in the meantime belongs to a transaction that
+        // already went through and must not be resurrected.
         let update = serde_json::json!({
             "state": State::Unspent.to_string(),
             "used_by_operation": null,
         });
         let path = format!(
-            "rest/v1/proof?used_by_operation=eq.{}",
-            url_encode(&op_id_str)
+            "rest/v1/proof?used_by_operation=eq.{}&state=in.({},{})",
+            url_encode(&op_id_str),
+            url_encode(&State::Reserved.to_string()),
+            url_encode(&State::Pending.to_string()),
         );
         let (status, response_text) = self.patch_request(&path, &update).await?;
 
