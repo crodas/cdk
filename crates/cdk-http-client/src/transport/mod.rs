@@ -259,3 +259,7 @@ mod tor_transport;
 
 #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
 pub use self::tor_transport::TorAsync;
+
+mod in_process;
+
+pub use self::in_process::InProcessTransport;

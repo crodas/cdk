@@ -21,6 +21,8 @@ use crate::wallet::{AuthMintConnector, AuthWallet};
 use crate::OidcClient;
 
 pub mod http_client;
+#[cfg(test)]
+mod test;
 pub mod transport;
 
 /// Auth HTTP Client with async transport

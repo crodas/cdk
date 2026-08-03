@@ -59,6 +59,7 @@ mod client;
 mod error;
 mod request;
 mod response;
+mod server;
 mod transport;
 pub mod ws;
 
@@ -76,6 +77,7 @@ pub use client::{fetch, HttpClient, HttpClientBuilder};
 pub use error::HttpError;
 pub use request::RequestBuilder;
 pub use response::{RawResponse, Response};
+pub use server::{HttpServer, ServerRequest, ServerResponse};
 #[cfg(any(target_arch = "wasm32", feature = "bitreq", feature = "reqwest"))]
 pub use transport::Async;
 #[cfg(all(
@@ -88,4 +90,4 @@ pub use transport::BitreqTransport;
 pub use transport::ReqwestTransport;
 #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
 pub use transport::TorAsync;
-pub use transport::Transport;
+pub use transport::{InProcessTransport, Transport};
