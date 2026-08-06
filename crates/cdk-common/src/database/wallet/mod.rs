@@ -13,8 +13,8 @@ use crate::nuts::{
     CurrencyUnit, Id, KeySetInfo, Keys, MintInfo, PublicKey, SpendingConditions, State,
 };
 use crate::wallet::{
-    self, MintId, MintQuote as WalletMintQuote, ProofInfo, Transaction, TransactionDirection,
-    TransactionId,
+    self, MintId, MintIdentity, MintIdentityClaim, MintQuote as WalletMintQuote, ProofInfo,
+    Transaction, TransactionDirection, TransactionId,
 };
 
 #[cfg(feature = "test")]
@@ -281,4 +281,37 @@ where
 
     /// Tries to get the latest p2pk key generated
     async fn latest_p2pk(&self) -> Result<Option<wallet::P2PKSigningKey>, Err>;
+
+    /// Every mint the wallet knows by pubkey.
+    ///
+    /// Mints still identified by URL are not listed: they have no identity to
+    /// report. Backends without a pubkey-keyed store return nothing.
+    async fn list_mint_identities(&self) -> Result<Vec<MintIdentity>, Err> {
+        Ok(Vec::new())
+    }
+
+    /// URL/pubkey associations the wallet observed but did not apply.
+    ///
+    /// Because the pubkey is unauthenticated, a claim that would pool two URLs'
+    /// funds under one mint is recorded rather than applied. Callers should
+    /// surface these for a person to decide on.
+    async fn list_mint_identity_claims(&self) -> Result<Vec<MintIdentityClaim>, Err> {
+        Ok(Vec::new())
+    }
+
+    /// Accept or reject a pending claim.
+    ///
+    /// Accepting a merge links `mint_url` to `pubkey`, after which both URLs'
+    /// proofs, keysets, quotes and transactions are returned together for that
+    /// identity. That is a trust decision about whose funds are whose, so it
+    /// belongs to the user, not to the wallet.
+    async fn resolve_mint_identity_claim(
+        &self,
+        mint_url: MintUrl,
+        pubkey: PublicKey,
+        accept: bool,
+    ) -> Result<(), Err> {
+        let _ = (mint_url, pubkey, accept);
+        Err(Error::Internal("mint identities are not supported by this backend".to_string()).into())
+    }
 }

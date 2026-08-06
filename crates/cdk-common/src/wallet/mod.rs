@@ -19,7 +19,8 @@ use uuid::Uuid;
 use crate::mint_quote::quote_state_from_amounts;
 use crate::mint_url::MintUrl;
 use crate::nuts::{
-    CurrencyUnit, Id, MeltQuoteState, MintQuoteState, SecretKey, SpendingConditions, State,
+    CurrencyUnit, Id, MeltQuoteState, MintInfo, MintQuoteState, SecretKey, SpendingConditions,
+    State,
 };
 use crate::{Amount, Error};
 
@@ -95,6 +96,55 @@ impl fmt::Display for MintId {
             Self::Url(mint_url) => write!(f, "{mint_url}"),
         }
     }
+}
+
+/// A mint the wallet knows by the pubkey it published.
+///
+/// The pubkey is not authenticated by any protocol signature: nothing in Cashu
+/// signs with the mint identity key. It is only ever what the mint reachable at
+/// one of `urls` claimed, so treat it as a way to recognise the same mint across
+/// URLs, never as proof of identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MintIdentity {
+    /// The pubkey the mint claims.
+    pub pubkey: PublicKey,
+    /// URLs the wallet currently resolves to this identity.
+    pub urls: Vec<MintUrl>,
+    /// Metadata last observed for this identity.
+    pub info: MintInfo,
+    /// Unix time this identity was first recorded.
+    pub first_seen: u64,
+    /// Unix time this identity was last confirmed by contacting one of `urls`.
+    pub last_seen: u64,
+}
+
+/// Why a URL/pubkey association was not applied automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MintIdentityClaimKind {
+    /// A new URL claimed a pubkey another URL already holds.
+    ///
+    /// Applying this would pool both URLs' proofs under one mint, so a mint that
+    /// copied an honest mint's pubkey could have its proofs counted as the
+    /// honest mint's.
+    Merge,
+    /// A known URL claimed a different pubkey than the one it is linked to.
+    Rotation,
+}
+
+/// A URL/pubkey association the wallet observed but did not apply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MintIdentityClaim {
+    /// URL that made the claim.
+    pub mint_url: MintUrl,
+    /// Pubkey it claimed.
+    pub pubkey: PublicKey,
+    /// Why it was withheld.
+    pub kind: MintIdentityClaimKind,
+    /// Unix time the claim was first observed.
+    pub first_seen: u64,
+    /// Unix time the claim was last observed.
+    pub last_seen: u64,
 }
 
 /// Wallet Key
