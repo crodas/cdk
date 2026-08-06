@@ -611,7 +611,7 @@ impl Wallet {
         // Check that mint is in store of mints
         if self
             .localstore
-            .get_mint(&self.mint_id().await?)
+            .get_mint(&MintId::Url(self.mint_url.clone()))
             .await?
             .is_none()
         {

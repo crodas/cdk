@@ -7,6 +7,33 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Wallets identify a mint by the pubkey it publishes rather than by its URL. Mints
+  are still added by URL and tokens are still URL-addressed; a mint moves onto the
+  pubkey-keyed tables the first time the wallet talks to it and learns a pubkey, so
+  it keeps its proofs when it changes domain. Mints that publish no pubkey are
+  unaffected and need no upgrade step.
+- **Breaking** for anyone implementing `WalletDatabase`: lookups take a `MintId`
+  (the pubkey, or the URL for a mint that published none) instead of a `MintUrl`,
+  and `get_mints` is keyed by it. `add_mint` still takes a URL. New `resolve_mint`
+  and `mint_urls` bridge between the two, alongside provided `mint_pubkey`,
+  `list_mint_identities`, `list_mint_identity_claims` and
+  `resolve_mint_identity_claim`.
+- A URL claiming a pubkey another URL already holds is recorded as a pending claim
+  rather than merged, since nothing in Cashu signs the mint identity key and
+  merging would let one mint's proofs be counted as another's. Surfaced through
+  `WalletRepository::list_mint_identity_claims`.
+- `update_mint_url` now refuses to rename a mint onto a URL that is already taken.
+
+### Fixed
+
+- `MintInfo::pubkey` was written but never read back on the SQLite and PostgreSQL
+  wallet backends, so it was always `None`. Existing databases keep the value and
+  start returning it.
+- `update_mint_url` left rows behind on every backend, each covering a different
+  subset of the tables that reference a mint, and never renamed the mint itself.
+
 ## [0.17.0](https://github.com/cashubtc/cdk/releases/tag/v0.17.0)
 
 ### Summary

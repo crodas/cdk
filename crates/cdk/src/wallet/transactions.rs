@@ -2,6 +2,7 @@ use cdk_common::wallet::{Transaction, TransactionDirection, TransactionId};
 use cdk_common::Proofs;
 
 use crate::{Error, Wallet};
+use cdk_common::wallet::MintId;
 
 impl Wallet {
     fn transaction_matches_wallet(&self, transaction: &Transaction) -> bool {
@@ -20,7 +21,7 @@ impl Wallet {
         let mut transactions = self
             .localstore
             .list_transactions(
-                Some(&self.mint_id().await?),
+                Some(&MintId::Url(self.mint_url.clone())),
                 direction,
                 Some(self.unit.clone()),
             )

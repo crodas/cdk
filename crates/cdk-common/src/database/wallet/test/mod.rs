@@ -471,6 +471,54 @@ where
     );
 }
 
+/// Renaming a mint onto a URL another mint already answers on is refused.
+///
+/// Letting it through would file two mints' proofs under one URL, with no way to
+/// tell afterwards which belonged to which.
+pub async fn update_mint_url_rejects_occupied_url<DB>(db: DB)
+where
+    DB: Database<crate::database::Error>,
+{
+    let old_url = test_mint_url();
+    let new_url = test_mint_url_2();
+
+    db.add_mint(old_url.clone(), None).await.unwrap();
+    db.add_mint(new_url.clone(), None).await.unwrap();
+    db.update_proofs(
+        vec![test_proof_info(test_keyset_id(), 5, old_url.clone())],
+        vec![],
+    )
+    .await
+    .unwrap();
+    db.update_proofs(
+        vec![test_proof_info(test_keyset_id_2(), 50, new_url.clone())],
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        db.update_mint_url(old_url.clone(), new_url.clone())
+            .await
+            .is_err(),
+        "renamed a mint onto a URL that was already taken"
+    );
+
+    // Both mints are intact and still apart.
+    assert_eq!(
+        db.get_balance(Some(&mint_id(&old_url)), None, None)
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        db.get_balance(Some(&mint_id(&new_url)), None, None)
+            .await
+            .unwrap(),
+        50
+    );
+}
+
 /// Test that removing a mint removes the keysets that belong to it.
 ///
 /// The schema declares this as a cascading foreign key, but sqlite never enables
@@ -2391,6 +2439,7 @@ macro_rules! wallet_db_test {
             remove_mint_removes_keysets,
             update_mint_url,
             update_mint_url_moves_all_rows,
+            update_mint_url_rejects_occupied_url,
             add_and_get_keysets,
             get_keyset_by_id_in_transaction,
             add_and_get_keys,

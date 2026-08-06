@@ -684,9 +684,19 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
         old_mint_url: MintUrl,
         new_mint_url: MintUrl,
     ) -> Result<(), database::Error> {
-        let write_txn = self.db.begin_write().map_err(Error::from)?;
         let old = old_mint_url.to_string();
         let new = new_mint_url.to_string();
+
+        // Refuse rather than pool two mints' rows under one URL.
+        {
+            let read_txn = self.db.begin_read().map_err(Error::from)?;
+            let table = read_txn.open_table(MINTS_TABLE).map_err(Error::from)?;
+            if table.get(new.as_str()).map_err(Error::from)?.is_some() {
+                return Err(database::Error::Duplicate);
+            }
+        }
+
+        let write_txn = self.db.begin_write().map_err(Error::from)?;
 
         // The mint row itself, otherwise the mint stays listed under its old URL
         // and every row moved below is orphaned.

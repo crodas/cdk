@@ -11,6 +11,7 @@ use crate::nuts::{
     CheckStateRequest, Proof, ProofState, Proofs, PublicKey, SpendingConditions, State,
 };
 use crate::{ensure_cdk, Amount, Error, Wallet};
+use cdk_common::wallet::MintId;
 
 impl Wallet {
     /// Get unspent proofs for mint
@@ -54,7 +55,7 @@ impl Wallet {
         Ok(self
             .localstore
             .get_proofs(
-                Some(&self.mint_id().await?),
+                Some(&MintId::Url(self.mint_url.clone())),
                 Some(self.unit.clone()),
                 state,
                 spending_conditions,
@@ -124,7 +125,7 @@ impl Wallet {
         let proofs = self
             .localstore
             .get_proofs(
-                Some(&self.mint_id().await?),
+                Some(&MintId::Url(self.mint_url.clone())),
                 Some(self.unit.clone()),
                 Some(vec![State::Pending, State::Reserved, State::PendingSpent]),
                 None,

@@ -65,7 +65,7 @@ where
     };
 
     query(r#"SELECT mint_url FROM mint_locator WHERE pubkey = :pubkey"#)?
-        .bind("pubkey", hex_pubkey(pubkey))
+        .bind("pubkey", pubkey.to_hex())
         .fetch_all(conn)
         .await?
         .into_iter()
@@ -75,11 +75,6 @@ where
                 .ok_or(ConversionError::MissingColumn(0, 1))?))
         })
         .collect()
-}
-
-/// Lowercase hex, the representation the pubkey-keyed tables use.
-fn hex_pubkey(pubkey: &PublicKey) -> String {
-    pubkey.to_hex()
 }
 
 /// Resolve a URL-shaped id to the identity that URL was promoted to.
@@ -118,7 +113,7 @@ fn mint_rows_clause(mint: &MintId) -> &'static str {
 /// Bind whichever parameter [`mint_rows_clause`] referenced.
 fn bind_mint_rows(stmt: crate::stmt::Statement, mint: &MintId) -> crate::stmt::Statement {
     match mint {
-        MintId::Pubkey(pubkey) => stmt.bind("mint_pubkey", hex_pubkey(pubkey)),
+        MintId::Pubkey(pubkey) => stmt.bind("mint_pubkey", pubkey.to_hex()),
         MintId::Url(mint_url) => stmt.bind("mint_url", mint_url.to_string()),
     }
 }
@@ -326,7 +321,7 @@ async fn promote_mint_identity<T>(
 where
     T: DatabaseExecutor,
 {
-    let hex = hex_pubkey(pubkey);
+    let hex = pubkey.to_hex();
     let now = unix_time();
     let current = promoted_pubkey(tx, mint_url).await?;
 
@@ -649,7 +644,7 @@ where
                 WHERE pubkey = :pubkey
                 "#,
             )?
-            .bind("pubkey", hex_pubkey(pubkey))
+            .bind("pubkey", pubkey.to_hex())
             .fetch_one(&*conn)
             .await?
             .map(sql_row_to_mint_info)
@@ -1520,6 +1515,21 @@ where
             .map_err(|e| Error::Database(Box::new(e)))?;
         let tx = ConnectionWithTransaction::new(conn).await?;
 
+        // Refuse rather than pool two mints' rows under one URL.
+        let occupied = query(
+            r#"SELECT 1 FROM mint WHERE mint_url = :mint_url
+               UNION ALL
+               SELECT 1 FROM mint_locator WHERE mint_url = :mint_url"#,
+        )?
+        .bind("mint_url", new_mint_url.to_string())
+        .pluck(&tx)
+        .await?
+        .is_some();
+
+        if occupied {
+            return Err(Error::Duplicate);
+        }
+
         // The mint row must move too, otherwise the mint keeps answering under
         // its old URL and every dependent row is orphaned. A promoted mint has
         // no such row; it is its locator that moves.
@@ -1596,6 +1606,7 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
         let tx = ConnectionWithTransaction::new(conn).await?;
+        let mut refused_pubkey = false;
 
         // A mint that tells us a pubkey moves onto the pubkey-keyed tables, and
         // stays there. Everything else keeps its URL-keyed row.
@@ -1611,6 +1622,10 @@ where
                     "{mint_url} claims pubkey {pubkey}, which is held elsewhere; recorded the \
                      claim rather than merging the two"
                 );
+
+                // Storing the key on the URL-keyed row would read as accepted to
+                // anything that takes `mint.pubkey` as the identity.
+                refused_pubkey = true;
             }
         }
 
@@ -1659,7 +1674,9 @@ where
 
                 (
                     name,
-                    pubkey.map(|p| p.to_bytes().to_vec()),
+                    pubkey
+                        .filter(|_| !refused_pubkey)
+                        .map(|p| p.to_bytes().to_vec()),
                     version.map(|v| serde_json::to_string(&v).ok()),
                     description,
                     description_long,
@@ -1796,7 +1813,7 @@ where
             .into_iter()
             .next()
             .ok_or_else(|| Error::Internal(format!("unknown mint {mint}")))?;
-        let mint_pubkey = mint.pubkey().map(hex_pubkey);
+        let mint_pubkey = mint.pubkey().map(PublicKey::to_hex);
 
         let tx = ConnectionWithTransaction::new(conn).await?;
 
@@ -2604,6 +2621,22 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
+        // Collected up front so the identities are not walked one query at a time.
+        let mut locators: HashMap<String, Vec<MintUrl>> = HashMap::new();
+        for row in query(r#"SELECT pubkey, mint_url FROM mint_locator"#)?
+            .fetch_all(&*conn)
+            .await?
+        {
+            unpack_into!(let (pubkey, mint_url) = row);
+            let Ok(mint_url) = MintUrl::from_str(&column_as_string!(mint_url)) else {
+                continue;
+            };
+            locators
+                .entry(column_as_string!(pubkey))
+                .or_default()
+                .push(mint_url);
+        }
+
         let mut identities = Vec::new();
 
         for mut row in query(
@@ -2634,11 +2667,7 @@ where
 
             identities.push(MintIdentity {
                 pubkey,
-                urls: mint_urls_for(&*conn, &MintId::Pubkey(pubkey))
-                    .await?
-                    .into_iter()
-                    .filter_map(|url| MintUrl::from_str(&url).ok())
-                    .collect(),
+                urls: locators.remove(&pubkey.to_hex()).unwrap_or_default(),
                 info: sql_row_to_mint_info(row)?,
                 first_seen,
                 last_seen,
@@ -2696,7 +2725,7 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
         let tx = ConnectionWithTransaction::new(conn).await?;
-        let hex = hex_pubkey(&pubkey);
+        let hex = pubkey.to_hex();
 
         if accept {
             // The user has decided these are the same mint, which is the only

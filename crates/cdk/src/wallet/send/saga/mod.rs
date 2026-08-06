@@ -67,8 +67,8 @@ use bitcoin::XOnlyPublicKey;
 use cdk_common::amount::KeysetFeeAndAmounts;
 use cdk_common::util::unix_time;
 use cdk_common::wallet::{
-    KeysetLoadPolicy, OperationData, P2PKLockedProofSendMode, SendOperationData, SendSagaState,
-    Transaction, TransactionDirection, WalletSaga, WalletSagaState,
+    KeysetLoadPolicy, MintId, OperationData, P2PKLockedProofSendMode, SendOperationData,
+    SendSagaState, Transaction, TransactionDirection, WalletSaga, WalletSagaState,
 };
 use cdk_common::Id;
 use tracing::instrument;
@@ -481,7 +481,7 @@ impl<'a> SendSaga<'a, Initial> {
                     .wallet
                     .localstore
                     .get_proofs(
-                        Some(&self.wallet.mint_id().await?),
+                        Some(&MintId::Url(self.wallet.mint_url.clone())),
                         Some(self.wallet.unit.clone()),
                         Some(vec![State::Unspent]),
                         Some(vec![]),

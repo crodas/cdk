@@ -1548,6 +1548,16 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         let old_encoded = url_encode(&old_mint_url.to_string());
         let update_body = serde_json::json!({ "mint_url": new_mint_url.to_string() });
 
+        // Refuse rather than pool two mints' rows under one URL.
+        let path = format!(
+            "rest/v1/mint?mint_url=eq.{}",
+            url_encode(&new_mint_url.to_string())
+        );
+        let (status, text) = self.get_request(&path).await?;
+        if status.is_success() && Self::parse_response::<MintTable>(&text)?.is_some() {
+            return Err(DatabaseError::Duplicate);
+        }
+
         // The mint row first, then every table that references it. Missing one
         // strands its rows under a mint the wallet no longer knows about.
         for table in [

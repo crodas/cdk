@@ -3,6 +3,7 @@ use tracing::instrument;
 use crate::nuts::nut00::ProofsMethods;
 use crate::nuts::State;
 use crate::{Amount, Error, Wallet};
+use cdk_common::wallet::MintId;
 
 impl Wallet {
     /// Total unspent balance of wallet
@@ -12,7 +13,7 @@ impl Wallet {
         let balance = self
             .localstore
             .get_balance(
-                Some(&self.mint_id().await?),
+                Some(&MintId::Url(self.mint_url.clone())),
                 Some(self.unit.clone()),
                 Some(vec![State::Unspent]),
             )
