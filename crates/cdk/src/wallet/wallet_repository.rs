@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use cdk_common::database;
 use cdk_common::database::WalletDatabase;
-use cdk_common::wallet::WalletKey;
+use cdk_common::wallet::{MintIdentity, MintIdentityClaim, WalletKey};
+use cdk_common::PublicKey;
 use tokio::sync::RwLock;
 use tracing::instrument;
 use zeroize::Zeroize;
@@ -498,6 +499,50 @@ impl WalletRepository {
             .await
             .keys()
             .any(|key| &key.mint_url == mint_url)
+    }
+
+    /// Every mint the wallet knows by the pubkey it published.
+    ///
+    /// Mints that publish no pubkey are still identified by URL and are not
+    /// listed here.
+    #[instrument(skip(self))]
+    pub async fn list_mint_identities(&self) -> Result<Vec<MintIdentity>, Error> {
+        self.localstore
+            .list_mint_identities()
+            .await
+            .map_err(Error::Database)
+    }
+
+    /// URL/pubkey associations the wallet saw but would not apply on its own.
+    ///
+    /// Nothing in Cashu signs the mint identity key, so a URL claiming a key
+    /// another URL already holds is recorded rather than believed: applying it
+    /// would pool the two mints' funds. Show these to the user and pass their
+    /// answer to [`WalletRepository::resolve_mint_identity_claim`].
+    #[instrument(skip(self))]
+    pub async fn list_mint_identity_claims(&self) -> Result<Vec<MintIdentityClaim>, Error> {
+        self.localstore
+            .list_mint_identity_claims()
+            .await
+            .map_err(Error::Database)
+    }
+
+    /// Accept or reject a pending identity claim.
+    ///
+    /// Accepting means the user asserts the two URLs are the same mint, after
+    /// which their proofs, keysets, quotes and transactions are reported
+    /// together.
+    #[instrument(skip(self))]
+    pub async fn resolve_mint_identity_claim(
+        &self,
+        mint_url: MintUrl,
+        pubkey: PublicKey,
+        accept: bool,
+    ) -> Result<(), Error> {
+        self.localstore
+            .resolve_mint_identity_claim(mint_url, pubkey, accept)
+            .await
+            .map_err(Error::Database)
     }
     /// Get balances for all wallets
     ///
