@@ -13,7 +13,8 @@ use cdk_common::nuts::{MeltQuoteState, MintQuoteState};
 use cdk_common::secret::Secret;
 use cdk_common::util::unix_time;
 use cdk_common::wallet::{
-    self, MintId, MintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId,
+    self, MintId, MintIdentity, MintIdentityClaim, MintIdentityClaimKind, MintQuote, ProofInfo,
+    Transaction, TransactionDirection, TransactionId,
 };
 use cdk_common::{
     database, Amount, CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintInfo, PaymentMethod, Proof,
@@ -63,8 +64,8 @@ where
         MintId::Pubkey(pubkey) => pubkey,
     };
 
-    query(r#"SELECT mint_url FROM mint WHERE pubkey = :pubkey"#)?
-        .bind("pubkey", pubkey.to_bytes().to_vec())
+    query(r#"SELECT mint_url FROM mint_locator WHERE pubkey = :pubkey"#)?
+        .bind("pubkey", hex_pubkey(pubkey))
         .fetch_all(conn)
         .await?
         .into_iter()
@@ -74,6 +75,354 @@ where
                 .ok_or(ConversionError::MissingColumn(0, 1))?))
         })
         .collect()
+}
+
+/// Lowercase hex, the representation the pubkey-keyed tables use.
+fn hex_pubkey(pubkey: &PublicKey) -> String {
+    pubkey.to_hex()
+}
+
+/// Resolve a URL-shaped id to the identity that URL was promoted to.
+///
+/// A URL keeps reaching its mint after the mint moves onto the pubkey-keyed
+/// tables, so a caller holding only a URL still gets the whole identity, which
+/// after a merge is more than the rows that arrived through that one URL.
+async fn canonical_mint<T>(conn: &T, mint: &MintId) -> Result<MintId, Error>
+where
+    T: DatabaseExecutor,
+{
+    let MintId::Url(mint_url) = mint else {
+        return Ok(mint.clone());
+    };
+
+    match promoted_pubkey(conn, mint_url).await? {
+        Some(pubkey) => Ok(MintId::Pubkey(
+            PublicKey::from_hex(&pubkey).map_err(|e| Error::Internal(e.to_string()))?,
+        )),
+        None => Ok(mint.clone()),
+    }
+}
+
+/// The `WHERE` fragment selecting the rows that belong to a mint.
+///
+/// A mint that has moved onto the pubkey-keyed tables carries its pubkey on
+/// every row, so its rows stay found regardless of which of its URLs they were
+/// written under. One that has not is still selected by URL.
+fn mint_rows_clause(mint: &MintId) -> &'static str {
+    match mint {
+        MintId::Pubkey(_) => "mint_pubkey = :mint_pubkey",
+        MintId::Url(_) => "mint_url = :mint_url",
+    }
+}
+
+/// Bind whichever parameter [`mint_rows_clause`] referenced.
+fn bind_mint_rows(stmt: crate::stmt::Statement, mint: &MintId) -> crate::stmt::Statement {
+    match mint {
+        MintId::Pubkey(pubkey) => stmt.bind("mint_pubkey", hex_pubkey(pubkey)),
+        MintId::Url(mint_url) => stmt.bind("mint_url", mint_url.to_string()),
+    }
+}
+
+/// The pubkey a mint URL has been promoted to, if any.
+///
+/// Rows written for a promoted mint carry this so they stay attached to the
+/// identity rather than to the URL they happened to arrive through.
+async fn promoted_pubkey<T>(conn: &T, mint_url: &MintUrl) -> Result<Option<String>, Error>
+where
+    T: DatabaseExecutor,
+{
+    query(r#"SELECT pubkey FROM mint_locator WHERE mint_url = :mint_url"#)?
+        .bind("mint_url", mint_url.to_string())
+        .pluck(conn)
+        .await?
+        .map(|pubkey| Ok(column_as_string!(pubkey)))
+        .transpose()
+}
+
+/// Whether a mint was moved onto the pubkey-keyed tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Promotion {
+    /// The mint is now identified by the pubkey it claimed.
+    Applied,
+    /// The claim was recorded instead of applied; the mint is unchanged.
+    Deferred(MintIdentityClaimKind),
+}
+
+/// Attach every row of `mint_url` to `pubkey`.
+///
+/// Runs in the promoting transaction, so a mint never ends up half moved: for a
+/// given mint either all its rows carry the identity or none do, which is what
+/// lets a read pick one predicate rather than testing both.
+async fn stamp_rows<T>(tx: &T, mint_url: &MintUrl, pubkey: &str) -> Result<(), Error>
+where
+    T: DatabaseExecutor,
+{
+    for table in MINT_URL_TABLES {
+        query(&format!(
+            "UPDATE {table} SET mint_pubkey = :mint_pubkey WHERE mint_url = :mint_url"
+        ))?
+        .bind("mint_pubkey", pubkey.to_string())
+        .bind("mint_url", mint_url.to_string())
+        .execute(tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Write the metadata for an identity, creating it if it is new.
+async fn upsert_identity<T>(tx: &T, pubkey: &str, info: &MintInfo, now: u64) -> Result<(), Error>
+where
+    T: DatabaseExecutor,
+{
+    query(
+        r#"
+   INSERT INTO mint_identity
+   (
+       pubkey, name, version, description, description_long, contact, nuts,
+       icon_url, urls, motd, mint_time, tos_url, first_seen, last_seen
+   )
+   VALUES
+   (
+       :pubkey, :name, :version, :description, :description_long, :contact, :nuts,
+       :icon_url, :urls, :motd, :mint_time, :tos_url, :now, :now
+   )
+   ON CONFLICT(pubkey) DO UPDATE SET
+       name = excluded.name,
+       version = excluded.version,
+       description = excluded.description,
+       description_long = excluded.description_long,
+       contact = excluded.contact,
+       nuts = excluded.nuts,
+       icon_url = excluded.icon_url,
+       urls = excluded.urls,
+       motd = excluded.motd,
+       mint_time = excluded.mint_time,
+       tos_url = excluded.tos_url,
+       last_seen = excluded.last_seen
+   ;
+        "#,
+    )?
+    .bind("pubkey", pubkey.to_string())
+    .bind("name", info.name.clone())
+    .bind(
+        "version",
+        info.version
+            .as_ref()
+            .and_then(|v| serde_json::to_string(v).ok()),
+    )
+    .bind("description", info.description.clone())
+    .bind("description_long", info.description_long.clone())
+    .bind(
+        "contact",
+        info.contact
+            .as_ref()
+            .and_then(|c| serde_json::to_string(c).ok()),
+    )
+    .bind("nuts", serde_json::to_string(&info.nuts).ok())
+    .bind("icon_url", info.icon_url.clone())
+    .bind(
+        "urls",
+        info.urls
+            .as_ref()
+            .and_then(|u| serde_json::to_string(u).ok()),
+    )
+    .bind("motd", info.motd.clone())
+    .bind("mint_time", info.time.map(|v| v as i64))
+    .bind("tos_url", info.tos_url.clone())
+    .bind("now", now as i64)
+    .execute(tx)
+    .await?;
+
+    Ok(())
+}
+
+/// Record a URL/pubkey association the wallet saw but would not apply.
+async fn record_claim<T>(
+    tx: &T,
+    mint_url: &MintUrl,
+    pubkey: &str,
+    kind: MintIdentityClaimKind,
+    now: u64,
+) -> Result<(), Error>
+where
+    T: DatabaseExecutor,
+{
+    let kind = match kind {
+        MintIdentityClaimKind::Merge => "merge",
+        MintIdentityClaimKind::Rotation => "rotation",
+    };
+
+    query(
+        r#"
+        INSERT INTO mint_identity_claim (mint_url, pubkey, kind, status, first_seen, last_seen)
+        VALUES (:mint_url, :pubkey, :kind, 'pending', :now, :now)
+        ON CONFLICT(mint_url, pubkey) DO UPDATE SET last_seen = excluded.last_seen
+        "#,
+    )?
+    .bind("mint_url", mint_url.to_string())
+    .bind("pubkey", pubkey.to_string())
+    .bind("kind", kind.to_string())
+    .bind("now", now as i64)
+    .execute(tx)
+    .await?;
+
+    Ok(())
+}
+
+/// Link a URL to an identity and move its rows across.
+async fn link_locator<T>(
+    tx: &T,
+    mint_url: &MintUrl,
+    pubkey: &str,
+    source: &str,
+    now: u64,
+) -> Result<(), Error>
+where
+    T: DatabaseExecutor,
+{
+    query(
+        r#"
+        INSERT INTO mint_locator (mint_url, pubkey, source, added_time, last_verified_time)
+        VALUES (:mint_url, :pubkey, :source, :now, :now)
+        ON CONFLICT(mint_url) DO UPDATE SET
+            pubkey = excluded.pubkey,
+            last_verified_time = excluded.last_verified_time
+        "#,
+    )?
+    .bind("mint_url", mint_url.to_string())
+    .bind("pubkey", pubkey.to_string())
+    .bind("source", source.to_string())
+    .bind("now", now as i64)
+    .execute(tx)
+    .await?;
+
+    stamp_rows(tx, mint_url, pubkey).await?;
+
+    // The URL-keyed row is what the mint is moving off, and a mint must appear
+    // in exactly one of the two tables or `get_mints` counts it twice.
+    query(r#"DELETE FROM mint WHERE mint_url = :mint_url"#)?
+        .bind("mint_url", mint_url.to_string())
+        .execute(tx)
+        .await?;
+
+    Ok(())
+}
+
+/// Move a mint onto the pubkey-keyed tables, applying the trust policy.
+///
+/// The pubkey is an unauthenticated self-assertion, so a claim that would pool
+/// two URLs' funds under one identity is recorded rather than applied unless the
+/// identity already advertises the newcomer among its own URLs.
+async fn promote_mint_identity<T>(
+    tx: &T,
+    mint_url: &MintUrl,
+    pubkey: &PublicKey,
+    info: &MintInfo,
+) -> Result<Promotion, Error>
+where
+    T: DatabaseExecutor,
+{
+    let hex = hex_pubkey(pubkey);
+    let now = unix_time();
+    let current = promoted_pubkey(tx, mint_url).await?;
+
+    match current {
+        // Already this identity: refresh what the mint just told us.
+        Some(ref held) if *held == hex => {
+            upsert_identity(tx, &hex, info, now).await?;
+            link_locator(tx, mint_url, &hex, "contacted", now).await?;
+            Ok(Promotion::Applied)
+        }
+        // This URL now claims a different key than the one it is linked to.
+        Some(held) => {
+            let others = locator_count(tx, &held).await?;
+            if others > 1 {
+                // Retagging would split an identity several URLs share, and
+                // there is no way to tell which of them the new key belongs to.
+                record_claim(tx, mint_url, &hex, MintIdentityClaimKind::Rotation, now).await?;
+                return Ok(Promotion::Deferred(MintIdentityClaimKind::Rotation));
+            }
+
+            // Sole locator, so nothing is shared and no rows change hands.
+            upsert_identity(tx, &hex, info, now).await?;
+            link_locator(tx, mint_url, &hex, "contacted", now).await?;
+            query(r#"DELETE FROM mint_identity WHERE pubkey = :pubkey"#)?
+                .bind("pubkey", held)
+                .execute(tx)
+                .await?;
+            Ok(Promotion::Applied)
+        }
+        None => {
+            let incumbent_urls = identity_urls(tx, &hex).await?;
+
+            match incumbent_urls {
+                // First to claim this key.
+                None => {
+                    upsert_identity(tx, &hex, info, now).await?;
+                    link_locator(tx, mint_url, &hex, "contacted", now).await?;
+                    Ok(Promotion::Applied)
+                }
+                // The identity already names this URL as one of its own, which
+                // is the only claim that comes from the incumbent rather than
+                // from the newcomer.
+                Some(urls) if urls.iter().any(|u| u == &mint_url.to_string()) => {
+                    upsert_identity(tx, &hex, info, now).await?;
+                    link_locator(tx, mint_url, &hex, "corroborated", now).await?;
+                    Ok(Promotion::Applied)
+                }
+                // A new URL claiming a key someone else holds. Applying it would
+                // let this mint's proofs count as the incumbent's.
+                Some(_) => {
+                    record_claim(tx, mint_url, &hex, MintIdentityClaimKind::Merge, now).await?;
+                    Ok(Promotion::Deferred(MintIdentityClaimKind::Merge))
+                }
+            }
+        }
+    }
+}
+
+/// How many URLs resolve to an identity.
+async fn locator_count<T>(tx: &T, pubkey: &str) -> Result<i64, Error>
+where
+    T: DatabaseExecutor,
+{
+    Ok(
+        query(r#"SELECT COUNT(*) FROM mint_locator WHERE pubkey = :pubkey"#)?
+            .bind("pubkey", pubkey.to_string())
+            .pluck(tx)
+            .await?
+            .map(|n| Ok::<_, Error>(column_as_number!(n)))
+            .transpose()?
+            .unwrap_or(0),
+    )
+}
+
+/// The URLs an identity advertises for itself, if it exists.
+///
+/// `None` distinguishes "no such identity" from "an identity that advertises
+/// nothing", which is what decides whether a claim is a merge.
+async fn identity_urls<T>(tx: &T, pubkey: &str) -> Result<Option<Vec<String>>, Error>
+where
+    T: DatabaseExecutor,
+{
+    let Some(row) = query(r#"SELECT urls FROM mint_identity WHERE pubkey = :pubkey"#)?
+        .bind("pubkey", pubkey.to_string())
+        .fetch_one(tx)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    let urls = row
+        .into_iter()
+        .next()
+        .and_then(|urls| match urls {
+            Column::Text(text) => serde_json::from_str::<Vec<String>>(&text).ok(),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    Ok(Some(urls))
 }
 
 /// Wallet SQLite Database
@@ -232,25 +581,22 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        Ok(
-            query(r#"SELECT pubkey FROM mint WHERE mint_url = :mint_url"#)?
-                .bind("mint_url", mint_url.to_string())
-                .fetch_one(&*conn)
-                .await?
-                .map(|mut row| {
-                    let pubkey = column_as_nullable_binary!(row
-                        .pop()
-                        .ok_or(ConversionError::MissingColumn(0, 1))?);
+        // A mint that has been promoted is identified by the pubkey it was
+        // promoted to. One that has not, whether because it publishes none or
+        // because the wallet has not spoken to it since, keeps its URL.
+        if let Some(pubkey) = promoted_pubkey(&*conn, mint_url).await? {
+            return Ok(Some(MintId::Pubkey(
+                PublicKey::from_hex(&pubkey).map_err(|e| Error::Internal(e.to_string()))?,
+            )));
+        }
 
-                    Ok::<_, Error>(
-                        pubkey
-                            .and_then(|bytes| PublicKey::from_slice(&bytes).ok())
-                            .map(MintId::Pubkey)
-                            .unwrap_or_else(|| MintId::Url(mint_url.clone())),
-                    )
-                })
-                .transpose()?,
-        )
+        let known = query(r#"SELECT 1 FROM mint WHERE mint_url = :mint_url"#)?
+            .bind("mint_url", mint_url.to_string())
+            .pluck(&*conn)
+            .await?
+            .is_some();
+
+        Ok(known.then(|| MintId::Url(mint_url.clone())))
     }
 
     #[instrument(skip(self))]
@@ -275,6 +621,36 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
+
+        let mint = &canonical_mint(&*conn, mint).await?;
+
+        if let MintId::Pubkey(pubkey) = mint {
+            return query(
+                r#"
+                SELECT
+                    name,
+                    pubkey,
+                    version,
+                    description,
+                    description_long,
+                    contact,
+                    nuts,
+                    icon_url,
+                    motd,
+                    urls,
+                    mint_time,
+                    tos_url
+                FROM
+                    mint_identity
+                WHERE pubkey = :pubkey
+                "#,
+            )?
+            .bind("pubkey", hex_pubkey(pubkey))
+            .fetch_one(&*conn)
+            .await?
+            .map(sql_row_to_mint_info)
+            .transpose();
+        }
 
         let mint_urls = mint_urls_for(&*conn, mint).await?;
         let Some(mint_url) = mint_urls.first() else {
@@ -315,7 +691,7 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-        Ok(query(
+        let mut mints = query(
             r#"
                 SELECT
                     name,
@@ -344,18 +720,45 @@ where
                 MintUrl::from_str
             );
 
-            let info = sql_row_to_mint_info(row).ok();
-            // A mint that published a pubkey is keyed by it, so two URLs of the
-            // same mint collapse to one entry.
-            let id = info
-                .as_ref()
-                .and_then(|info| info.pubkey)
-                .map(MintId::Pubkey)
-                .unwrap_or(MintId::Url(url));
-
-            Ok((id, info))
+            Ok((MintId::Url(url), sql_row_to_mint_info(row).ok()))
         })
-        .collect::<Result<HashMap<_, _>, Error>>()?)
+        .collect::<Result<HashMap<_, _>, Error>>()?;
+
+        // Promoted mints are keyed by pubkey, so a mint reachable at several
+        // URLs appears once rather than once per URL.
+        for mut row in query(
+            r#"
+                SELECT
+                    name,
+                    pubkey,
+                    version,
+                    description,
+                    description_long,
+                    contact,
+                    nuts,
+                    icon_url,
+                    motd,
+                    urls,
+                    mint_time,
+                    tos_url,
+                    pubkey
+                FROM
+                    mint_identity
+                "#,
+        )?
+        .fetch_all(&*conn)
+        .await?
+        {
+            let pubkey = column_as_string!(
+                row.pop().ok_or(ConversionError::MissingColumn(0, 1))?,
+                PublicKey::from_hex,
+                PublicKey::from_slice
+            );
+
+            mints.insert(MintId::Pubkey(pubkey), sql_row_to_mint_info(row).ok());
+        }
+
+        Ok(mints)
     }
 
     #[instrument(skip(self))]
@@ -369,13 +772,11 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        let mint_urls = mint_urls_for(&*conn, mint).await?;
-        if mint_urls.is_empty() {
-            return Ok(None);
-        }
+        let mint = &canonical_mint(&*conn, mint).await?;
 
-        let keysets = query(
-            r#"
+        let keysets = bind_mint_rows(
+            query(&format!(
+                r#"
             SELECT
                 id,
                 unit,
@@ -384,10 +785,12 @@ where
                 final_expiry
             FROM
                 keyset
-            WHERE mint_url IN (:mint_urls)
+            WHERE {}
             "#,
-        )?
-        .bind_vec("mint_urls", mint_urls)?
+                mint_rows_clause(mint)
+            ))?,
+            mint,
+        )
         .fetch_all(&*conn)
         .await?
         .into_iter()
@@ -623,13 +1026,13 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        let mint_urls = match mint {
-            Some(mint) => Some(mint_urls_for(&*conn, mint).await?),
+        let mint = match mint {
+            Some(mint) => Some(canonical_mint(&*conn, mint).await?),
             None => None,
         };
+        let mint = mint.as_ref();
 
-        Ok(query(
-            r#"
+        let mut sql = r#"
             SELECT
                 amount,
                 unit,
@@ -648,29 +1051,30 @@ where
                 created_by_operation,
                 p2pk_e
             FROM proof
-            "#,
-        )?
-        .fetch_all(&*conn)
-        .await?
-        .into_iter()
-        .filter_map(|row| {
-            let row = sql_row_to_proof_info(row).ok()?;
+            "#
+        .to_string();
 
-            // Mint filtering is by URL set rather than by the single URL
-            // `matches_conditions` understands, so it is applied separately.
-            if let Some(mint_urls) = &mint_urls {
-                if !mint_urls.contains(&row.mint_url.to_string()) {
-                    return None;
-                }
-            }
+        if let Some(mint) = mint {
+            sql.push_str(" WHERE ");
+            sql.push_str(mint_rows_clause(mint));
+        }
 
-            if row.matches_conditions(&None, &unit, &state, &spending_conditions) {
-                Some(row)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>())
+        let mut stmt = query(&sql)?;
+        if let Some(mint) = mint {
+            stmt = bind_mint_rows(stmt, mint);
+        }
+
+        Ok(stmt
+            .fetch_all(&*conn)
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                let row = sql_row_to_proof_info(row).ok()?;
+                // The mint is already filtered in SQL, so it is not passed here.
+                row.matches_conditions(&None, &unit, &state, &spending_conditions)
+                    .then_some(row)
+            })
+            .collect::<Vec<_>>())
     }
 
     #[instrument(skip(self, ys))]
@@ -726,16 +1130,11 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        let mint_urls = match mint {
-            Some(mint) => Some(mint_urls_for(&*conn, mint).await?),
+        let mint = match mint {
+            Some(mint) => Some(canonical_mint(&*conn, mint).await?),
             None => None,
         };
-
-        // A pubkey-identified mint with no URLs holds nothing, and an empty IN
-        // clause is rejected rather than matching nothing.
-        if mint_urls.as_ref().is_some_and(|urls| urls.is_empty()) {
-            return Ok(0);
-        }
+        let mint = mint.as_ref();
 
         let mut query_str = "SELECT COALESCE(SUM(amount), 0) as total FROM proof".to_string();
         let mut where_clauses = Vec::new();
@@ -745,8 +1144,8 @@ where
             .map(|x| x.to_string())
             .collect::<Vec<_>>();
 
-        if mint_urls.is_some() {
-            where_clauses.push("mint_url IN (:mint_urls)");
+        if let Some(mint) = mint {
+            where_clauses.push(mint_rows_clause(mint));
         }
         if unit.is_some() {
             where_clauses.push("unit = :unit");
@@ -762,8 +1161,8 @@ where
 
         let mut q = query(&query_str)?;
 
-        if let Some(mint_urls) = mint_urls {
-            q = q.bind_vec("mint_urls", mint_urls)?;
+        if let Some(mint) = mint {
+            q = bind_mint_rows(q, mint);
         }
         if let Some(ref unit) = unit {
             q = q.bind("unit", unit.to_string());
@@ -846,13 +1245,13 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        let mint_urls = match mint {
-            Some(mint) => Some(mint_urls_for(&*conn, mint).await?),
+        let mint = match mint {
+            Some(mint) => Some(canonical_mint(&*conn, mint).await?),
             None => None,
         };
+        let mint = mint.as_ref();
 
-        Ok(query(
-            r#"
+        let mut sql = r#"
             SELECT
                 mint_url,
                 direction,
@@ -870,30 +1269,32 @@ where
                 saga_id
             FROM
                 transactions
-            "#,
-        )?
-        .fetch_all(&*conn)
-        .await?
-        .into_iter()
-        .filter_map(|row| {
-            // TODO: Avoid a table scan by passing the heavy lifting of checking to the DB engine
-            let transaction = sql_row_to_transaction(row).ok()?;
+            "#
+        .to_string();
 
-            // Mint filtering is by URL set rather than by the single URL
-            // `matches_conditions` understands, so it is applied separately.
-            if let Some(mint_urls) = &mint_urls {
-                if !mint_urls.contains(&transaction.mint_url.to_string()) {
-                    return None;
-                }
-            }
+        if let Some(mint) = mint {
+            sql.push_str(" WHERE ");
+            sql.push_str(mint_rows_clause(mint));
+        }
 
-            if transaction.matches_conditions(&None, &direction, &unit) {
-                Some(transaction)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>())
+        let mut stmt = query(&sql)?;
+        if let Some(mint) = mint {
+            stmt = bind_mint_rows(stmt, mint);
+        }
+
+        Ok(stmt
+            .fetch_all(&*conn)
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                // TODO: Avoid a table scan by passing the heavy lifting of checking to the DB engine
+                let transaction = sql_row_to_transaction(row).ok()?;
+                // The mint is already filtered in SQL, so it is not passed here.
+                transaction
+                    .matches_conditions(&None, &direction, &unit)
+                    .then_some(transaction)
+            })
+            .collect::<Vec<_>>())
     }
 
     async fn update_proofs(
@@ -912,11 +1313,12 @@ where
             query(
                 r#"
     INSERT INTO proof
-    (y, mint_url, state, spending_condition, unit, amount, keyset_id, secret, c, witness, dleq_e, dleq_s, dleq_r, used_by_operation, created_by_operation, p2pk_e)
+    (y, mint_url, mint_pubkey, state, spending_condition, unit, amount, keyset_id, secret, c, witness, dleq_e, dleq_s, dleq_r, used_by_operation, created_by_operation, p2pk_e)
     VALUES
-    (:y, :mint_url, :state, :spending_condition, :unit, :amount, :keyset_id, :secret, :c, :witness, :dleq_e, :dleq_s, :dleq_r, :used_by_operation, :created_by_operation, :p2pk_e)
+    (:y, :mint_url, :mint_pubkey, :state, :spending_condition, :unit, :amount, :keyset_id, :secret, :c, :witness, :dleq_e, :dleq_s, :dleq_r, :used_by_operation, :created_by_operation, :p2pk_e)
     ON CONFLICT(y) DO UPDATE SET
         mint_url = excluded.mint_url,
+        mint_pubkey = excluded.mint_pubkey,
         state = excluded.state,
         spending_condition = excluded.spending_condition,
         unit = excluded.unit,
@@ -936,6 +1338,7 @@ where
             )?
             .bind("y", proof.y.to_bytes().to_vec())
             .bind("mint_url", proof.mint_url.to_string())
+            .bind("mint_pubkey", promoted_pubkey(&tx, &proof.mint_url).await?)
             .bind("state", proof.state.to_string())
             .bind(
                 "spending_condition",
@@ -1025,6 +1428,7 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
+        let mint_pubkey = promoted_pubkey(&*conn, &transaction.mint_url).await?;
         let mint_url = transaction.mint_url.to_string();
         let direction = transaction.direction.to_string();
         let unit = transaction.unit.to_string();
@@ -1041,11 +1445,12 @@ where
         query(
                r#"
    INSERT INTO transactions
-   (id, mint_url, direction, unit, amount, fee, ys, timestamp, memo, metadata, quote_id, payment_request, payment_proof, payment_method, saga_id)
+   (id, mint_url, mint_pubkey, direction, unit, amount, fee, ys, timestamp, memo, metadata, quote_id, payment_request, payment_proof, payment_method, saga_id)
    VALUES
-   (:id, :mint_url, :direction, :unit, :amount, :fee, :ys, :timestamp, :memo, :metadata, :quote_id, :payment_request, :payment_proof, :payment_method, :saga_id)
+   (:id, :mint_url, :mint_pubkey, :direction, :unit, :amount, :fee, :ys, :timestamp, :memo, :metadata, :quote_id, :payment_request, :payment_proof, :payment_method, :saga_id)
    ON CONFLICT(id) DO UPDATE SET
        mint_url = excluded.mint_url,
+       mint_pubkey = excluded.mint_pubkey,
        direction = excluded.direction,
        unit = excluded.unit,
        amount = excluded.amount,
@@ -1063,6 +1468,7 @@ where
            )?
            .bind("id", id.as_slice().to_vec())
            .bind("mint_url", mint_url)
+           .bind("mint_pubkey", mint_pubkey)
            .bind("direction", direction)
            .bind("unit", unit)
            .bind("amount", amount)
@@ -1099,12 +1505,17 @@ where
         let tx = ConnectionWithTransaction::new(conn).await?;
 
         // The mint row must move too, otherwise the mint keeps answering under
-        // its old URL and every dependent row is orphaned.
-        query(r#"UPDATE mint SET mint_url = :new_mint_url WHERE mint_url = :old_mint_url"#)?
+        // its old URL and every dependent row is orphaned. A promoted mint has
+        // no such row; it is its locator that moves.
+        for table in ["mint", "mint_locator", "mint_identity_claim"] {
+            query(&format!(
+                "UPDATE {table} SET mint_url = :new_mint_url WHERE mint_url = :old_mint_url"
+            ))?
             .bind("new_mint_url", new_mint_url.to_string())
             .bind("old_mint_url", old_mint_url.to_string())
             .execute(&tx)
             .await?;
+        }
 
         for table in MINT_URL_TABLES {
             query(&format!(
@@ -1168,6 +1579,36 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
+        let tx = ConnectionWithTransaction::new(conn).await?;
+
+        // A mint that tells us a pubkey moves onto the pubkey-keyed tables, and
+        // stays there. Everything else keeps its URL-keyed row.
+        if let Some(info) = mint_info.as_ref() {
+            if let Some(pubkey) = info.pubkey {
+                if promote_mint_identity(&tx, &mint_url, &pubkey, info).await? == Promotion::Applied
+                {
+                    tx.commit().await?;
+                    return Ok(());
+                }
+
+                tracing::warn!(
+                    "{mint_url} claims pubkey {pubkey}, which is held elsewhere; recorded the \
+                     claim rather than merging the two"
+                );
+            }
+        }
+
+        // Never resurrect a URL-keyed row for a mint that has already moved:
+        // a mint must appear in exactly one of the two tables.
+        if promoted_pubkey(&tx, &mint_url).await?.is_some() {
+            if let Some(info) = mint_info.as_ref() {
+                if let Some(pubkey) = info.pubkey {
+                    upsert_identity(&tx, &hex_pubkey(&pubkey), info, unix_time()).await?;
+                }
+            }
+            tx.commit().await?;
+            return Ok(());
+        }
 
         let (
             name,
@@ -1260,8 +1701,10 @@ where
         .bind("motd", motd)
         .bind("mint_time", time.map(|v| v as i64))
         .bind("tos_url", tos_url)
-        .execute(&*conn)
+        .execute(&tx)
         .await?;
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -1289,9 +1732,27 @@ where
             .await?;
 
         query(r#"DELETE FROM mint WHERE mint_url IN (:mint_urls)"#)?
+            .bind_vec("mint_urls", mint_urls.clone())?
+            .execute(&tx)
+            .await?;
+
+        query(r#"DELETE FROM mint_locator WHERE mint_url IN (:mint_urls)"#)?
+            .bind_vec("mint_urls", mint_urls.clone())?
+            .execute(&tx)
+            .await?;
+
+        query(r#"DELETE FROM mint_identity_claim WHERE mint_url IN (:mint_urls)"#)?
             .bind_vec("mint_urls", mint_urls)?
             .execute(&tx)
             .await?;
+
+        // An identity nothing reaches any more is not a mint the wallet knows.
+        query(
+            r#"DELETE FROM mint_identity
+               WHERE pubkey NOT IN (SELECT pubkey FROM mint_locator)"#,
+        )?
+        .execute(&tx)
+        .await?;
 
         tx.commit().await?;
 
@@ -1310,13 +1771,15 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        // Keysets are stored against a URL, so a pubkey-identified mint records
-        // them under the first URL it resolves to.
+        // Keysets carry the identity, but also a URL, since a mint that has not
+        // been promoted has nothing else to be found by. A pubkey-identified
+        // mint records them under the first URL it answers on.
         let mint_url = mint_urls_for(&*conn, mint)
             .await?
             .into_iter()
             .next()
             .ok_or_else(|| Error::Internal(format!("unknown mint {mint}")))?;
+        let mint_pubkey = mint.pubkey().map(hex_pubkey);
 
         let tx = ConnectionWithTransaction::new(conn).await?;
 
@@ -1324,15 +1787,18 @@ where
             query(
                 r#"
         INSERT INTO keyset
-        (mint_url, id, unit, active, input_fee_ppk, final_expiry, keyset_u32)
+        (mint_url, mint_pubkey, id, unit, active, input_fee_ppk, final_expiry, keyset_u32)
         VALUES
-        (:mint_url, :id, :unit, :active, :input_fee_ppk, :final_expiry, :keyset_u32)
+        (:mint_url, :mint_pubkey, :id, :unit, :active, :input_fee_ppk, :final_expiry, :keyset_u32)
         ON CONFLICT(id) DO UPDATE SET
+            mint_url = excluded.mint_url,
+            mint_pubkey = excluded.mint_pubkey,
             active = excluded.active,
             input_fee_ppk = excluded.input_fee_ppk
         "#,
             )?
             .bind("mint_url", mint_url.clone())
+            .bind("mint_pubkey", mint_pubkey.clone())
             .bind("id", keyset.id.to_string())
             .bind("unit", keyset.unit.to_string())
             .bind("active", keyset.active)
@@ -1362,11 +1828,12 @@ where
         let rows_affected = query(
                 r#"
     INSERT INTO mint_quote
-    (id, mint_url, amount, unit, request, state, expiry, secret_key, payment_method, amount_issued, amount_paid, updated_at, estimated_blocks, version, used_by_operation)
+    (id, mint_url, mint_pubkey, amount, unit, request, state, expiry, secret_key, payment_method, amount_issued, amount_paid, updated_at, estimated_blocks, version, used_by_operation)
     VALUES
-    (:id, :mint_url, :amount, :unit, :request, :state, :expiry, :secret_key, :payment_method, :amount_issued, :amount_paid, :updated_at, :estimated_blocks, :version, :used_by_operation)
+    (:id, :mint_url, :mint_pubkey, :amount, :unit, :request, :state, :expiry, :secret_key, :payment_method, :amount_issued, :amount_paid, :updated_at, :estimated_blocks, :version, :used_by_operation)
     ON CONFLICT(id) DO UPDATE SET
         mint_url = excluded.mint_url,
+        mint_pubkey = excluded.mint_pubkey,
         amount = excluded.amount,
         unit = excluded.unit,
         request = excluded.request,
@@ -1386,6 +1853,7 @@ where
             )?
             .bind("id", quote.id.to_string())
             .bind("mint_url", quote.mint_url.to_string())
+            .bind("mint_pubkey", promoted_pubkey(&*conn, &quote.mint_url).await?)
             .bind("amount", quote.amount.map(|a| a.to_i64()))
             .bind("unit", quote.unit.to_string())
             .bind("request", quote.request)
@@ -1437,12 +1905,17 @@ where
         let expected_version = quote.version;
         let new_version = expected_version.wrapping_add(1);
 
+        let mint_pubkey = match quote.mint_url.as_ref() {
+            Some(mint_url) => promoted_pubkey(&*conn, mint_url).await?,
+            None => None,
+        };
+
         let rows_affected = query(
             r#"
  INSERT INTO melt_quote
- (id, unit, amount, request, fee_reserve, state, expiry, payment_proof, payment_method, estimated_blocks, fee_index, version, mint_url, used_by_operation)
+ (id, unit, amount, request, fee_reserve, state, expiry, payment_proof, payment_method, estimated_blocks, fee_index, version, mint_url, mint_pubkey, used_by_operation)
  VALUES
- (:id, :unit, :amount, :request, :fee_reserve, :state, :expiry, :payment_proof, :payment_method, :estimated_blocks, :fee_index, :version, :mint_url, :used_by_operation)
+ (:id, :unit, :amount, :request, :fee_reserve, :state, :expiry, :payment_proof, :payment_method, :estimated_blocks, :fee_index, :version, :mint_url, :mint_pubkey, :used_by_operation)
  ON CONFLICT(id) DO UPDATE SET
      unit = excluded.unit,
      amount = excluded.amount,
@@ -1456,6 +1929,7 @@ where
      fee_index = excluded.fee_index,
      version = :new_version,
      mint_url = excluded.mint_url,
+     mint_pubkey = excluded.mint_pubkey,
      used_by_operation = excluded.used_by_operation
  WHERE melt_quote.version = :expected_version
  ;
@@ -1475,6 +1949,7 @@ where
         .bind("version", quote.version as i64)
         .bind("new_version", new_version as i64)
         .bind("expected_version", expected_version as i64)
+        .bind("mint_pubkey", mint_pubkey)
         .bind("mint_url", quote.mint_url.map(|m| m.to_string()))
         .bind("used_by_operation", quote.used_by_operation)
         .execute(&*conn)
@@ -1593,9 +2068,9 @@ where
         query(
             r#"
             INSERT INTO wallet_sagas
-            (id, kind, state, amount, mint_url, unit, quote_id, created_at, updated_at, data, version)
+            (id, kind, state, amount, mint_url, mint_pubkey, unit, quote_id, created_at, updated_at, data, version)
             VALUES
-            (:id, :kind, :state, :amount, :mint_url, :unit, :quote_id, :created_at, :updated_at, :data, :version)
+            (:id, :kind, :state, :amount, :mint_url, :mint_pubkey, :unit, :quote_id, :created_at, :updated_at, :data, :version)
             "#,
         )?
         .bind("id", saga.id.to_string())
@@ -1603,6 +2078,7 @@ where
         .bind("state", state_json)
         .bind("amount", u64::from(saga.amount) as i64)
         .bind("mint_url", saga.mint_url.to_string())
+        .bind("mint_pubkey", promoted_pubkey(&*conn, &saga.mint_url).await?)
         .bind("unit", saga.unit.to_string())
         .bind("quote_id", saga.quote_id)
         .bind("created_at", saga.created_at as i64)
@@ -2103,6 +2579,138 @@ where
     }
 
     #[instrument(skip(self))]
+    #[instrument(skip(self))]
+    async fn list_mint_identities(&self) -> Result<Vec<MintIdentity>, database::Error> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+
+        let mut identities = Vec::new();
+
+        for mut row in query(
+            r#"
+            SELECT
+                name, version, description, description_long, contact, nuts,
+                icon_url, motd, urls, mint_time, tos_url,
+                pubkey, first_seen, last_seen
+            FROM mint_identity
+            "#,
+        )?
+        .fetch_all(&*conn)
+        .await?
+        {
+            let last_seen =
+                column_as_number!(row.pop().ok_or(ConversionError::MissingColumn(0, 1))?);
+            let first_seen =
+                column_as_number!(row.pop().ok_or(ConversionError::MissingColumn(0, 1))?);
+            let pubkey = column_as_string!(
+                row.pop().ok_or(ConversionError::MissingColumn(0, 1))?,
+                PublicKey::from_hex,
+                PublicKey::from_slice
+            );
+
+            // `sql_row_to_mint_info` expects a `pubkey` column between `name`
+            // and `version`; the identity table keys on it instead.
+            row.insert(1, Column::Text(pubkey.to_hex()));
+
+            identities.push(MintIdentity {
+                pubkey,
+                urls: mint_urls_for(&*conn, &MintId::Pubkey(pubkey))
+                    .await?
+                    .into_iter()
+                    .filter_map(|url| MintUrl::from_str(&url).ok())
+                    .collect(),
+                info: sql_row_to_mint_info(row)?,
+                first_seen,
+                last_seen,
+            });
+        }
+
+        Ok(identities)
+    }
+
+    #[instrument(skip(self))]
+    async fn list_mint_identity_claims(&self) -> Result<Vec<MintIdentityClaim>, database::Error> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+
+        Ok(query(
+            r#"
+            SELECT mint_url, pubkey, kind, first_seen, last_seen
+            FROM mint_identity_claim
+            WHERE status = 'pending'
+            "#,
+        )?
+        .fetch_all(&*conn)
+        .await?
+        .into_iter()
+        .map(|row| {
+            unpack_into!(let (mint_url, pubkey, kind, first_seen, last_seen) = row);
+
+            Ok(MintIdentityClaim {
+                mint_url: column_as_string!(mint_url, MintUrl::from_str),
+                pubkey: column_as_string!(pubkey, PublicKey::from_hex, PublicKey::from_slice),
+                kind: match column_as_string!(kind).as_str() {
+                    "rotation" => MintIdentityClaimKind::Rotation,
+                    _ => MintIdentityClaimKind::Merge,
+                },
+                first_seen: column_as_number!(first_seen),
+                last_seen: column_as_number!(last_seen),
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?)
+    }
+
+    #[instrument(skip(self))]
+    async fn resolve_mint_identity_claim(
+        &self,
+        mint_url: MintUrl,
+        pubkey: PublicKey,
+        accept: bool,
+    ) -> Result<(), database::Error> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        let tx = ConnectionWithTransaction::new(conn).await?;
+        let hex = hex_pubkey(&pubkey);
+
+        if accept {
+            // The user has decided these are the same mint, which is the only
+            // thing that can make it so: nothing signs the pubkey.
+            link_locator(&tx, &mint_url, &hex, "accepted", unix_time()).await?;
+            query(
+                r#"DELETE FROM mint_identity_claim
+                   WHERE mint_url = :mint_url AND pubkey = :pubkey"#,
+            )?
+            .bind("mint_url", mint_url.to_string())
+            .bind("pubkey", hex)
+            .execute(&tx)
+            .await?;
+        } else {
+            // Kept as rejected rather than deleted, so the same claim is not
+            // raised again every time the mint is contacted.
+            query(
+                r#"UPDATE mint_identity_claim SET status = 'rejected'
+                   WHERE mint_url = :mint_url AND pubkey = :pubkey"#,
+            )?
+            .bind("mint_url", mint_url.to_string())
+            .bind("pubkey", hex)
+            .execute(&tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
     async fn latest_p2pk(&self) -> Result<Option<wallet::P2PKSigningKey>, Error> {
         let conn = self
             .pool

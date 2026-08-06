@@ -11,7 +11,7 @@ pub type WalletSqliteDatabase = SQLWalletDatabase<SqliteConnectionManager>;
 
 #[cfg(test)]
 mod tests {
-    use cdk_common::wallet_db_test;
+    use cdk_common::{wallet_db_test, wallet_identity_db_test};
 
     use super::memory;
 
@@ -20,6 +20,7 @@ mod tests {
     }
 
     wallet_db_test!(provide_db);
+    wallet_identity_db_test!(provide_db);
     use std::str::FromStr;
 
     use cdk_common::database::WalletDatabase;

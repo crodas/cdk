@@ -17,8 +17,9 @@ use super::*;
 use crate::mint_url::MintUrl;
 use crate::nuts::{Id, KeySetInfo, Keys, MintInfo, Proof, State};
 use crate::wallet::{
-    MeltQuote, MintId, MintQuote, OperationData, ProofInfo, SwapOperationData, SwapSagaState,
-    Transaction, TransactionDirection, WalletSaga, WalletSagaState,
+    MeltQuote, MintId, MintIdentityClaimKind, MintQuote, OperationData, ProofInfo,
+    SwapOperationData, SwapSagaState, Transaction, TransactionDirection, WalletSaga,
+    WalletSagaState,
 };
 
 /// Generate a unique test ID
@@ -1830,6 +1831,405 @@ where
         .unwrap();
     assert_eq!(unspent.len(), 1);
     assert_eq!(unspent[0].y, proof_info_2.y);
+}
+
+// =============================================================================
+// Mint Identity Tests
+//
+// Opt-in: a backend that has no pubkey-keyed store inherits defaults that return
+// nothing, so it would pass these vacuously. The invocation list is therefore the
+// honest record of which backends actually promote mints.
+// =============================================================================
+
+fn info_with_pubkey(pubkey: cashu::PublicKey) -> MintInfo {
+    MintInfo::default().pubkey(pubkey)
+}
+
+/// A mint that publishes a pubkey is identified by it, not by its URL.
+pub async fn mint_identity_created_on_pubkey<DB>(db: DB)
+where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let mint_url = test_mint_url();
+    let pubkey = SecretKey::generate().public_key();
+
+    db.add_mint(mint_url.clone(), Some(info_with_pubkey(pubkey)))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.resolve_mint(&mint_url).await.unwrap(),
+        Some(MintId::Pubkey(pubkey))
+    );
+
+    let identities = db.list_mint_identities().await.unwrap();
+    assert_eq!(identities.len(), 1);
+    assert_eq!(identities[0].pubkey, pubkey);
+    assert_eq!(identities[0].urls, vec![mint_url]);
+    assert!(db.list_mint_identity_claims().await.unwrap().is_empty());
+}
+
+/// Promoting the same mint repeatedly changes nothing after the first time.
+pub async fn mint_identity_promotion_is_idempotent<DB>(db: DB)
+where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let mint_url = test_mint_url();
+    let pubkey = SecretKey::generate().public_key();
+
+    for _ in 0..3 {
+        db.add_mint(mint_url.clone(), Some(info_with_pubkey(pubkey)))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(db.list_mint_identities().await.unwrap().len(), 1);
+    assert_eq!(db.get_mints().await.unwrap().len(), 1);
+    assert!(db.list_mint_identity_claims().await.unwrap().is_empty());
+}
+
+/// A promoted mint appears once, and the bootstrap path does not resurrect it
+/// under its URL.
+pub async fn mint_appears_in_exactly_one_store<DB>(db: DB)
+where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let mint_url = test_mint_url();
+    let pubkey = SecretKey::generate().public_key();
+
+    db.add_mint(mint_url.clone(), Some(info_with_pubkey(pubkey)))
+        .await
+        .unwrap();
+    assert_eq!(db.get_mints().await.unwrap().len(), 1);
+
+    // The metadata-less bootstrap call every wallet makes on startup.
+    db.add_mint(mint_url.clone(), None).await.unwrap();
+
+    let mints = db.get_mints().await.unwrap();
+    assert_eq!(
+        mints.len(),
+        1,
+        "mint counted under both its URL and its key"
+    );
+    assert!(mints.contains_key(&MintId::Pubkey(pubkey)));
+    assert_eq!(
+        db.resolve_mint(&mint_url).await.unwrap(),
+        Some(MintId::Pubkey(pubkey))
+    );
+}
+
+/// A mint that publishes no pubkey keeps working exactly as before.
+pub async fn mint_without_pubkey_stays_url_keyed<DB>(db: DB)
+where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let mint_url = test_mint_url();
+    let keyset_id = test_keyset_id();
+
+    db.add_mint(mint_url.clone(), Some(MintInfo::default()))
+        .await
+        .unwrap();
+    db.add_mint_keysets(
+        &mint_id(&mint_url),
+        vec![test_keyset_info(keyset_id, &mint_url)],
+    )
+    .await
+    .unwrap();
+    db.update_proofs(
+        vec![test_proof_info(keyset_id, 32, mint_url.clone())],
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    assert!(db.list_mint_identities().await.unwrap().is_empty());
+    assert_eq!(
+        db.resolve_mint(&mint_url).await.unwrap(),
+        Some(MintId::Url(mint_url.clone()))
+    );
+    assert_eq!(
+        db.get_balance(Some(&mint_id(&mint_url)), None, None)
+            .await
+            .unwrap(),
+        32
+    );
+}
+
+/// Rows written after a mint is promoted still belong to it.
+///
+/// If a write forgot to stamp the identity, the funds would be invisible to
+/// every lookup that goes through the pubkey.
+pub async fn rows_written_after_promotion_carry_identity<DB>(db: DB)
+where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let mint_url = test_mint_url();
+    let pubkey = SecretKey::generate().public_key();
+    let keyset_id = test_keyset_id();
+
+    db.add_mint(mint_url.clone(), Some(info_with_pubkey(pubkey)))
+        .await
+        .unwrap();
+
+    let mint = MintId::Pubkey(pubkey);
+    db.add_mint_keysets(&mint, vec![test_keyset_info(keyset_id, &mint_url)])
+        .await
+        .unwrap();
+    db.update_proofs(
+        vec![test_proof_info(keyset_id, 64, mint_url.clone())],
+        vec![],
+    )
+    .await
+    .unwrap();
+    db.add_transaction(test_transaction(
+        mint_url.clone(),
+        TransactionDirection::Incoming,
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(db.get_balance(Some(&mint), None, None).await.unwrap(), 64);
+    assert_eq!(
+        db.get_proofs(Some(&mint), None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.get_mint_keysets(&mint)
+            .await
+            .unwrap()
+            .unwrap_or_default()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.list_transactions(Some(&mint), None, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// Seed two mints that claim the same pubkey, each holding its own proof.
+async fn seed_conflicting_claim<DB>(
+    db: &DB,
+    pubkey: cashu::PublicKey,
+    incumbent_urls: Option<Vec<String>>,
+) where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let a = test_mint_url();
+    let b = test_mint_url_2();
+
+    let mut info = info_with_pubkey(pubkey);
+    info.urls = incumbent_urls;
+
+    db.add_mint(a.clone(), Some(info)).await.unwrap();
+    db.update_proofs(vec![test_proof_info(test_keyset_id(), 10, a)], vec![])
+        .await
+        .unwrap();
+
+    db.add_mint(b.clone(), Some(info_with_pubkey(pubkey)))
+        .await
+        .unwrap();
+    db.update_proofs(vec![test_proof_info(test_keyset_id_2(), 100, b)], vec![])
+        .await
+        .unwrap();
+}
+
+/// A second URL claiming a key someone else holds is refused.
+///
+/// The pubkey is unauthenticated, so honouring the claim would let this mint's
+/// proofs be counted as the incumbent's.
+pub async fn mint_identity_merge_requires_corroboration<DB>(db: DB)
+where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let pubkey = SecretKey::generate().public_key();
+    seed_conflicting_claim(&db, pubkey, None).await;
+
+    let b = test_mint_url_2();
+    assert_eq!(
+        db.resolve_mint(&b).await.unwrap(),
+        Some(MintId::Url(b.clone())),
+        "uncorroborated claim was applied"
+    );
+
+    let claims = db.list_mint_identity_claims().await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].mint_url, b);
+    assert_eq!(claims[0].pubkey, pubkey);
+    assert_eq!(claims[0].kind, MintIdentityClaimKind::Merge);
+
+    // The security property: the two mints' funds stay apart.
+    let incumbent = MintId::Pubkey(pubkey);
+    assert_eq!(
+        db.get_balance(Some(&incumbent), None, None).await.unwrap(),
+        10,
+        "claimed mint's proofs were pooled into the incumbent"
+    );
+    assert_eq!(
+        db.get_balance(Some(&MintId::Url(b)), None, None)
+            .await
+            .unwrap(),
+        100
+    );
+}
+
+/// A claim the incumbent itself advertises is applied without asking.
+pub async fn mint_identity_corroborated_merge_is_automatic<DB>(db: DB)
+where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let pubkey = SecretKey::generate().public_key();
+    seed_conflicting_claim(&db, pubkey, Some(vec![test_mint_url_2().to_string()])).await;
+
+    let mint = MintId::Pubkey(pubkey);
+    assert_eq!(
+        db.resolve_mint(&test_mint_url_2()).await.unwrap(),
+        Some(mint.clone())
+    );
+    assert!(db.list_mint_identity_claims().await.unwrap().is_empty());
+    assert_eq!(db.get_balance(Some(&mint), None, None).await.unwrap(), 110);
+    assert_eq!(db.mint_urls(&mint).await.unwrap().len(), 2);
+}
+
+/// Accepting a refused claim pools the two mints, rejecting it leaves them apart.
+pub async fn mint_identity_merge_resolution<DB>(db: DB)
+where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let pubkey = SecretKey::generate().public_key();
+    seed_conflicting_claim(&db, pubkey, None).await;
+
+    let b = test_mint_url_2();
+    let mint = MintId::Pubkey(pubkey);
+
+    db.resolve_mint_identity_claim(b.clone(), pubkey, false)
+        .await
+        .unwrap();
+    assert!(
+        db.list_mint_identity_claims().await.unwrap().is_empty(),
+        "rejected claim is still pending"
+    );
+    assert_eq!(db.get_balance(Some(&mint), None, None).await.unwrap(), 10);
+
+    db.resolve_mint_identity_claim(b.clone(), pubkey, true)
+        .await
+        .unwrap();
+    assert_eq!(db.resolve_mint(&b).await.unwrap(), Some(mint.clone()));
+    assert_eq!(
+        db.get_balance(Some(&mint), None, None).await.unwrap(),
+        110,
+        "accepted merge did not pool both mints"
+    );
+    // Symmetric: either URL now reaches the whole identity.
+    assert_eq!(
+        db.get_balance(Some(&MintId::Url(b)), None, None)
+            .await
+            .unwrap(),
+        110
+    );
+}
+
+/// A mint that is the only way to reach an identity may change its key.
+pub async fn mint_identity_rotation_sole_locator<DB>(db: DB)
+where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let mint_url = test_mint_url();
+    let old = SecretKey::generate().public_key();
+    let new = SecretKey::generate().public_key();
+
+    db.add_mint(mint_url.clone(), Some(info_with_pubkey(old)))
+        .await
+        .unwrap();
+    db.update_proofs(
+        vec![test_proof_info(test_keyset_id(), 21, mint_url.clone())],
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    db.add_mint(mint_url.clone(), Some(info_with_pubkey(new)))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.resolve_mint(&mint_url).await.unwrap(),
+        Some(MintId::Pubkey(new))
+    );
+    // No orphan left behind.
+    let identities = db.list_mint_identities().await.unwrap();
+    assert_eq!(identities.len(), 1);
+    assert_eq!(identities[0].pubkey, new);
+    // The rotation relabels; it does not lose the mint's proofs.
+    assert_eq!(
+        db.get_balance(Some(&MintId::Pubkey(new)), None, None)
+            .await
+            .unwrap(),
+        21
+    );
+}
+
+/// Removing the last URL of an identity removes the identity.
+pub async fn remove_mint_drops_orphan_identity<DB>(db: DB)
+where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let mint_url = test_mint_url();
+    let pubkey = SecretKey::generate().public_key();
+
+    db.add_mint(mint_url.clone(), Some(info_with_pubkey(pubkey)))
+        .await
+        .unwrap();
+
+    db.remove_mint(&MintId::Pubkey(pubkey)).await.unwrap();
+
+    assert!(db.list_mint_identities().await.unwrap().is_empty());
+    assert!(db.resolve_mint(&mint_url).await.unwrap().is_none());
+    assert!(db.get_mints().await.unwrap().is_empty());
+}
+
+/// Tests for a backend that identifies mints by pubkey.
+///
+/// Separate from `wallet_db_test!` because the trait's defaults report "no
+/// identities", which would make every assertion here pass without a store.
+#[macro_export]
+macro_rules! wallet_identity_db_test {
+    ($make_db_fn:ident) => {
+        wallet_identity_db_test!(
+            $make_db_fn,
+            mint_identity_created_on_pubkey,
+            mint_identity_promotion_is_idempotent,
+            mint_appears_in_exactly_one_store,
+            mint_without_pubkey_stays_url_keyed,
+            rows_written_after_promotion_carry_identity,
+            mint_identity_merge_requires_corroboration,
+            mint_identity_corroborated_merge_is_automatic,
+            mint_identity_merge_resolution,
+            mint_identity_rotation_sole_locator,
+            remove_mint_drops_orphan_identity
+        );
+    };
+    ($make_db_fn:ident, $($name:ident),+ $(,)?) => {
+        ::paste::paste! {
+            $(
+                #[tokio::test]
+                async fn [<wallet_identity_ $name>]() {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Time went backwards");
+
+                    cdk_common::database::wallet::test::$name($make_db_fn(format!("test_{}_{}", now.as_nanos(), stringify!($name))).await).await;
+                }
+            )+
+        }
+    };
 }
 
 /// Unit test that is expected to be passed for a correct wallet database implementation
