@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use cdk_common::database::{self, WalletDatabase};
 use cdk_common::mint_url::MintUrl;
-use cdk_common::wallet::ProofInfo;
+use cdk_common::wallet::{MintId, ProofInfo};
 use cdk_common::{AuthProof, Id, Keys, MintInfo};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -283,7 +283,7 @@ impl AuthWallet {
         Ok(self
             .localstore
             .get_proofs(
-                Some(self.mint_url.clone()),
+                Some(&MintId::Url(self.mint_url.clone())),
                 Some(CurrencyUnit::Auth),
                 Some(vec![State::Unspent]),
                 None,
@@ -318,7 +318,7 @@ impl AuthWallet {
         let auth_proof = match self
             .localstore
             .get_proofs(
-                Some(self.mint_url.clone()),
+                Some(&MintId::Url(self.mint_url.clone())),
                 Some(CurrencyUnit::Auth),
                 Some(vec![State::Unspent]),
                 None,

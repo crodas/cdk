@@ -721,7 +721,7 @@ impl WalletRepository {
     async fn load_wallets(&self) -> Result<(), Error> {
         let mints = self.localstore.get_mints().await.map_err(Error::Database)?;
 
-        for (mint_url, mint_info) in mints {
+        for (mint, mint_info) in mints {
             let units = mint_info
                 .map(|info| {
                     let supported_units = info.supported_units();
@@ -734,6 +734,19 @@ impl WalletRepository {
                 // Older databases may not have mint metadata. Keep the
                 // established single-sat wallet behavior for those records.
                 .unwrap_or_else(|| vec![CurrencyUnit::Sat]);
+
+            // A wallet speaks HTTP, so it needs a URL to connect through. A
+            // pubkey-identified mint may have several; any of them reaches it.
+            let Some(mint_url) = self
+                .localstore
+                .mint_urls(&mint)
+                .await
+                .map_err(Error::Database)?
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
 
             for unit in units {
                 self.get_or_create_wallet(mint_url.clone(), unit, None)
@@ -1292,7 +1305,7 @@ mod tests {
 
         // Verify mint is still in DB (remove_wallet does not touch DB)
         assert!(localstore
-            .get_mint(mint_url.clone())
+            .get_mint(&cdk_common::wallet::MintId::Url(mint_url.clone()))
             .await
             .unwrap()
             .is_some());

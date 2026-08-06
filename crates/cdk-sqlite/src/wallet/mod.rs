@@ -33,6 +33,7 @@ mod tests {
     #[cfg(feature = "sqlcipher")]
     async fn test_sqlcipher() {
         use cdk_common::mint_url::MintUrl;
+        use cdk_common::nuts::SecretKey;
         use cdk_common::MintInfo;
 
         use super::*;
@@ -43,7 +44,9 @@ mod tests {
             .await
             .unwrap();
 
-        let mint_info = MintInfo::new().description("test");
+        let mint_info = MintInfo::new()
+            .description("test")
+            .pubkey(SecretKey::generate().public_key());
         let mint_url = MintUrl::from_str("https://mint.xyz").unwrap();
 
         db.add_mint(mint_url.clone(), Some(mint_info.clone()))
@@ -112,7 +115,7 @@ mod tests {
         // Retrieve the proof from the database
         let retrieved_proofs = db
             .get_proofs(
-                Some(mint_url),
+                Some(&cdk_common::wallet::MintId::Url(mint_url)),
                 Some(CurrencyUnit::Sat),
                 Some(vec![State::Unspent]),
                 None,

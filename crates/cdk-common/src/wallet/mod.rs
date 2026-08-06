@@ -31,6 +31,72 @@ pub use saga::{
     SwapSagaState, WalletSaga, WalletSagaState,
 };
 
+/// How a mint is identified in the wallet database.
+///
+/// A mint is identified by the NUT-06 pubkey it publishes, which stays the same
+/// across every URL the mint can be reached at. Mints that publish no pubkey are
+/// identified by URL instead, which is what every mint was before pubkeys were
+/// recorded.
+///
+/// Mints are still *added* by URL. Use [`Database::resolve_mint`] to get from the
+/// URL a mint was added under to the identity its rows are stored by.
+///
+/// [`Database::resolve_mint`]: crate::database::WalletDatabase::resolve_mint
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MintId {
+    /// Identified by the pubkey the mint published.
+    Pubkey(PublicKey),
+    /// Not identified by pubkey: the mint published none, or the wallet has not
+    /// contacted it since pubkeys started being recorded.
+    Url(MintUrl),
+}
+
+impl MintId {
+    /// The pubkey this mint is identified by, if it has one.
+    pub fn pubkey(&self) -> Option<&PublicKey> {
+        match self {
+            Self::Pubkey(pubkey) => Some(pubkey),
+            Self::Url(_) => None,
+        }
+    }
+
+    /// The URL this mint is identified by, if it is not identified by pubkey.
+    ///
+    /// This is not "a URL the mint can be reached at": a pubkey-identified mint
+    /// returns `None` here while still having URLs. Use
+    /// [`Database::mint_urls`] for that.
+    ///
+    /// [`Database::mint_urls`]: crate::database::WalletDatabase::mint_urls
+    pub fn url(&self) -> Option<&MintUrl> {
+        match self {
+            Self::Url(mint_url) => Some(mint_url),
+            Self::Pubkey(_) => None,
+        }
+    }
+}
+
+impl From<PublicKey> for MintId {
+    fn from(pubkey: PublicKey) -> Self {
+        Self::Pubkey(pubkey)
+    }
+}
+
+impl From<MintUrl> for MintId {
+    fn from(mint_url: MintUrl) -> Self {
+        Self::Url(mint_url)
+    }
+}
+
+impl fmt::Display for MintId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pubkey(pubkey) => write!(f, "{pubkey}"),
+            Self::Url(mint_url) => write!(f, "{mint_url}"),
+        }
+    }
+}
+
 /// Wallet Key
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct WalletKey {

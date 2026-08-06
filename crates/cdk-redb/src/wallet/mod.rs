@@ -13,13 +13,16 @@ use cdk_common::mint_url::MintUrl;
 use cdk_common::nut00::KnownMethod;
 use cdk_common::util::unix_time;
 use cdk_common::wallet::{
-    self, MintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId,
+    self, MintId, MintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId,
 };
 use cdk_common::{
     database, Amount, CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintInfo, PaymentMethod,
     PublicKey, SpendingConditions, State,
 };
-use redb::{Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable, ReadableTable,
+    TableDefinition,
+};
 use tracing::instrument;
 
 use crate::error::Error;
@@ -68,6 +71,33 @@ pub struct WalletRedbDatabase {
 }
 
 impl WalletRedbDatabase {
+    /// The URLs a mint identity is stored under.
+    ///
+    /// A URL-identified mint is its own single locator, resolved without a read
+    /// so that rows referencing a URL with no mint entry still match, as they did
+    /// when every lookup was by URL.
+    ///
+    /// Callers must resolve before opening a write transaction: this opens its
+    /// own read transaction and would otherwise see pre-write state.
+    fn mint_urls_for(&self, mint: &MintId) -> Result<Vec<String>, Error> {
+        let pubkey = match mint {
+            MintId::Url(mint_url) => return Ok(vec![mint_url.to_string()]),
+            MintId::Pubkey(pubkey) => pubkey,
+        };
+
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(MINTS_TABLE)?;
+
+        Ok(table
+            .iter()?
+            .flatten()
+            .filter_map(|(url, info)| {
+                let info: Option<MintInfo> = serde_json::from_str(info.value()).ok()?;
+                (info?.pubkey.as_ref() == Some(pubkey)).then(|| url.value().to_string())
+            })
+            .collect())
+    }
+
     /// Create new [`WalletRedbDatabase`]
     pub fn new(path: &Path) -> Result<Self, Error> {
         {
@@ -204,14 +234,46 @@ impl WalletRedbDatabase {
 #[async_trait]
 impl WalletDatabase<database::Error> for WalletRedbDatabase {
     #[instrument(skip(self))]
-    async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, database::Error> {
+    async fn resolve_mint(&self, mint_url: &MintUrl) -> Result<Option<MintId>, database::Error> {
         let read_txn = self.db.begin_read().map_err(Into::<Error>::into)?;
         let table = read_txn.open_table(MINTS_TABLE).map_err(Error::from)?;
 
-        if let Some(mint_info) = table
+        let Some(info) = table
             .get(mint_url.to_string().as_str())
             .map_err(Error::from)?
-        {
+        else {
+            return Ok(None);
+        };
+
+        let info: Option<MintInfo> = serde_json::from_str(info.value()).map_err(Error::from)?;
+
+        Ok(Some(
+            info.and_then(|info| info.pubkey)
+                .map(MintId::Pubkey)
+                .unwrap_or_else(|| MintId::Url(mint_url.clone())),
+        ))
+    }
+
+    #[instrument(skip(self))]
+    async fn mint_urls(&self, mint: &MintId) -> Result<Vec<MintUrl>, database::Error> {
+        Ok(self
+            .mint_urls_for(mint)?
+            .into_iter()
+            .filter_map(|url| MintUrl::from_str(&url).ok())
+            .collect())
+    }
+
+    #[instrument(skip(self))]
+    async fn get_mint(&self, mint: &MintId) -> Result<Option<MintInfo>, database::Error> {
+        let mint_urls = self.mint_urls_for(mint)?;
+        let Some(mint_url) = mint_urls.first() else {
+            return Ok(None);
+        };
+
+        let read_txn = self.db.begin_read().map_err(Into::<Error>::into)?;
+        let table = read_txn.open_table(MINTS_TABLE).map_err(Error::from)?;
+
+        if let Some(mint_info) = table.get(mint_url.as_str()).map_err(Error::from)? {
             return Ok(serde_json::from_str(mint_info.value()).map_err(Error::from)?);
         }
 
@@ -219,7 +281,7 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
     }
 
     #[instrument(skip(self))]
-    async fn get_mints(&self) -> Result<HashMap<MintUrl, Option<MintInfo>>, database::Error> {
+    async fn get_mints(&self) -> Result<HashMap<MintId, Option<MintInfo>>, database::Error> {
         let read_txn = self.db.begin_read().map_err(Error::from)?;
         let table = read_txn.open_table(MINTS_TABLE).map_err(Error::from)?;
         let mints = table
@@ -227,9 +289,17 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             .map_err(Error::from)?
             .flatten()
             .filter_map(|(mint, mint_info)| {
-                MintUrl::from_str(mint.value())
-                    .ok()
-                    .map(|url| (url, serde_json::from_str(mint_info.value()).ok()))
+                let url = MintUrl::from_str(mint.value()).ok()?;
+                let info: Option<MintInfo> = serde_json::from_str(mint_info.value()).ok()?;
+                // A mint that published a pubkey is keyed by it, so two URLs of
+                // the same mint collapse to one entry.
+                let id = info
+                    .as_ref()
+                    .and_then(|info| info.pubkey)
+                    .map(MintId::Pubkey)
+                    .unwrap_or(MintId::Url(url));
+
+                Some((id, info))
             })
             .collect();
 
@@ -239,19 +309,21 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
     #[instrument(skip(self))]
     async fn get_mint_keysets(
         &self,
-        mint_url: MintUrl,
+        mint: &MintId,
     ) -> Result<Option<Vec<KeySetInfo>>, database::Error> {
+        let mint_urls = self.mint_urls_for(mint)?;
+
         let read_txn = self.db.begin_read().map_err(Into::<Error>::into)?;
         let table = read_txn
             .open_multimap_table(MINT_KEYSETS_TABLE)
             .map_err(Error::from)?;
 
-        let keyset_ids = table
-            .get(mint_url.to_string().as_str())
-            .map_err(Error::from)?
-            .flatten()
-            .map(|k| Id::from_bytes(k.value()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut keyset_ids = Vec::new();
+        for mint_url in &mint_urls {
+            for k in table.get(mint_url.as_str()).map_err(Error::from)?.flatten() {
+                keyset_ids.push(Id::from_bytes(k.value())?);
+            }
+        }
 
         let mut keysets = vec![];
 
@@ -393,11 +465,13 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
     #[instrument(skip_all)]
     async fn get_proofs(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<&MintId>,
         unit: Option<CurrencyUnit>,
         state: Option<Vec<State>>,
         spending_conditions: Option<Vec<SpendingConditions>>,
     ) -> Result<Vec<ProofInfo>, database::Error> {
+        let mint_urls = mint.map(|mint| self.mint_urls_for(mint)).transpose()?;
+
         let read_txn = self.db.begin_read().map_err(Error::from)?;
 
         let table = read_txn.open_table(PROOFS_TABLE).map_err(Error::from)?;
@@ -407,16 +481,19 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             .map_err(Error::from)?
             .flatten()
             .filter_map(|(_k, v)| {
-                let mut proof = None;
+                let proof_info = serde_json::from_str::<ProofInfo>(v.value()).ok()?;
 
-                if let Ok(proof_info) = serde_json::from_str::<ProofInfo>(v.value()) {
-                    if proof_info.matches_conditions(&mint_url, &unit, &state, &spending_conditions)
-                    {
-                        proof = Some(proof_info)
+                // Mint filtering is by URL set rather than by the single URL
+                // `matches_conditions` understands, so it is applied separately.
+                if let Some(mint_urls) = &mint_urls {
+                    if !mint_urls.contains(&proof_info.mint_url.to_string()) {
+                        return None;
                     }
                 }
 
-                proof
+                proof_info
+                    .matches_conditions(&None, &unit, &state, &spending_conditions)
+                    .then_some(proof_info)
             })
             .collect();
 
@@ -450,13 +527,13 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
 
     async fn get_balance(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<&MintId>,
         unit: Option<CurrencyUnit>,
         state: Option<Vec<State>>,
     ) -> Result<u64, database::Error> {
         // For redb, we still need to fetch all proofs and sum them
         // since redb doesn't have SQL aggregation
-        let proofs = self.get_proofs(mint_url, unit, state, None).await?;
+        let proofs = self.get_proofs(mint, unit, state, None).await?;
         Ok(proofs.iter().map(|p| u64::from(p.proof.amount)).sum())
     }
 
@@ -480,10 +557,12 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
     #[instrument(skip(self))]
     async fn list_transactions(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<&MintId>,
         direction: Option<TransactionDirection>,
         unit: Option<CurrencyUnit>,
     ) -> Result<Vec<Transaction>, database::Error> {
+        let mint_urls = mint.map(|mint| self.mint_urls_for(mint)).transpose()?;
+
         let read_txn = self.db.begin_read().map_err(Error::from)?;
 
         let table = read_txn
@@ -495,15 +574,18 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             .map_err(Error::from)?
             .flatten()
             .filter_map(|(_k, v)| {
-                let mut transaction = None;
+                let tx = serde_json::from_str::<Transaction>(v.value()).ok()?;
 
-                if let Ok(tx) = serde_json::from_str::<Transaction>(v.value()) {
-                    if tx.matches_conditions(&mint_url, &direction, &unit) {
-                        transaction = Some(tx)
+                // Mint filtering is by URL set rather than by the single URL
+                // `matches_conditions` understands, so it is applied separately.
+                if let Some(mint_urls) = &mint_urls {
+                    if !mint_urls.contains(&tx.mint_url.to_string()) {
+                        return None;
                     }
                 }
 
-                transaction
+                tx.matches_conditions(&None, &direction, &unit)
+                    .then_some(tx)
             })
             .collect();
 
@@ -603,6 +685,46 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
         new_mint_url: MintUrl,
     ) -> Result<(), database::Error> {
         let write_txn = self.db.begin_write().map_err(Error::from)?;
+        let old = old_mint_url.to_string();
+        let new = new_mint_url.to_string();
+
+        // The mint row itself, otherwise the mint stays listed under its old URL
+        // and every row moved below is orphaned.
+        {
+            let mut table = write_txn.open_table(MINTS_TABLE).map_err(Error::from)?;
+            let info = table
+                .get(old.as_str())
+                .map_err(Error::from)?
+                .map(|v| v.value().to_string());
+
+            if let Some(info) = info {
+                table.remove(old.as_str()).map_err(Error::from)?;
+                table
+                    .insert(new.as_str(), info.as_str())
+                    .map_err(Error::from)?;
+            }
+        }
+
+        // Keyset associations are keyed by mint url.
+        {
+            let mut table = write_txn
+                .open_multimap_table(MINT_KEYSETS_TABLE)
+                .map_err(Error::from)?;
+
+            let keyset_ids: Vec<Vec<u8>> = table
+                .get(old.as_str())
+                .map_err(Error::from)?
+                .flatten()
+                .map(|v| v.value().to_vec())
+                .collect();
+
+            for keyset_id in keyset_ids {
+                table
+                    .insert(new.as_str(), keyset_id.as_slice())
+                    .map_err(Error::from)?;
+            }
+            table.remove_all(old.as_str()).map_err(Error::from)?;
+        }
 
         // Update proofs table
         {
@@ -638,13 +760,12 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             }
         }
 
-        // Update mint quotes
+        // Update mint quotes. Expired quotes move too: leaving them behind makes
+        // the wallet's own history disagree with itself.
         {
             let mut table = write_txn
                 .open_table(MINT_QUOTES_TABLE)
                 .map_err(Error::from)?;
-
-            let unix_time = unix_time();
 
             let quotes: Vec<MintQuote> = table
                 .iter()
@@ -652,7 +773,7 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
                 .flatten()
                 .filter_map(|(_, quote)| {
                     let mut q: MintQuote = serde_json::from_str(quote.value()).ok()?;
-                    if q.mint_url == old_mint_url && q.expiry >= unix_time {
+                    if q.mint_url == old_mint_url {
                         q.mint_url = new_mint_url.clone();
                         Some(q)
                     } else {
@@ -666,6 +787,99 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
                     .insert(
                         quote.id.as_str(),
                         serde_json::to_string(&quote).map_err(Error::from)?.as_str(),
+                    )
+                    .map_err(Error::from)?;
+            }
+        }
+
+        // Update melt quotes
+        {
+            let mut table = write_txn
+                .open_table(MELT_QUOTES_TABLE)
+                .map_err(Error::from)?;
+
+            let quotes: Vec<wallet::MeltQuote> = table
+                .iter()
+                .map_err(Error::from)?
+                .flatten()
+                .filter_map(|(_, quote)| {
+                    let mut q: wallet::MeltQuote = serde_json::from_str(quote.value()).ok()?;
+                    if q.mint_url.as_ref() == Some(&old_mint_url) {
+                        q.mint_url = Some(new_mint_url.clone());
+                        Some(q)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for quote in quotes {
+                table
+                    .insert(
+                        quote.id.as_str(),
+                        serde_json::to_string(&quote).map_err(Error::from)?.as_str(),
+                    )
+                    .map_err(Error::from)?;
+            }
+        }
+
+        // Update transactions
+        {
+            let mut table = write_txn
+                .open_table(TRANSACTIONS_TABLE)
+                .map_err(Error::from)?;
+
+            let transactions: Vec<Transaction> = table
+                .iter()
+                .map_err(Error::from)?
+                .flatten()
+                .filter_map(|(_, v)| {
+                    let mut t: Transaction = serde_json::from_str(v.value()).ok()?;
+                    if t.mint_url == old_mint_url {
+                        t.mint_url = new_mint_url.clone();
+                        Some(t)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for transaction in transactions {
+                table
+                    .insert(
+                        transaction.id().as_slice(),
+                        serde_json::to_string(&transaction)
+                            .map_err(Error::from)?
+                            .as_str(),
+                    )
+                    .map_err(Error::from)?;
+            }
+        }
+
+        // Update sagas
+        {
+            let mut table = write_txn.open_table(SAGAS_TABLE).map_err(Error::from)?;
+
+            let sagas: Vec<wallet::WalletSaga> = table
+                .iter()
+                .map_err(Error::from)?
+                .flatten()
+                .filter_map(|(_, v)| {
+                    let mut s: wallet::WalletSaga = serde_json::from_str(v.value()).ok()?;
+                    if s.mint_url == old_mint_url {
+                        s.mint_url = new_mint_url.clone();
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for saga in sagas {
+                table
+                    .insert(
+                        saga.id.to_string().as_str(),
+                        serde_json::to_string(&saga).map_err(Error::from)?.as_str(),
                     )
                     .map_err(Error::from)?;
             }
@@ -727,14 +941,40 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
     }
 
     #[instrument(skip(self))]
-    async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), database::Error> {
+    async fn remove_mint(&self, mint: &MintId) -> Result<(), database::Error> {
+        // Resolved before the write transaction opens, since it reads.
+        let mint_urls = self.mint_urls_for(mint)?;
+
         let write_txn = self.db.begin_write().map_err(Error::from)?;
-        {
-            let mut table = write_txn.open_table(MINTS_TABLE).map_err(Error::from)?;
-            table
-                .remove(mint_url.to_string().as_str())
-                .map_err(Error::from)?;
+        for mint_url in &mint_urls {
+            {
+                let mut table = write_txn.open_table(MINTS_TABLE).map_err(Error::from)?;
+                table.remove(mint_url.as_str()).map_err(Error::from)?;
+            }
+
+            // Keysets belong to the mint, so they go with it.
+            {
+                let mut associations = write_txn
+                    .open_multimap_table(MINT_KEYSETS_TABLE)
+                    .map_err(Error::from)?;
+                let keyset_ids: Vec<Vec<u8>> = associations
+                    .get(mint_url.as_str())
+                    .map_err(Error::from)?
+                    .flatten()
+                    .map(|v| v.value().to_vec())
+                    .collect();
+                associations
+                    .remove_all(mint_url.as_str())
+                    .map_err(Error::from)?;
+                drop(associations);
+
+                let mut keysets = write_txn.open_table(KEYSETS_TABLE).map_err(Error::from)?;
+                for keyset_id in keyset_ids {
+                    keysets.remove(keyset_id.as_slice()).map_err(Error::from)?;
+                }
+            }
         }
+
         write_txn.commit().map_err(Error::from)?;
         Ok(())
     }
@@ -742,9 +982,17 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
     #[instrument(skip(self))]
     async fn add_mint_keysets(
         &self,
-        mint_url: MintUrl,
+        mint: &MintId,
         keysets: Vec<KeySetInfo>,
     ) -> Result<(), database::Error> {
+        // Keysets are stored against a URL, so a pubkey-identified mint records
+        // them under the first URL it resolves to.
+        let mint_url = self
+            .mint_urls_for(mint)?
+            .into_iter()
+            .next()
+            .ok_or(Error::UnknownMintInfo)?;
+
         let write_txn = self.db.begin_write().map_err(Error::from)?;
         {
             let mut table = write_txn

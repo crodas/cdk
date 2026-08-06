@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::str::FromStr;
+use std::str::{self, FromStr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,7 +13,7 @@ use cdk_common::nuts::{MeltQuoteState, MintQuoteState};
 use cdk_common::secret::Secret;
 use cdk_common::util::unix_time;
 use cdk_common::wallet::{
-    self, MintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId,
+    self, MintId, MintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId,
 };
 use cdk_common::{
     database, Amount, CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintInfo, PaymentMethod, Proof,
@@ -34,6 +34,46 @@ use crate::{
 #[rustfmt::skip]
 mod migrations {
     include!(concat!(env!("OUT_DIR"), "/migrations_wallet.rs"));
+}
+
+/// Tables carrying a `mint_url` that references a mint, excluding `mint` itself.
+///
+/// A mint's identity has to be rewritten across all of them together; missing one
+/// strands its rows under a mint the wallet no longer knows about.
+const MINT_URL_TABLES: [&str; 6] = [
+    "keyset",
+    "mint_quote",
+    "melt_quote",
+    "proof",
+    "transactions",
+    "wallet_sagas",
+];
+
+/// The URLs a mint identity is stored under.
+///
+/// A URL-identified mint is its own single locator, resolved without a query so
+/// that rows referencing a URL with no `mint` row still match, as they did when
+/// every lookup was by URL.
+async fn mint_urls_for<T>(conn: &T, mint: &MintId) -> Result<Vec<String>, Error>
+where
+    T: DatabaseExecutor,
+{
+    let pubkey = match mint {
+        MintId::Url(mint_url) => return Ok(vec![mint_url.to_string()]),
+        MintId::Pubkey(pubkey) => pubkey,
+    };
+
+    query(r#"SELECT mint_url FROM mint WHERE pubkey = :pubkey"#)?
+        .bind("pubkey", pubkey.to_bytes().to_vec())
+        .fetch_all(conn)
+        .await?
+        .into_iter()
+        .map(|mut row| {
+            Ok(column_as_string!(row
+                .pop()
+                .ok_or(ConversionError::MissingColumn(0, 1))?))
+        })
+        .collect()
 }
 
 /// Wallet SQLite Database
@@ -185,12 +225,62 @@ where
     }
 
     #[instrument(skip(self))]
-    async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, database::Error> {
+    async fn resolve_mint(&self, mint_url: &MintUrl) -> Result<Option<MintId>, database::Error> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
+
+        Ok(
+            query(r#"SELECT pubkey FROM mint WHERE mint_url = :mint_url"#)?
+                .bind("mint_url", mint_url.to_string())
+                .fetch_one(&*conn)
+                .await?
+                .map(|mut row| {
+                    let pubkey = column_as_nullable_binary!(row
+                        .pop()
+                        .ok_or(ConversionError::MissingColumn(0, 1))?);
+
+                    Ok::<_, Error>(
+                        pubkey
+                            .and_then(|bytes| PublicKey::from_slice(&bytes).ok())
+                            .map(MintId::Pubkey)
+                            .unwrap_or_else(|| MintId::Url(mint_url.clone())),
+                    )
+                })
+                .transpose()?,
+        )
+    }
+
+    #[instrument(skip(self))]
+    async fn mint_urls(&self, mint: &MintId) -> Result<Vec<MintUrl>, database::Error> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+
+        Ok(mint_urls_for(&*conn, mint)
+            .await?
+            .into_iter()
+            .filter_map(|url| MintUrl::from_str(&url).ok())
+            .collect())
+    }
+
+    #[instrument(skip(self))]
+    async fn get_mint(&self, mint: &MintId) -> Result<Option<MintInfo>, database::Error> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+
+        let mint_urls = mint_urls_for(&*conn, mint).await?;
+        let Some(mint_url) = mint_urls.first() else {
+            return Ok(None);
+        };
+
         Ok(query(
             r#"
             SELECT
@@ -211,7 +301,7 @@ where
             WHERE mint_url = :mint_url
             "#,
         )?
-        .bind("mint_url", mint_url.to_string())
+        .bind("mint_url", mint_url.clone())
         .fetch_one(&*conn)
         .await?
         .map(sql_row_to_mint_info)
@@ -219,7 +309,7 @@ where
     }
 
     #[instrument(skip(self))]
-    async fn get_mints(&self) -> Result<HashMap<MintUrl, Option<MintInfo>>, database::Error> {
+    async fn get_mints(&self) -> Result<HashMap<MintId, Option<MintInfo>>, database::Error> {
         let conn = self
             .pool
             .get()
@@ -254,7 +344,16 @@ where
                 MintUrl::from_str
             );
 
-            Ok((url, sql_row_to_mint_info(row).ok()))
+            let info = sql_row_to_mint_info(row).ok();
+            // A mint that published a pubkey is keyed by it, so two URLs of the
+            // same mint collapse to one entry.
+            let id = info
+                .as_ref()
+                .and_then(|info| info.pubkey)
+                .map(MintId::Pubkey)
+                .unwrap_or(MintId::Url(url));
+
+            Ok((id, info))
         })
         .collect::<Result<HashMap<_, _>, Error>>()?)
     }
@@ -262,13 +361,18 @@ where
     #[instrument(skip(self))]
     async fn get_mint_keysets(
         &self,
-        mint_url: MintUrl,
+        mint: &MintId,
     ) -> Result<Option<Vec<KeySetInfo>>, database::Error> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
+
+        let mint_urls = mint_urls_for(&*conn, mint).await?;
+        if mint_urls.is_empty() {
+            return Ok(None);
+        }
 
         let keysets = query(
             r#"
@@ -280,10 +384,10 @@ where
                 final_expiry
             FROM
                 keyset
-            WHERE mint_url = :mint_url
+            WHERE mint_url IN (:mint_urls)
             "#,
         )?
-        .bind("mint_url", mint_url.to_string())
+        .bind_vec("mint_urls", mint_urls)?
         .fetch_all(&*conn)
         .await?
         .into_iter()
@@ -508,7 +612,7 @@ where
     #[instrument(skip(self, state, spending_conditions))]
     async fn get_proofs(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<&MintId>,
         unit: Option<CurrencyUnit>,
         state: Option<Vec<State>>,
         spending_conditions: Option<Vec<SpendingConditions>>,
@@ -518,6 +622,12 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
+
+        let mint_urls = match mint {
+            Some(mint) => Some(mint_urls_for(&*conn, mint).await?),
+            None => None,
+        };
+
         Ok(query(
             r#"
             SELECT
@@ -546,7 +656,15 @@ where
         .filter_map(|row| {
             let row = sql_row_to_proof_info(row).ok()?;
 
-            if row.matches_conditions(&mint_url, &unit, &state, &spending_conditions) {
+            // Mint filtering is by URL set rather than by the single URL
+            // `matches_conditions` understands, so it is applied separately.
+            if let Some(mint_urls) = &mint_urls {
+                if !mint_urls.contains(&row.mint_url.to_string()) {
+                    return None;
+                }
+            }
+
+            if row.matches_conditions(&None, &unit, &state, &spending_conditions) {
                 Some(row)
             } else {
                 None
@@ -598,7 +716,7 @@ where
 
     async fn get_balance(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<&MintId>,
         unit: Option<CurrencyUnit>,
         states: Option<Vec<State>>,
     ) -> Result<u64, database::Error> {
@@ -608,6 +726,17 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
+        let mint_urls = match mint {
+            Some(mint) => Some(mint_urls_for(&*conn, mint).await?),
+            None => None,
+        };
+
+        // A pubkey-identified mint with no URLs holds nothing, and an empty IN
+        // clause is rejected rather than matching nothing.
+        if mint_urls.as_ref().is_some_and(|urls| urls.is_empty()) {
+            return Ok(0);
+        }
+
         let mut query_str = "SELECT COALESCE(SUM(amount), 0) as total FROM proof".to_string();
         let mut where_clauses = Vec::new();
         let states = states
@@ -616,8 +745,8 @@ where
             .map(|x| x.to_string())
             .collect::<Vec<_>>();
 
-        if mint_url.is_some() {
-            where_clauses.push("mint_url = :mint_url");
+        if mint_urls.is_some() {
+            where_clauses.push("mint_url IN (:mint_urls)");
         }
         if unit.is_some() {
             where_clauses.push("unit = :unit");
@@ -633,8 +762,8 @@ where
 
         let mut q = query(&query_str)?;
 
-        if let Some(ref mint_url) = mint_url {
-            q = q.bind("mint_url", mint_url.to_string());
+        if let Some(mint_urls) = mint_urls {
+            q = q.bind_vec("mint_urls", mint_urls)?;
         }
         if let Some(ref unit) = unit {
             q = q.bind("unit", unit.to_string());
@@ -707,7 +836,7 @@ where
     #[instrument(skip(self))]
     async fn list_transactions(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<&MintId>,
         direction: Option<TransactionDirection>,
         unit: Option<CurrencyUnit>,
     ) -> Result<Vec<Transaction>, database::Error> {
@@ -716,6 +845,11 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
+
+        let mint_urls = match mint {
+            Some(mint) => Some(mint_urls_for(&*conn, mint).await?),
+            None => None,
+        };
 
         Ok(query(
             r#"
@@ -744,7 +878,16 @@ where
         .filter_map(|row| {
             // TODO: Avoid a table scan by passing the heavy lifting of checking to the DB engine
             let transaction = sql_row_to_transaction(row).ok()?;
-            if transaction.matches_conditions(&mint_url, &direction, &unit) {
+
+            // Mint filtering is by URL set rather than by the single URL
+            // `matches_conditions` understands, so it is applied separately.
+            if let Some(mint_urls) = &mint_urls {
+                if !mint_urls.contains(&transaction.mint_url.to_string()) {
+                    return None;
+                }
+            }
+
+            if transaction.matches_conditions(&None, &direction, &unit) {
                 Some(transaction)
             } else {
                 None
@@ -954,9 +1097,16 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
         let tx = ConnectionWithTransaction::new(conn).await?;
-        let tables = ["mint_quote", "proof"];
 
-        for table in &tables {
+        // The mint row must move too, otherwise the mint keeps answering under
+        // its old URL and every dependent row is orphaned.
+        query(r#"UPDATE mint SET mint_url = :new_mint_url WHERE mint_url = :old_mint_url"#)?
+            .bind("new_mint_url", new_mint_url.to_string())
+            .bind("old_mint_url", old_mint_url.to_string())
+            .execute(&tx)
+            .await?;
+
+        for table in MINT_URL_TABLES {
             query(&format!(
                 r#"
                 UPDATE {table}
@@ -1117,17 +1267,33 @@ where
     }
 
     #[instrument(skip(self))]
-    async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), database::Error> {
+    async fn remove_mint(&self, mint: &MintId) -> Result<(), database::Error> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        query(r#"DELETE FROM mint WHERE mint_url=:mint_url"#)?
-            .bind("mint_url", mint_url.to_string())
-            .execute(&*conn)
+        let mint_urls = mint_urls_for(&*conn, mint).await?;
+        if mint_urls.is_empty() {
+            return Ok(());
+        }
+
+        let tx = ConnectionWithTransaction::new(conn).await?;
+
+        // Deleted explicitly rather than by cascade: the mint_url foreign key was
+        // removed so that a mint can be identified by pubkey instead.
+        query(r#"DELETE FROM keyset WHERE mint_url IN (:mint_urls)"#)?
+            .bind_vec("mint_urls", mint_urls.clone())?
+            .execute(&tx)
             .await?;
+
+        query(r#"DELETE FROM mint WHERE mint_url IN (:mint_urls)"#)?
+            .bind_vec("mint_urls", mint_urls)?
+            .execute(&tx)
+            .await?;
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -1135,7 +1301,7 @@ where
     #[instrument(skip(self, keysets))]
     async fn add_mint_keysets(
         &self,
-        mint_url: MintUrl,
+        mint: &MintId,
         keysets: Vec<KeySetInfo>,
     ) -> Result<(), database::Error> {
         let conn = self
@@ -1143,6 +1309,15 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
+
+        // Keysets are stored against a URL, so a pubkey-identified mint records
+        // them under the first URL it resolves to.
+        let mint_url = mint_urls_for(&*conn, mint)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Internal(format!("unknown mint {mint}")))?;
+
         let tx = ConnectionWithTransaction::new(conn).await?;
 
         for keyset in keysets {
@@ -1157,7 +1332,7 @@ where
             input_fee_ppk = excluded.input_fee_ppk
         "#,
             )?
-            .bind("mint_url", mint_url.to_string())
+            .bind("mint_url", mint_url.clone())
             .bind("id", keyset.id.to_string())
             .bind("unit", keyset.unit.to_string())
             .bind("active", keyset.active)
@@ -1966,9 +2141,18 @@ fn sql_row_to_mint_info(row: Vec<Column>) -> Result<MintInfo, Error> {
 
     Ok(MintInfo {
         name: column_as_nullable_string!(&name),
-        pubkey: column_as_nullable_string!(&pubkey, |v| serde_json::from_str(v).ok(), |v| {
-            serde_json::from_slice(v).ok()
-        }),
+        // A pubkey is stored bare, not as JSON, so serde is the wrong reader for
+        // either representation: `PublicKey` deserializes from a *quoted* JSON
+        // string, which neither raw bytes nor bare hex are.
+        pubkey: column_as_nullable_string!(
+            &pubkey,
+            |v| PublicKey::from_hex(v).ok(),
+            // `add_mint` has written 33 raw bytes since the first migration; the
+            // utf8 fallback covers rows carried over from a hex-encoding backend.
+            |v| PublicKey::from_slice(v).ok().or_else(|| str::from_utf8(v)
+                .ok()
+                .and_then(|s| PublicKey::from_hex(s).ok()))
+        ),
         version: column_as_nullable_string!(&version).and_then(|v| serde_json::from_str(&v).ok()),
         description: column_as_nullable_string!(description),
         description_long: column_as_nullable_string!(description_long),

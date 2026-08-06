@@ -41,6 +41,44 @@ impl TryFrom<MintUrl> for cdk::mint_url::MintUrl {
     }
 }
 
+/// FFI-compatible mint identity.
+///
+/// A mint is identified by the pubkey it publishes, which stays the same across
+/// every URL it can be reached at. Mints that publish no pubkey are identified
+/// by URL instead. Mints are still added by URL either way.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, uniffi::Enum)]
+pub enum MintId {
+    /// Identified by the pubkey the mint published, as hex.
+    Pubkey { pubkey: String },
+    /// Identified by URL, for a mint that published no pubkey.
+    Url { url: MintUrl },
+}
+
+impl From<cdk_common::wallet::MintId> for MintId {
+    fn from(mint: cdk_common::wallet::MintId) -> Self {
+        match mint {
+            cdk_common::wallet::MintId::Pubkey(pubkey) => Self::Pubkey {
+                pubkey: pubkey.to_hex(),
+            },
+            cdk_common::wallet::MintId::Url(url) => Self::Url { url: url.into() },
+        }
+    }
+}
+
+impl TryFrom<MintId> for cdk_common::wallet::MintId {
+    type Error = FfiError;
+
+    fn try_from(mint: MintId) -> Result<Self, Self::Error> {
+        Ok(match mint {
+            MintId::Pubkey { pubkey } => Self::Pubkey(
+                cdk::nuts::PublicKey::from_hex(&pubkey)
+                    .map_err(|e| FfiError::internal(format!("Invalid pubkey: {}", e)))?,
+            ),
+            MintId::Url { url } => Self::Url(url.try_into()?),
+        })
+    }
+}
+
 /// FFI-compatible MintVersion
 #[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
 pub struct MintVersion {

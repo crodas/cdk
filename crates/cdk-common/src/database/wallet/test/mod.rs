@@ -17,8 +17,8 @@ use super::*;
 use crate::mint_url::MintUrl;
 use crate::nuts::{Id, KeySetInfo, Keys, MintInfo, Proof, State};
 use crate::wallet::{
-    MeltQuote, MintQuote, OperationData, ProofInfo, SwapOperationData, SwapSagaState, Transaction,
-    TransactionDirection, WalletSaga, WalletSagaState,
+    MeltQuote, MintId, MintQuote, OperationData, ProofInfo, SwapOperationData, SwapSagaState,
+    Transaction, TransactionDirection, WalletSaga, WalletSagaState,
 };
 
 /// Generate a unique test ID
@@ -65,6 +65,14 @@ fn test_mint_url() -> MintUrl {
 /// Create a second test mint URL
 fn test_mint_url_2() -> MintUrl {
     MintUrl::from_str("https://test-mint-2.example.com").unwrap()
+}
+
+/// Identify a mint by the URL it was added under.
+///
+/// Test mints publish no pubkey unless a test sets one, so they stay
+/// URL-identified.
+fn mint_id(mint_url: &MintUrl) -> MintId {
+    MintId::Url(mint_url.clone())
 }
 
 /// Create test keyset info
@@ -188,12 +196,85 @@ where
         .unwrap();
 
     // Get mint
-    let retrieved = db.get_mint(mint_url.clone()).await.unwrap();
+    let retrieved = db.get_mint(&mint_id(&mint_url)).await.unwrap();
     assert!(retrieved.is_some());
 
     // Get all mints
     let mints = db.get_mints().await.unwrap();
-    assert!(mints.contains_key(&mint_url));
+    assert!(mints.contains_key(&mint_id(&mint_url)));
+}
+
+/// Test that `MintInfo::pubkey` survives a round trip through the database.
+///
+/// The mint identity pubkey is the key a wallet uses to recognise the same mint
+/// across URLs, so a backend that silently drops it is unusable for that.
+pub async fn mint_info_pubkey_round_trip<DB>(db: DB)
+where
+    // `mint_pubkey` is a provided trait method, which async_trait desugars with
+    // a `Self: Sync` bound.
+    DB: Database<crate::database::Error> + Sync,
+{
+    let mint_url = test_mint_url();
+    let pubkey = SecretKey::generate().public_key();
+    let mint_info = MintInfo::default().pubkey(pubkey);
+
+    db.add_mint(mint_url.clone(), Some(mint_info))
+        .await
+        .unwrap();
+
+    // Reachable by the URL it was added under.
+    let retrieved = db.get_mint(&mint_id(&mint_url)).await.unwrap().unwrap();
+    assert_eq!(retrieved.pubkey, Some(pubkey));
+
+    // Having published a pubkey, the mint is now identified by it.
+    assert_eq!(
+        db.resolve_mint(&mint_url).await.unwrap(),
+        Some(MintId::Pubkey(pubkey))
+    );
+    assert_eq!(db.mint_pubkey(&mint_url).await.unwrap(), Some(pubkey));
+
+    // And reachable by that identity, which is how it stays findable when it
+    // answers on a different URL.
+    let by_pubkey = MintId::Pubkey(pubkey);
+    assert_eq!(
+        db.get_mint(&by_pubkey).await.unwrap().unwrap().pubkey,
+        Some(pubkey)
+    );
+    assert_eq!(db.mint_urls(&by_pubkey).await.unwrap(), vec![mint_url]);
+
+    let mints = db.get_mints().await.unwrap();
+    assert_eq!(
+        mints.get(&by_pubkey).unwrap().as_ref().unwrap().pubkey,
+        Some(pubkey)
+    );
+}
+
+/// Test that a mint which publishes no pubkey keeps reading back as `None`.
+///
+/// Guards against a reader that invents a key out of an absent column.
+pub async fn mint_info_pubkey_absent_round_trip<DB>(db: DB)
+where
+    // `mint_pubkey` is a provided trait method, which async_trait desugars with
+    // a `Self: Sync` bound.
+    DB: Database<crate::database::Error> + Sync,
+{
+    let mint_url = test_mint_url();
+    let mint_info = MintInfo::default();
+    assert_eq!(mint_info.pubkey, None);
+
+    db.add_mint(mint_url.clone(), Some(mint_info))
+        .await
+        .unwrap();
+
+    let retrieved = db.get_mint(&mint_id(&mint_url)).await.unwrap().unwrap();
+    assert_eq!(retrieved.pubkey, None);
+
+    // With no pubkey to identify it by, the mint stays identified by its URL.
+    assert_eq!(
+        db.resolve_mint(&mint_url).await.unwrap(),
+        Some(MintId::Url(mint_url.clone()))
+    );
+    assert_eq!(db.mint_pubkey(&mint_url).await.unwrap(), None);
 }
 
 /// Test adding mint without info
@@ -207,7 +288,7 @@ where
 
     // Verify mint exists in the database
     let mints = db.get_mints().await.unwrap();
-    assert!(mints.contains_key(&mint_url));
+    assert!(mints.contains_key(&mint_id(&mint_url)));
 }
 
 /// Test removing a mint
@@ -221,9 +302,9 @@ where
     db.add_mint(mint_url.clone(), None).await.unwrap();
 
     // Remove mint
-    db.remove_mint(mint_url.clone()).await.unwrap();
+    db.remove_mint(&mint_id(&mint_url)).await.unwrap();
 
-    let result = db.get_mint(mint_url).await.unwrap();
+    let result = db.get_mint(&mint_id(&mint_url)).await.unwrap();
     assert!(result.is_none());
 }
 
@@ -244,6 +325,187 @@ where
         .unwrap();
 }
 
+/// Test that changing a mint's URL carries every row that references it.
+///
+/// A mint URL appears on seven tables. Leaving any of them behind strands the
+/// rows: the proofs still exist but no longer belong to any mint the wallet
+/// knows about.
+pub async fn update_mint_url_moves_all_rows<DB>(db: DB)
+where
+    DB: Database<crate::database::Error>,
+{
+    let old_url = test_mint_url();
+    let new_url = test_mint_url_2();
+    let (keys, keyset_id) = test_keys_with_id();
+
+    db.add_mint(old_url.clone(), Some(MintInfo::default()))
+        .await
+        .unwrap();
+    db.add_mint_keysets(
+        &mint_id(&old_url),
+        vec![test_keyset_info(keyset_id, &old_url)],
+    )
+    .await
+    .unwrap();
+    db.add_keys(KeySet {
+        id: keyset_id,
+        unit: CurrencyUnit::Sat,
+        keys,
+        active: Some(true),
+        input_fee_ppk: 0,
+        final_expiry: None,
+    })
+    .await
+    .unwrap();
+
+    let mint_quote = test_mint_quote(old_url.clone());
+    db.add_mint_quote(mint_quote.clone()).await.unwrap();
+
+    let mut melt_quote = test_melt_quote();
+    melt_quote.mint_url = Some(old_url.clone());
+    db.add_melt_quote(melt_quote.clone()).await.unwrap();
+
+    let proof_info = test_proof_info(keyset_id, 64, old_url.clone());
+    db.update_proofs(vec![proof_info.clone()], vec![])
+        .await
+        .unwrap();
+
+    let transaction = test_transaction(old_url.clone(), TransactionDirection::Incoming);
+    db.add_transaction(transaction.clone()).await.unwrap();
+
+    let saga = test_wallet_saga(old_url.clone());
+    db.add_saga(saga.clone()).await.unwrap();
+
+    db.update_mint_url(old_url.clone(), new_url.clone())
+        .await
+        .unwrap();
+
+    // The mint itself moved.
+    assert!(db.get_mint(&mint_id(&new_url)).await.unwrap().is_some());
+    assert!(db.get_mint(&mint_id(&old_url)).await.unwrap().is_none());
+    let mints = db.get_mints().await.unwrap();
+    assert!(mints.contains_key(&mint_id(&new_url)));
+    assert!(!mints.contains_key(&mint_id(&old_url)));
+
+    // Keysets moved.
+    let keysets = db.get_mint_keysets(&mint_id(&new_url)).await.unwrap();
+    assert_eq!(
+        keysets.unwrap_or_default().len(),
+        1,
+        "keyset did not move to the new mint url"
+    );
+    assert!(db
+        .get_mint_keysets(&mint_id(&old_url))
+        .await
+        .unwrap()
+        .unwrap_or_default()
+        .is_empty());
+
+    // Proofs and balance moved.
+    let proofs = db
+        .get_proofs(Some(&mint_id(&new_url)), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(proofs.len(), 1, "proof did not move to the new mint url");
+    assert_eq!(proofs[0].y, proof_info.y);
+    assert!(db
+        .get_proofs(Some(&mint_id(&old_url)), None, None, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.get_balance(Some(&mint_id(&new_url)), None, None)
+            .await
+            .unwrap(),
+        64
+    );
+    assert_eq!(
+        db.get_balance(Some(&mint_id(&old_url)), None, None)
+            .await
+            .unwrap(),
+        0
+    );
+
+    // Transactions moved.
+    let transactions = db
+        .list_transactions(Some(&mint_id(&new_url)), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        transactions.len(),
+        1,
+        "transaction did not move to the new mint url"
+    );
+    assert!(db
+        .list_transactions(Some(&mint_id(&old_url)), None, None)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Quotes report the new url.
+    assert_eq!(
+        db.get_mint_quote(&mint_quote.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .mint_url,
+        new_url,
+        "mint quote still points at the old mint url"
+    );
+    assert_eq!(
+        db.get_melt_quote(&melt_quote.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .mint_url,
+        Some(new_url.clone()),
+        "melt quote still points at the old mint url"
+    );
+
+    // Sagas moved.
+    assert_eq!(
+        db.get_saga(&saga.id).await.unwrap().unwrap().mint_url,
+        new_url,
+        "saga still points at the old mint url"
+    );
+}
+
+/// Test that removing a mint removes the keysets that belong to it.
+///
+/// The schema declares this as a cascading foreign key, but sqlite never enables
+/// `PRAGMA foreign_keys`, so the cascade only ever fired on postgres.
+pub async fn remove_mint_removes_keysets<DB>(db: DB)
+where
+    DB: Database<crate::database::Error>,
+{
+    let mint_url = test_mint_url();
+    let keyset_id = test_keyset_id();
+
+    db.add_mint(mint_url.clone(), None).await.unwrap();
+    db.add_mint_keysets(
+        &mint_id(&mint_url),
+        vec![test_keyset_info(keyset_id, &mint_url)],
+    )
+    .await
+    .unwrap();
+
+    db.remove_mint(&mint_id(&mint_url)).await.unwrap();
+
+    assert!(db.get_mint(&mint_id(&mint_url)).await.unwrap().is_none());
+    assert!(
+        db.get_mint_keysets(&mint_id(&mint_url))
+            .await
+            .unwrap()
+            .unwrap_or_default()
+            .is_empty(),
+        "keysets outlived the mint they belong to"
+    );
+    assert!(
+        db.get_keyset_by_id(&keyset_id).await.unwrap().is_none(),
+        "keyset is still reachable by id after its mint was removed"
+    );
+}
+
 // =============================================================================
 // Keyset Management Tests
 // =============================================================================
@@ -259,7 +521,7 @@ where
 
     // Add mint first
     db.add_mint(mint_url.clone(), None).await.unwrap();
-    db.add_mint_keysets(mint_url.clone(), vec![keyset_info.clone()])
+    db.add_mint_keysets(&mint_id(&mint_url), vec![keyset_info.clone()])
         .await
         .unwrap();
 
@@ -269,7 +531,7 @@ where
     assert_eq!(retrieved.unwrap().id, keyset_id);
 
     // Get keysets for mint
-    let keysets = db.get_mint_keysets(mint_url).await.unwrap();
+    let keysets = db.get_mint_keysets(&mint_id(&mint_url)).await.unwrap();
     assert!(keysets.is_some());
     assert!(!keysets.unwrap().is_empty());
 }
@@ -285,7 +547,7 @@ where
 
     // Add keyset
     db.add_mint(mint_url.clone(), None).await.unwrap();
-    db.add_mint_keysets(mint_url.clone(), vec![keyset_info])
+    db.add_mint_keysets(&mint_id(&mint_url), vec![keyset_info])
         .await
         .unwrap();
 
@@ -595,7 +857,7 @@ where
 
     // Get proofs by mint URL
     let proofs = db
-        .get_proofs(Some(mint_url.clone()), None, None, None)
+        .get_proofs(Some(&mint_id(&mint_url)), None, None, None)
         .await
         .unwrap();
     assert!(!proofs.is_empty());
@@ -760,7 +1022,10 @@ where
     assert_eq!(balance, 300);
 
     // Get balance by mint
-    let balance = db.get_balance(Some(mint_url), None, None).await.unwrap();
+    let balance = db
+        .get_balance(Some(&mint_id(&mint_url)), None, None)
+        .await
+        .unwrap();
     assert_eq!(balance, 300);
 }
 
@@ -907,7 +1172,7 @@ where
 
     // Filter by mint
     let transactions = db
-        .list_transactions(Some(mint_url_1), None, None)
+        .list_transactions(Some(&mint_id(&mint_url_1)), None, None)
         .await
         .unwrap();
     assert_eq!(transactions.len(), 1);
@@ -1574,9 +1839,13 @@ macro_rules! wallet_db_test {
         wallet_db_test!(
             $make_db_fn,
             add_and_get_mint,
+            mint_info_pubkey_round_trip,
+            mint_info_pubkey_absent_round_trip,
             add_mint_without_info,
             remove_mint,
+            remove_mint_removes_keysets,
             update_mint_url,
+            update_mint_url_moves_all_rows,
             add_and_get_keysets,
             get_keyset_by_id_in_transaction,
             add_and_get_keys,

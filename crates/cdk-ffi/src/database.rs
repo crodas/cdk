@@ -21,16 +21,13 @@ pub trait WalletDatabase: Send + Sync {
     // ========== Read methods ==========
 
     /// Get mint from storage
-    async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, FfiError>;
+    async fn get_mint(&self, mint: MintId) -> Result<Option<MintInfo>, FfiError>;
 
     /// Get all mints from storage
-    async fn get_mints(&self) -> Result<HashMap<MintUrl, Option<MintInfo>>, FfiError>;
+    async fn get_mints(&self) -> Result<HashMap<MintId, Option<MintInfo>>, FfiError>;
 
     /// Get mint keysets for mint url
-    async fn get_mint_keysets(
-        &self,
-        mint_url: MintUrl,
-    ) -> Result<Option<Vec<KeySetInfo>>, FfiError>;
+    async fn get_mint_keysets(&self, mint: MintId) -> Result<Option<Vec<KeySetInfo>>, FfiError>;
 
     /// Get mint keyset by id
     async fn get_keyset_by_id(&self, keyset_id: Id) -> Result<Option<KeySetInfo>, FfiError>;
@@ -57,7 +54,7 @@ pub trait WalletDatabase: Send + Sync {
     /// Get proofs from storage
     async fn get_proofs(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<MintId>,
         unit: Option<CurrencyUnit>,
         state: Option<Vec<ProofState>>,
         spending_conditions: Option<Vec<SpendingConditions>>,
@@ -69,7 +66,7 @@ pub trait WalletDatabase: Send + Sync {
     /// Get balance efficiently using SQL aggregation
     async fn get_balance(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<MintId>,
         unit: Option<CurrencyUnit>,
         state: Option<Vec<ProofState>>,
     ) -> Result<u64, FfiError>;
@@ -83,7 +80,7 @@ pub trait WalletDatabase: Send + Sync {
     /// List transactions from storage
     async fn list_transactions(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<MintId>,
         direction: Option<TransactionDirection>,
         unit: Option<CurrencyUnit>,
     ) -> Result<Vec<Transaction>, FfiError>;
@@ -177,12 +174,12 @@ pub trait WalletDatabase: Send + Sync {
     ) -> Result<(), FfiError>;
 
     /// Remove Mint from storage
-    async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), FfiError>;
+    async fn remove_mint(&self, mint: MintId) -> Result<(), FfiError>;
 
     /// Add mint keyset to storage
     async fn add_mint_keysets(
         &self,
-        mint_url: MintUrl,
+        mint: MintId,
         keysets: Vec<KeySetInfo>,
     ) -> Result<(), FfiError>;
 
@@ -314,14 +311,63 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
     }
 
     // Mint Management
+    async fn resolve_mint(
+        &self,
+        mint_url: &cdk::mint_url::MintUrl,
+    ) -> Result<Option<cdk_common::wallet::MintId>, cdk::cdk_database::Error> {
+        // Derived from the stored mint info rather than asked of the foreign
+        // database, so bindings do not have to implement a resolver.
+        let ffi_mint = MintId::Url {
+            url: mint_url.clone().into(),
+        };
+        let Some(info) = self
+            .ffi_db
+            .get_mint(ffi_mint)
+            .await
+            .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?
+        else {
+            return Ok(None);
+        };
+
+        let info: cdk::nuts::MintInfo = info
+            .try_into()
+            .map_err(|e: FfiError| cdk::cdk_database::Error::Database(e.to_string().into()))?;
+
+        Ok(Some(
+            info.pubkey
+                .map(cdk_common::wallet::MintId::Pubkey)
+                .unwrap_or_else(|| cdk_common::wallet::MintId::Url(mint_url.clone())),
+        ))
+    }
+
+    async fn mint_urls(
+        &self,
+        mint: &cdk_common::wallet::MintId,
+    ) -> Result<Vec<cdk::mint_url::MintUrl>, cdk::cdk_database::Error> {
+        if let cdk_common::wallet::MintId::Url(mint_url) = mint {
+            return Ok(vec![mint_url.clone()]);
+        }
+
+        Ok(self
+            .get_mints()
+            .await?
+            .into_keys()
+            .filter(|id| id == mint)
+            .filter_map(|id| match id {
+                cdk_common::wallet::MintId::Url(url) => Some(url),
+                cdk_common::wallet::MintId::Pubkey(_) => None,
+            })
+            .collect())
+    }
+
     async fn get_mint(
         &self,
-        mint_url: cdk::mint_url::MintUrl,
+        mint: &cdk_common::wallet::MintId,
     ) -> Result<Option<cdk::nuts::MintInfo>, cdk::cdk_database::Error> {
-        let ffi_mint_url = mint_url.into();
+        let ffi_mint = mint.clone().into();
         let result = self
             .ffi_db
-            .get_mint(ffi_mint_url)
+            .get_mint(ffi_mint)
             .await
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?;
         result
@@ -333,7 +379,7 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
     async fn get_mints(
         &self,
     ) -> Result<
-        HashMap<cdk::mint_url::MintUrl, Option<cdk::nuts::MintInfo>>,
+        HashMap<cdk_common::wallet::MintId, Option<cdk::nuts::MintInfo>>,
         cdk::cdk_database::Error,
     > {
         let result = self
@@ -343,15 +389,15 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?;
 
         let mut cdk_result = HashMap::new();
-        for (ffi_mint_url, mint_info_opt) in result {
-            let cdk_url = ffi_mint_url
+        for (ffi_mint, mint_info_opt) in result {
+            let cdk_mint: cdk_common::wallet::MintId = ffi_mint
                 .try_into()
                 .map_err(|e: FfiError| cdk::cdk_database::Error::Database(e.to_string().into()))?;
             let cdk_mint_info = mint_info_opt
                 .map(TryInto::try_into)
                 .transpose()
                 .map_err(|e: FfiError| cdk::cdk_database::Error::Database(e.to_string().into()))?;
-            cdk_result.insert(cdk_url, cdk_mint_info);
+            cdk_result.insert(cdk_mint, cdk_mint_info);
         }
         Ok(cdk_result)
     }
@@ -359,12 +405,12 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
     // Keyset Management
     async fn get_mint_keysets(
         &self,
-        mint_url: cdk::mint_url::MintUrl,
+        mint: &cdk_common::wallet::MintId,
     ) -> Result<Option<Vec<cdk::nuts::KeySetInfo>>, cdk::cdk_database::Error> {
-        let ffi_mint_url = mint_url.into();
+        let ffi_mint = mint.clone().into();
         let result = self
             .ffi_db
-            .get_mint_keysets(ffi_mint_url)
+            .get_mint_keysets(ffi_mint)
             .await
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?;
         let cdk_keysets = result
@@ -510,12 +556,12 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
     // Proof Management
     async fn get_proofs(
         &self,
-        mint_url: Option<cdk::mint_url::MintUrl>,
+        mint: Option<&cdk_common::wallet::MintId>,
         unit: Option<cdk::nuts::CurrencyUnit>,
         state: Option<Vec<cdk::nuts::State>>,
         spending_conditions: Option<Vec<cdk::nuts::SpendingConditions>>,
     ) -> Result<Vec<cdk::types::ProofInfo>, cdk::cdk_database::Error> {
-        let ffi_mint_url = mint_url.map(Into::into);
+        let ffi_mint: Option<MintId> = mint.cloned().map(Into::into);
         let ffi_unit = unit.map(Into::into);
         let ffi_state = state.map(|s| s.into_iter().map(Into::into).collect());
         let ffi_spending_conditions =
@@ -523,7 +569,7 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
 
         let result = self
             .ffi_db
-            .get_proofs(ffi_mint_url, ffi_unit, ffi_state, ffi_spending_conditions)
+            .get_proofs(ffi_mint, ffi_unit, ffi_state, ffi_spending_conditions)
             .await
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?;
 
@@ -621,16 +667,16 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
 
     async fn get_balance(
         &self,
-        mint_url: Option<cdk::mint_url::MintUrl>,
+        mint: Option<&cdk_common::wallet::MintId>,
         unit: Option<cdk::nuts::CurrencyUnit>,
         state: Option<Vec<cdk::nuts::State>>,
     ) -> Result<u64, cdk::cdk_database::Error> {
-        let ffi_mint_url = mint_url.map(Into::into);
+        let ffi_mint: Option<MintId> = mint.cloned().map(Into::into);
         let ffi_unit = unit.map(Into::into);
         let ffi_state = state.map(|s| s.into_iter().map(Into::into).collect());
 
         self.ffi_db
-            .get_balance(ffi_mint_url, ffi_unit, ffi_state)
+            .get_balance(ffi_mint, ffi_unit, ffi_state)
             .await
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
     }
@@ -655,17 +701,17 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
 
     async fn list_transactions(
         &self,
-        mint_url: Option<cdk::mint_url::MintUrl>,
+        mint: Option<&cdk_common::wallet::MintId>,
         direction: Option<cdk::wallet::types::TransactionDirection>,
         unit: Option<cdk::nuts::CurrencyUnit>,
     ) -> Result<Vec<cdk::wallet::types::Transaction>, cdk::cdk_database::Error> {
-        let ffi_mint_url = mint_url.map(Into::into);
+        let ffi_mint: Option<MintId> = mint.cloned().map(Into::into);
         let ffi_direction = direction.map(Into::into);
         let ffi_unit = unit.map(Into::into);
 
         let result = self
             .ffi_db
-            .list_transactions(ffi_mint_url, ffi_direction, ffi_unit)
+            .list_transactions(ffi_mint, ffi_direction, ffi_unit)
             .await
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?;
 
@@ -825,24 +871,24 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
 
     async fn remove_mint(
         &self,
-        mint_url: cdk::mint_url::MintUrl,
+        mint: &cdk_common::wallet::MintId,
     ) -> Result<(), cdk::cdk_database::Error> {
-        let ffi_mint_url = mint_url.into();
+        let ffi_mint = mint.clone().into();
         self.ffi_db
-            .remove_mint(ffi_mint_url)
+            .remove_mint(ffi_mint)
             .await
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
     }
 
     async fn add_mint_keysets(
         &self,
-        mint_url: cdk::mint_url::MintUrl,
+        mint: &cdk_common::wallet::MintId,
         keysets: Vec<cdk::nuts::KeySetInfo>,
     ) -> Result<(), cdk::cdk_database::Error> {
-        let ffi_mint_url = mint_url.into();
+        let ffi_mint = mint.clone().into();
         let ffi_keysets: Vec<KeySetInfo> = keysets.into_iter().map(Into::into).collect();
         self.ffi_db
-            .add_mint_keysets(ffi_mint_url, ffi_keysets)
+            .add_mint_keysets(ffi_mint, ffi_keysets)
             .await
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
     }
@@ -1209,17 +1255,17 @@ where
         Ok(result.into_iter().map(Into::into).collect())
     }
 
-    async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, FfiError> {
-        let cdk_mint_url = mint_url.try_into()?;
+    async fn get_mint(&self, mint: MintId) -> Result<Option<MintInfo>, FfiError> {
+        let cdk_mint: cdk_common::wallet::MintId = mint.try_into()?;
         let result = self
             .inner
-            .get_mint(cdk_mint_url)
+            .get_mint(&cdk_mint)
             .await
             .map_err(FfiError::internal)?;
         Ok(result.map(Into::into))
     }
 
-    async fn get_mints(&self) -> Result<HashMap<MintUrl, Option<MintInfo>>, FfiError> {
+    async fn get_mints(&self) -> Result<HashMap<MintId, Option<MintInfo>>, FfiError> {
         let result = self.inner.get_mints().await.map_err(FfiError::internal)?;
         Ok(result
             .into_iter()
@@ -1227,14 +1273,11 @@ where
             .collect())
     }
 
-    async fn get_mint_keysets(
-        &self,
-        mint_url: MintUrl,
-    ) -> Result<Option<Vec<KeySetInfo>>, FfiError> {
-        let cdk_mint_url = mint_url.try_into()?;
+    async fn get_mint_keysets(&self, mint: MintId) -> Result<Option<Vec<KeySetInfo>>, FfiError> {
+        let cdk_mint: cdk_common::wallet::MintId = mint.try_into()?;
         let result = self
             .inner
-            .get_mint_keysets(cdk_mint_url)
+            .get_mint_keysets(&cdk_mint)
             .await
             .map_err(FfiError::internal)?;
         Ok(result.map(|keysets| keysets.into_iter().map(Into::into).collect()))
@@ -1307,12 +1350,13 @@ where
 
     async fn get_proofs(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<MintId>,
         unit: Option<CurrencyUnit>,
         state: Option<Vec<ProofState>>,
         spending_conditions: Option<Vec<SpendingConditions>>,
     ) -> Result<Vec<ProofInfo>, FfiError> {
-        let cdk_mint_url = mint_url.map(|u| u.try_into()).transpose()?;
+        let cdk_mint: Option<cdk_common::wallet::MintId> =
+            mint.map(TryInto::try_into).transpose()?;
         let cdk_unit = unit.map(Into::into);
         let cdk_state = state.map(|s| s.into_iter().map(Into::into).collect());
         let cdk_spending_conditions: Option<Vec<cdk::nuts::SpendingConditions>> =
@@ -1326,7 +1370,12 @@ where
 
         let result = self
             .inner
-            .get_proofs(cdk_mint_url, cdk_unit, cdk_state, cdk_spending_conditions)
+            .get_proofs(
+                cdk_mint.as_ref(),
+                cdk_unit,
+                cdk_state,
+                cdk_spending_conditions,
+            )
             .await
             .map_err(FfiError::internal)?;
 
@@ -1335,16 +1384,17 @@ where
 
     async fn get_balance(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<MintId>,
         unit: Option<CurrencyUnit>,
         state: Option<Vec<ProofState>>,
     ) -> Result<u64, FfiError> {
-        let cdk_mint_url = mint_url.map(|u| u.try_into()).transpose()?;
+        let cdk_mint: Option<cdk_common::wallet::MintId> =
+            mint.map(TryInto::try_into).transpose()?;
         let cdk_unit = unit.map(Into::into);
         let cdk_state = state.map(|s| s.into_iter().map(Into::into).collect());
 
         self.inner
-            .get_balance(cdk_mint_url, cdk_unit, cdk_state)
+            .get_balance(cdk_mint.as_ref(), cdk_unit, cdk_state)
             .await
             .map_err(FfiError::internal)
     }
@@ -1364,17 +1414,18 @@ where
 
     async fn list_transactions(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<MintId>,
         direction: Option<TransactionDirection>,
         unit: Option<CurrencyUnit>,
     ) -> Result<Vec<Transaction>, FfiError> {
-        let cdk_mint_url = mint_url.map(|u| u.try_into()).transpose()?;
+        let cdk_mint: Option<cdk_common::wallet::MintId> =
+            mint.map(TryInto::try_into).transpose()?;
         let cdk_direction = direction.map(Into::into);
         let cdk_unit = unit.map(Into::into);
 
         let result = self
             .inner
-            .list_transactions(cdk_mint_url, cdk_direction, cdk_unit)
+            .list_transactions(cdk_mint.as_ref(), cdk_direction, cdk_unit)
             .await
             .map_err(FfiError::internal)?;
 
@@ -1584,26 +1635,26 @@ where
             .map_err(FfiError::internal)
     }
 
-    async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), FfiError> {
-        let cdk_mint_url = mint_url.try_into()?;
+    async fn remove_mint(&self, mint: MintId) -> Result<(), FfiError> {
+        let cdk_mint: cdk_common::wallet::MintId = mint.try_into()?;
         self.inner
-            .remove_mint(cdk_mint_url)
+            .remove_mint(&cdk_mint)
             .await
             .map_err(FfiError::internal)
     }
 
     async fn add_mint_keysets(
         &self,
-        mint_url: MintUrl,
+        mint: MintId,
         keysets: Vec<KeySetInfo>,
     ) -> Result<(), FfiError> {
-        let cdk_mint_url = mint_url.try_into()?;
+        let cdk_mint: cdk_common::wallet::MintId = mint.try_into()?;
         let cdk_keysets: Vec<cdk::nuts::KeySetInfo> = keysets
             .into_iter()
             .map(TryInto::try_into)
             .collect::<Result<_, _>>()?;
         self.inner
-            .add_mint_keysets(cdk_mint_url, cdk_keysets)
+            .add_mint_keysets(&cdk_mint, cdk_keysets)
             .await
             .map_err(FfiError::internal)
     }
@@ -1805,21 +1856,21 @@ macro_rules! impl_ffi_wallet_database {
                 self.inner.get_proofs_by_ys(ys).await
             }
 
-            async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, FfiError> {
-                self.inner.get_mint(mint_url).await
+            async fn get_mint(&self, mint: MintId) -> Result<Option<MintInfo>, FfiError> {
+                self.inner.get_mint(mint).await
             }
 
             async fn get_mints(
                 &self,
-            ) -> Result<std::collections::HashMap<MintUrl, Option<MintInfo>>, FfiError> {
+            ) -> Result<std::collections::HashMap<MintId, Option<MintInfo>>, FfiError> {
                 self.inner.get_mints().await
             }
 
             async fn get_mint_keysets(
                 &self,
-                mint_url: MintUrl,
+                mint: MintId,
             ) -> Result<Option<Vec<KeySetInfo>>, FfiError> {
-                self.inner.get_mint_keysets(mint_url).await
+                self.inner.get_mint_keysets(mint).await
             }
 
             async fn get_keyset_by_id(
@@ -1861,23 +1912,23 @@ macro_rules! impl_ffi_wallet_database {
 
             async fn get_proofs(
                 &self,
-                mint_url: Option<MintUrl>,
+                mint: Option<MintId>,
                 unit: Option<CurrencyUnit>,
                 state: Option<Vec<ProofState>>,
                 spending_conditions: Option<Vec<SpendingConditions>>,
             ) -> Result<Vec<ProofInfo>, FfiError> {
                 self.inner
-                    .get_proofs(mint_url, unit, state, spending_conditions)
+                    .get_proofs(mint, unit, state, spending_conditions)
                     .await
             }
 
             async fn get_balance(
                 &self,
-                mint_url: Option<MintUrl>,
+                mint: Option<MintId>,
                 unit: Option<CurrencyUnit>,
                 state: Option<Vec<ProofState>>,
             ) -> Result<u64, FfiError> {
-                self.inner.get_balance(mint_url, unit, state).await
+                self.inner.get_balance(mint, unit, state).await
             }
 
             async fn get_transaction(
@@ -1889,13 +1940,11 @@ macro_rules! impl_ffi_wallet_database {
 
             async fn list_transactions(
                 &self,
-                mint_url: Option<MintUrl>,
+                mint: Option<MintId>,
                 direction: Option<TransactionDirection>,
                 unit: Option<CurrencyUnit>,
             ) -> Result<Vec<Transaction>, FfiError> {
-                self.inner
-                    .list_transactions(mint_url, direction, unit)
-                    .await
+                self.inner.list_transactions(mint, direction, unit).await
             }
 
             async fn kv_read(
@@ -1995,16 +2044,16 @@ macro_rules! impl_ffi_wallet_database {
                 self.inner.add_mint(mint_url, mint_info).await
             }
 
-            async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), FfiError> {
-                self.inner.remove_mint(mint_url).await
+            async fn remove_mint(&self, mint: MintId) -> Result<(), FfiError> {
+                self.inner.remove_mint(mint).await
             }
 
             async fn add_mint_keysets(
                 &self,
-                mint_url: MintUrl,
+                mint: MintId,
                 keysets: Vec<KeySetInfo>,
             ) -> Result<(), FfiError> {
-                self.inner.add_mint_keysets(mint_url, keysets).await
+                self.inner.add_mint_keysets(mint, keysets).await
             }
 
             async fn add_mint_quote(&self, quote: MintQuote) -> Result<(), FfiError> {

@@ -10,7 +10,7 @@ use bitcoin::Network;
 use cdk_common::amount::FeeAndAmounts;
 use cdk_common::database::{self, WalletDatabase};
 use cdk_common::subscription::WalletParams;
-use cdk_common::wallet::{KeysetLoadPolicy, ProofInfo};
+use cdk_common::wallet::{KeysetLoadPolicy, MintId, ProofInfo};
 use cdk_common::{PublicKey, SecretKey, SECP256K1};
 use getrandom::getrandom;
 pub use mint_connector::http_client::{
@@ -386,6 +386,28 @@ impl Wallet {
         self.get_keyset_count_fee(&keyset_id, proof_count).await
     }
 
+    /// The identity this wallet's mint is stored under.
+    ///
+    /// Falls back to the URL when the mint has no record yet, which is the
+    /// identity the database would give it anyway until it publishes a pubkey.
+    #[instrument(skip(self))]
+    pub async fn mint_id(&self) -> Result<MintId, Error> {
+        Ok(self
+            .localstore
+            .resolve_mint(&self.mint_url)
+            .await?
+            .unwrap_or_else(|| MintId::Url(self.mint_url.clone())))
+    }
+
+    /// The pubkey this wallet's mint has published, if any.
+    ///
+    /// `None` means the mint publishes no pubkey, or has not been contacted
+    /// since one was last recorded, and so is still identified by its URL.
+    #[instrument(skip(self))]
+    pub async fn mint_pubkey(&self) -> Result<Option<PublicKey>, Error> {
+        Ok(self.localstore.mint_pubkey(&self.mint_url).await?)
+    }
+
     /// Update Mint information and related entries in the event a mint changes
     /// its URL
     #[instrument(skip(self))]
@@ -589,7 +611,7 @@ impl Wallet {
         // Check that mint is in store of mints
         if self
             .localstore
-            .get_mint(self.mint_url.clone())
+            .get_mint(&self.mint_id().await?)
             .await?
             .is_none()
         {

@@ -34,6 +34,7 @@ use cdk_common::database::{self, WalletDatabase};
 use cdk_common::mint_url::MintUrl;
 use cdk_common::nuts::{KeySetInfo, Keys};
 use cdk_common::parking_lot::RwLock;
+use cdk_common::wallet::MintId;
 use cdk_common::{CurrencyUnit, KeySet, MintInfo};
 use tokio::sync::Mutex;
 use web_time::Instant;
@@ -335,12 +336,17 @@ impl MintMetadataCache {
         let mut new_metadata = (*self.metadata.load().clone()).clone();
 
         // Load mint info
-        if let Some(mint_info) = storage.get_mint(self.mint_url.clone()).await? {
+        let mint = storage
+            .resolve_mint(&self.mint_url)
+            .await?
+            .unwrap_or_else(|| MintId::Url(self.mint_url.clone()));
+
+        if let Some(mint_info) = storage.get_mint(&mint).await? {
             new_metadata.mint_info = mint_info;
         }
 
         // Load keysets and their keys
-        if let Some(keysets) = storage.get_mint_keysets(self.mint_url.clone()).await? {
+        if let Some(keysets) = storage.get_mint_keysets(&mint).await? {
             new_metadata.active_keysets.clear();
             for keyset_info in keysets {
                 let keyset_arc = Arc::new(keyset_info.clone());
@@ -599,8 +605,18 @@ impl MintMetadataCache {
         let keysets: Vec<_> = metadata.keysets.values().map(|ks| (**ks).clone()).collect();
 
         if !keysets.is_empty() {
+            // Resolved after `add_mint`, so a mint that just published a pubkey
+            // is already identified by it.
+            let mint = storage
+                .resolve_mint(&mint_url)
+                .await
+                .inspect_err(|e| tracing::warn!("Failed to resolve mint {}: {}", mint_url, e))
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| MintId::Url(mint_url.clone()));
+
             storage
-                .add_mint_keysets(mint_url.clone(), keysets)
+                .add_mint_keysets(&mint, keysets)
                 .await
                 .inspect_err(|e| tracing::warn!("Failed to save keysets for {}: {}", mint_url, e))
                 .ok();

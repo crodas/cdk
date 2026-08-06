@@ -13,7 +13,8 @@ use crate::nuts::{
     CurrencyUnit, Id, KeySetInfo, Keys, MintInfo, PublicKey, SpendingConditions, State,
 };
 use crate::wallet::{
-    self, MintQuote as WalletMintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId,
+    self, MintId, MintQuote as WalletMintQuote, ProofInfo, Transaction, TransactionDirection,
+    TransactionId,
 };
 
 #[cfg(feature = "test")]
@@ -26,14 +27,40 @@ pub trait Database<Err>: Debug
 where
     Err: Into<Error> + From<Error>,
 {
+    /// Resolve the URL a mint was added under to the identity it is stored by.
+    ///
+    /// Returns `None` when no mint has been added under this URL. A mint that
+    /// has published a pubkey resolves to [`MintId::Pubkey`], so it keeps
+    /// resolving to the same identity from any of its URLs; one that has not
+    /// resolves to [`MintId::Url`].
+    async fn resolve_mint(&self, mint_url: &MintUrl) -> Result<Option<MintId>, Err>;
+
+    /// The pubkey a mint URL resolves to.
+    ///
+    /// `None` means either that no mint has been added under this URL, or that
+    /// the mint there has published no pubkey and so is still identified by URL.
+    /// Use [`Database::resolve_mint`] to tell those apart.
+    async fn mint_pubkey(&self, mint_url: &MintUrl) -> Result<Option<PublicKey>, Err> {
+        Ok(self
+            .resolve_mint(mint_url)
+            .await?
+            .and_then(|mint| mint.pubkey().copied()))
+    }
+
+    /// Every URL a mint identity is known to be reachable at.
+    ///
+    /// A URL-identified mint has exactly one. A pubkey-identified mint has one
+    /// per URL the wallet has resolved to it.
+    async fn mint_urls(&self, mint: &MintId) -> Result<Vec<MintUrl>, Err>;
+
     /// Get mint from storage
-    async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, Err>;
+    async fn get_mint(&self, mint: &MintId) -> Result<Option<MintInfo>, Err>;
 
     /// Get all mints from storage
-    async fn get_mints(&self) -> Result<HashMap<MintUrl, Option<MintInfo>>, Err>;
+    async fn get_mints(&self) -> Result<HashMap<MintId, Option<MintInfo>>, Err>;
 
-    /// Get mint keysets for mint url
-    async fn get_mint_keysets(&self, mint_url: MintUrl) -> Result<Option<Vec<KeySetInfo>>, Err>;
+    /// Get mint keysets for a mint
+    async fn get_mint_keysets(&self, mint: &MintId) -> Result<Option<Vec<KeySetInfo>>, Err>;
 
     /// Get mint keyset by id
     async fn get_keyset_by_id(&self, keyset_id: &Id) -> Result<Option<KeySetInfo>, Err>;
@@ -60,7 +87,7 @@ where
     /// Get proofs from storage
     async fn get_proofs(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<&MintId>,
         unit: Option<CurrencyUnit>,
         state: Option<Vec<State>>,
         spending_conditions: Option<Vec<SpendingConditions>>,
@@ -72,7 +99,7 @@ where
     /// Get balance
     async fn get_balance(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<&MintId>,
         unit: Option<CurrencyUnit>,
         state: Option<Vec<State>>,
     ) -> Result<u64, Err>;
@@ -86,7 +113,7 @@ where
     /// List transactions from storage
     async fn list_transactions(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<&MintId>,
         direction: Option<TransactionDirection>,
         unit: Option<CurrencyUnit>,
     ) -> Result<Vec<Transaction>, Err>;
@@ -116,17 +143,17 @@ where
     async fn increment_keyset_counter(&self, keyset_id: &Id, count: u32) -> Result<u32, Err>;
 
     /// Add Mint to storage
+    ///
+    /// Mints are added by URL: it is what the user types and what a token
+    /// carries. The identity the mint is then stored by comes from the pubkey in
+    /// `mint_info`, if it published one.
     async fn add_mint(&self, mint_url: MintUrl, mint_info: Option<MintInfo>) -> Result<(), Err>;
 
     /// Remove Mint from storage
-    async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), Err>;
+    async fn remove_mint(&self, mint: &MintId) -> Result<(), Err>;
 
     /// Add mint keyset to storage
-    async fn add_mint_keysets(
-        &self,
-        mint_url: MintUrl,
-        keysets: Vec<KeySetInfo>,
-    ) -> Result<(), Err>;
+    async fn add_mint_keysets(&self, mint: &MintId, keysets: Vec<KeySetInfo>) -> Result<(), Err>;
 
     /// Add mint quote to storage
     async fn add_mint_quote(&self, quote: WalletMintQuote) -> Result<(), Err>;

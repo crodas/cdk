@@ -21,7 +21,7 @@ use cdk_common::nuts::{
 use cdk_common::secret::Secret;
 use cdk_common::util::hex;
 use cdk_common::wallet::{
-    self, MintQuote, Transaction, TransactionDirection, TransactionId, WalletSaga,
+    self, MintId, MintQuote, Transaction, TransactionDirection, TransactionId, WalletSaga,
 };
 use reqwest::{Client, StatusCode};
 use scrypt::Params as ScryptParams;
@@ -139,6 +139,48 @@ pub struct SupabaseWalletDatabase {
 }
 
 impl SupabaseWalletDatabase {
+    /// The URLs a mint identity is stored under.
+    ///
+    /// A URL-identified mint is its own single locator, resolved without a
+    /// request so that rows referencing a URL with no mint row still match, as
+    /// they did when every lookup was by URL.
+    async fn mint_urls_for(&self, mint: &MintId) -> Result<Vec<String>, DatabaseError> {
+        let pubkey = match mint {
+            MintId::Url(mint_url) => return Ok(vec![mint_url.to_string()]),
+            MintId::Pubkey(pubkey) => pubkey,
+        };
+
+        let path = format!(
+            "rest/v1/mint?pubkey=eq.{}",
+            url_encode(&hex::encode(pubkey.to_bytes()))
+        );
+        let (status, text) = self.get_request(&path).await?;
+
+        if !status.is_success() {
+            return Err(DatabaseError::Internal(format!(
+                "mint_urls_for failed: HTTP {}",
+                status
+            )));
+        }
+
+        Ok(Self::parse_response::<MintTable>(&text)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mint| mint.mint_url)
+            .collect())
+    }
+
+    /// A PostgREST `in.(...)` filter value for a set of mint URLs.
+    fn mint_url_in_filter(mint_urls: &[String]) -> String {
+        let list = mint_urls
+            .iter()
+            .map(|url| format!("\"{url}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!("in.({})", url_encode(&list))
+    }
+
     /// Create a new SupabaseWalletDatabase with API key only (legacy behavior)
     ///
     /// No automatic token refresh is configured.
@@ -925,11 +967,54 @@ impl KVStoreDatabase for SupabaseWalletDatabase {
 }
 #[async_trait]
 impl Database<DatabaseError> for SupabaseWalletDatabase {
-    async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, DatabaseError> {
+    async fn resolve_mint(&self, mint_url: &MintUrl) -> Result<Option<MintId>, DatabaseError> {
         let path = format!(
             "rest/v1/mint?mint_url=eq.{}",
             url_encode(&mint_url.to_string())
         );
+        let (status, text) = self.get_request(&path).await?;
+
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(DatabaseError::Internal(format!(
+                "resolve_mint failed: HTTP {}",
+                status
+            )));
+        }
+
+        let Some(mint) =
+            Self::parse_response::<MintTable>(&text)?.and_then(|mints| mints.into_iter().next())
+        else {
+            return Ok(None);
+        };
+
+        let info: MintInfo = mint.try_into()?;
+
+        Ok(Some(
+            info.pubkey
+                .map(MintId::Pubkey)
+                .unwrap_or_else(|| MintId::Url(mint_url.clone())),
+        ))
+    }
+
+    async fn mint_urls(&self, mint: &MintId) -> Result<Vec<MintUrl>, DatabaseError> {
+        Ok(self
+            .mint_urls_for(mint)
+            .await?
+            .into_iter()
+            .filter_map(|url| MintUrl::from_str(&url).ok())
+            .collect())
+    }
+
+    async fn get_mint(&self, mint: &MintId) -> Result<Option<MintInfo>, DatabaseError> {
+        let mint_urls = self.mint_urls_for(mint).await?;
+        let Some(mint_url) = mint_urls.first() else {
+            return Ok(None);
+        };
+
+        let path = format!("rest/v1/mint?mint_url=eq.{}", url_encode(mint_url));
         let (status, text) = self.get_request(&path).await?;
 
         // 404 or empty result means not found
@@ -951,7 +1036,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         Ok(None)
     }
 
-    async fn get_mints(&self) -> Result<HashMap<MintUrl, Option<MintInfo>>, DatabaseError> {
+    async fn get_mints(&self) -> Result<HashMap<MintId, Option<MintInfo>>, DatabaseError> {
         let (status, text) = self.get_request("rest/v1/mint").await?;
 
         if !status.is_success() {
@@ -964,11 +1049,14 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         let mut map = HashMap::new();
         if let Some(mints) = Self::parse_response::<MintTable>(&text)? {
             for mint in mints {
-                map.insert(
-                    MintUrl::from_str(&mint.mint_url)
-                        .map_err(|e| DatabaseError::Internal(e.to_string()))?,
-                    Some(mint.try_into()?),
-                );
+                let url = MintUrl::from_str(&mint.mint_url)
+                    .map_err(|e| DatabaseError::Internal(e.to_string()))?;
+                let info: MintInfo = mint.try_into()?;
+                // A mint that published a pubkey is keyed by it, so two URLs of
+                // the same mint collapse to one entry.
+                let id = info.pubkey.map(MintId::Pubkey).unwrap_or(MintId::Url(url));
+
+                map.insert(id, Some(info));
             }
         }
         Ok(map)
@@ -976,11 +1064,16 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
 
     async fn get_mint_keysets(
         &self,
-        mint_url: MintUrl,
+        mint: &MintId,
     ) -> Result<Option<Vec<KeySetInfo>>, DatabaseError> {
+        let mint_urls = self.mint_urls_for(mint).await?;
+        if mint_urls.is_empty() {
+            return Ok(None);
+        }
+
         let path = format!(
-            "rest/v1/keyset?mint_url=eq.{}",
-            url_encode(&mint_url.to_string())
+            "rest/v1/keyset?mint_url={}",
+            Self::mint_url_in_filter(&mint_urls)
         );
         let (status, text) = self.get_request(&path).await?;
 
@@ -1137,14 +1230,21 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
 
     async fn get_proofs(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<&MintId>,
         unit: Option<CurrencyUnit>,
         state: Option<Vec<State>>,
         spending_conditions: Option<Vec<SpendingConditions>>,
     ) -> Result<Vec<ProofInfo>, DatabaseError> {
         let mut query = String::from("rest/v1/proof?select=*");
-        if let Some(url) = mint_url {
-            query.push_str(&format!("&mint_url=eq.{}", url_encode(&url.to_string())));
+        if let Some(mint) = mint {
+            let mint_urls = self.mint_urls_for(mint).await?;
+            if mint_urls.is_empty() {
+                return Ok(Vec::new());
+            }
+            query.push_str(&format!(
+                "&mint_url={}",
+                Self::mint_url_in_filter(&mint_urls)
+            ));
         }
         if let Some(u) = unit {
             query.push_str(&format!("&unit=eq.{}", url_encode(&u.to_string())));
@@ -1219,13 +1319,13 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
 
     async fn get_balance(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<&MintId>,
         unit: Option<CurrencyUnit>,
         state: Option<Vec<State>>,
     ) -> Result<u64, DatabaseError> {
         // Note: Ideally this would use a server-side SUM aggregation, but PostgREST
         // doesn't support aggregate functions directly. We fetch all proofs and sum locally.
-        let proofs = self.get_proofs(mint_url, unit, state, None).await?;
+        let proofs = self.get_proofs(mint, unit, state, None).await?;
         Ok(proofs.iter().map(|p| p.proof.amount.to_u64()).sum())
     }
 
@@ -1259,13 +1359,20 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
 
     async fn list_transactions(
         &self,
-        mint_url: Option<MintUrl>,
+        mint: Option<&MintId>,
         direction: Option<TransactionDirection>,
         unit: Option<CurrencyUnit>,
     ) -> Result<Vec<Transaction>, DatabaseError> {
         let mut query = String::from("rest/v1/transactions?select=*");
-        if let Some(url) = mint_url {
-            query.push_str(&format!("&mint_url=eq.{}", url_encode(&url.to_string())));
+        if let Some(mint) = mint {
+            let mint_urls = self.mint_urls_for(mint).await?;
+            if mint_urls.is_empty() {
+                return Ok(Vec::new());
+            }
+            query.push_str(&format!(
+                "&mint_url={}",
+                Self::mint_url_in_filter(&mint_urls)
+            ));
         }
         if let Some(d) = direction {
             query.push_str(&format!("&direction=eq.{}", url_encode(&d.to_string())));
@@ -1441,54 +1548,58 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         let old_encoded = url_encode(&old_mint_url.to_string());
         let update_body = serde_json::json!({ "mint_url": new_mint_url.to_string() });
 
-        // Update mint table first (parent table)
-        let path = format!("rest/v1/mint?mint_url=eq.{}", old_encoded);
-        let (status, response_text) = self.patch_request(&path, &update_body).await?;
+        // The mint row first, then every table that references it. Missing one
+        // strands its rows under a mint the wallet no longer knows about.
+        for table in [
+            "mint",
+            "keyset",
+            "mint_quote",
+            "melt_quote",
+            "proof",
+            "transactions",
+        ] {
+            let path = format!("rest/v1/{}?mint_url=eq.{}", table, old_encoded);
+            let (status, response_text) = self.patch_request(&path, &update_body).await?;
+            if !status.is_success() {
+                return Err(DatabaseError::Internal(format!(
+                    "update_mint_url ({}) failed: HTTP {} - {}",
+                    table, status, response_text
+                )));
+            }
+        }
+
+        // Sagas keep the whole `WalletSaga` in a JSON column, so there is no
+        // mint_url to filter or patch directly; each one has to be rewritten.
+        let (status, text) = self.get_request("rest/v1/saga").await?;
         if !status.is_success() {
             return Err(DatabaseError::Internal(format!(
-                "update_mint_url (mint) failed: HTTP {} - {}",
-                status, response_text
+                "update_mint_url (saga) failed: HTTP {} - {}",
+                status, text
             )));
         }
 
-        // Update keyset table
-        let path = format!("rest/v1/keyset?mint_url=eq.{}", old_encoded);
-        let (status, response_text) = self.patch_request(&path, &update_body).await?;
-        if !status.is_success() {
-            return Err(DatabaseError::Internal(format!(
-                "update_mint_url (keyset) failed: HTTP {} - {}",
-                status, response_text
-            )));
-        }
+        for item in Self::parse_response::<SagaTable>(&text)?.unwrap_or_default() {
+            let mut saga: WalletSaga = serde_json::from_str(&item.data)
+                .map_err(|e| DatabaseError::Internal(format!("Deserialize saga: {e}")))?;
 
-        // Update mint_quote table
-        let path = format!("rest/v1/mint_quote?mint_url=eq.{}", old_encoded);
-        let (status, response_text) = self.patch_request(&path, &update_body).await?;
-        if !status.is_success() {
-            return Err(DatabaseError::Internal(format!(
-                "update_mint_url (mint_quote) failed: HTTP {} - {}",
-                status, response_text
-            )));
-        }
+            if saga.mint_url != old_mint_url {
+                continue;
+            }
 
-        // Update proof table
-        let path = format!("rest/v1/proof?mint_url=eq.{}", old_encoded);
-        let (status, response_text) = self.patch_request(&path, &update_body).await?;
-        if !status.is_success() {
-            return Err(DatabaseError::Internal(format!(
-                "update_mint_url (proof) failed: HTTP {} - {}",
-                status, response_text
-            )));
-        }
+            saga.mint_url = new_mint_url.clone();
+            let data = serde_json::to_string(&saga)
+                .map_err(|e| DatabaseError::Internal(format!("Serialize saga: {e}")))?;
 
-        // Update transactions table
-        let path = format!("rest/v1/transactions?mint_url=eq.{}", old_encoded);
-        let (status, response_text) = self.patch_request(&path, &update_body).await?;
-        if !status.is_success() {
-            return Err(DatabaseError::Internal(format!(
-                "update_mint_url (transactions) failed: HTTP {} - {}",
-                status, response_text
-            )));
+            let path = format!("rest/v1/saga?id=eq.{}", url_encode(&item.id));
+            let (status, response_text) = self
+                .patch_request(&path, &serde_json::json!({ "data": data }))
+                .await?;
+            if !status.is_success() {
+                return Err(DatabaseError::Internal(format!(
+                    "update_mint_url (saga {}) failed: HTTP {} - {}",
+                    item.id, status, response_text
+                )));
+            }
         }
 
         Ok(())
@@ -1568,30 +1679,47 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         Ok(())
     }
 
-    async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), DatabaseError> {
-        let path = format!(
-            "rest/v1/mint?mint_url=eq.{}",
-            url_encode(&mint_url.to_string())
-        );
-        let (status, response_text) = self.delete_request(&path).await?;
+    async fn remove_mint(&self, mint: &MintId) -> Result<(), DatabaseError> {
+        let mint_urls = self.mint_urls_for(mint).await?;
+        if mint_urls.is_empty() {
+            return Ok(());
+        }
+        let filter = Self::mint_url_in_filter(&mint_urls);
 
-        if !status.is_success() {
-            return Err(DatabaseError::Internal(format!(
-                "remove_mint failed: HTTP {} - {}",
-                status, response_text
-            )));
+        // Keysets are deleted explicitly rather than by cascade, matching the
+        // other backends now that a mint can be identified by pubkey instead.
+        for table in ["keyset", "mint"] {
+            let path = format!("rest/v1/{}?mint_url={}", table, filter);
+            let (status, response_text) = self.delete_request(&path).await?;
+
+            if !status.is_success() {
+                return Err(DatabaseError::Internal(format!(
+                    "remove_mint ({}) failed: HTTP {} - {}",
+                    table, status, response_text
+                )));
+            }
         }
         Ok(())
     }
 
     async fn add_mint_keysets(
         &self,
-        mint_url: MintUrl,
+        mint: &MintId,
         keysets: Vec<KeySetInfo>,
     ) -> Result<(), DatabaseError> {
         if keysets.is_empty() {
             return Ok(());
         }
+
+        // Keysets are stored against a URL, so a pubkey-identified mint records
+        // them under the first URL it resolves to.
+        let mint_url = self
+            .mint_urls_for(mint)
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|url| MintUrl::from_str(&url).ok())
+            .ok_or_else(|| DatabaseError::Internal(format!("unknown mint {mint}")))?;
 
         let items: Result<Vec<KeySetTable>, DatabaseError> = keysets
             .into_iter()
