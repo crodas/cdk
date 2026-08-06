@@ -158,8 +158,12 @@ where
     T: DatabaseExecutor,
 {
     for table in MINT_URL_TABLES {
+        // Skipping rows that already carry the identity keeps a routine metadata
+        // refresh from rewriting every proof the mint holds.
         query(&format!(
-            "UPDATE {table} SET mint_pubkey = :mint_pubkey WHERE mint_url = :mint_url"
+            "UPDATE {table} SET mint_pubkey = :mint_pubkey
+             WHERE mint_url = :mint_url
+               AND (mint_pubkey IS NULL OR mint_pubkey <> :mint_pubkey)"
         ))?
         .bind("mint_pubkey", pubkey.to_string())
         .bind("mint_url", mint_url.to_string())
@@ -1309,7 +1313,19 @@ where
             .map_err(|e| Error::Database(Box::new(e)))?;
         let tx = ConnectionWithTransaction::new(conn).await?;
 
+        // A batch is nearly always one mint's proofs, so the identity is
+        // resolved per distinct URL rather than per proof.
+        let mut identities: HashMap<MintUrl, Option<String>> = HashMap::new();
+        for proof in &added {
+            if !identities.contains_key(&proof.mint_url) {
+                let pubkey = promoted_pubkey(&tx, &proof.mint_url).await?;
+                identities.insert(proof.mint_url.clone(), pubkey);
+            }
+        }
+
         for proof in added {
+            let mint_pubkey = identities.get(&proof.mint_url).cloned().flatten();
+
             query(
                 r#"
     INSERT INTO proof
@@ -1338,7 +1354,7 @@ where
             )?
             .bind("y", proof.y.to_bytes().to_vec())
             .bind("mint_url", proof.mint_url.to_string())
-            .bind("mint_pubkey", promoted_pubkey(&tx, &proof.mint_url).await?)
+            .bind("mint_pubkey", mint_pubkey)
             .bind("state", proof.state.to_string())
             .bind(
                 "spending_condition",
@@ -1600,11 +1616,12 @@ where
 
         // Never resurrect a URL-keyed row for a mint that has already moved:
         // a mint must appear in exactly one of the two tables.
-        if promoted_pubkey(&tx, &mint_url).await?.is_some() {
+        if let Some(promoted) = promoted_pubkey(&tx, &mint_url).await? {
+            // Keyed on the identity this URL belongs to, not on whatever key the
+            // mint just claimed: if that claim was refused above, writing it here
+            // would leave an identity nothing points at.
             if let Some(info) = mint_info.as_ref() {
-                if let Some(pubkey) = info.pubkey {
-                    upsert_identity(&tx, &hex_pubkey(&pubkey), info, unix_time()).await?;
-                }
+                upsert_identity(&tx, &promoted, info, unix_time()).await?;
             }
             tx.commit().await?;
             return Ok(());

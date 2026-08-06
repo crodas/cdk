@@ -2175,6 +2175,149 @@ where
     );
 }
 
+/// A URL that is one of several reaching an identity may not change its key.
+///
+/// Retagging would split an identity the other URLs still point at, and nothing
+/// says which of them the new key belongs to. The wrong guess would move funds
+/// between mints, so the claim is recorded instead.
+pub async fn mint_identity_rotation_multi_locator_is_refused<DB>(db: DB)
+where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let a = test_mint_url();
+    let b = test_mint_url_2();
+    let shared = SecretKey::generate().public_key();
+    let rotated = SecretKey::generate().public_key();
+
+    // Both URLs reach one identity, by the incumbent's own advertisement.
+    let mut info = info_with_pubkey(shared);
+    info.urls = Some(vec![b.to_string()]);
+    db.add_mint(a.clone(), Some(info)).await.unwrap();
+    db.update_proofs(
+        vec![test_proof_info(test_keyset_id(), 7, a.clone())],
+        vec![],
+    )
+    .await
+    .unwrap();
+    db.add_mint(b.clone(), Some(info_with_pubkey(shared)))
+        .await
+        .unwrap();
+    db.update_proofs(
+        vec![test_proof_info(test_keyset_id_2(), 70, b.clone())],
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.mint_urls(&MintId::Pubkey(shared)).await.unwrap().len(),
+        2
+    );
+
+    // Now one of them claims a different key.
+    db.add_mint(a.clone(), Some(info_with_pubkey(rotated)))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.resolve_mint(&a).await.unwrap(),
+        Some(MintId::Pubkey(shared)),
+        "rotation split an identity that several URLs share"
+    );
+
+    let claims = db.list_mint_identity_claims().await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].mint_url, a);
+    assert_eq!(claims[0].pubkey, rotated);
+    assert_eq!(claims[0].kind, MintIdentityClaimKind::Rotation);
+
+    // The identity is untouched: same URLs, same funds, no stray identity.
+    assert_eq!(
+        db.mint_urls(&MintId::Pubkey(shared)).await.unwrap().len(),
+        2
+    );
+    assert_eq!(
+        db.get_balance(Some(&MintId::Pubkey(shared)), None, None)
+            .await
+            .unwrap(),
+        77
+    );
+    assert_eq!(db.list_mint_identities().await.unwrap().len(), 1);
+}
+
+/// A promoted mint that moves to a new URL takes everything with it.
+///
+/// A promoted mint has no URL-keyed row; it is its locator that moves, which is
+/// a different path from the one a URL-identified mint takes.
+pub async fn update_mint_url_moves_promoted_mint<DB>(db: DB)
+where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let old_url = test_mint_url();
+    let new_url = test_mint_url_2();
+    let pubkey = SecretKey::generate().public_key();
+    let keyset_id = test_keyset_id();
+
+    db.add_mint(old_url.clone(), Some(info_with_pubkey(pubkey)))
+        .await
+        .unwrap();
+
+    let mint = MintId::Pubkey(pubkey);
+    db.add_mint_keysets(&mint, vec![test_keyset_info(keyset_id, &old_url)])
+        .await
+        .unwrap();
+    db.update_proofs(
+        vec![test_proof_info(keyset_id, 64, old_url.clone())],
+        vec![],
+    )
+    .await
+    .unwrap();
+    db.add_transaction(test_transaction(
+        old_url.clone(),
+        TransactionDirection::Incoming,
+    ))
+    .await
+    .unwrap();
+    let saga = test_wallet_saga(old_url.clone());
+    db.add_saga(saga.clone()).await.unwrap();
+
+    db.update_mint_url(old_url.clone(), new_url.clone())
+        .await
+        .unwrap();
+
+    // The identity is unchanged; only where it answers moved.
+    assert_eq!(
+        db.resolve_mint(&new_url).await.unwrap(),
+        Some(mint.clone()),
+        "the new URL does not reach the identity"
+    );
+    assert!(db.resolve_mint(&old_url).await.unwrap().is_none());
+    assert_eq!(db.mint_urls(&mint).await.unwrap(), vec![new_url.clone()]);
+
+    // And it still holds everything it held.
+    assert_eq!(db.get_balance(Some(&mint), None, None).await.unwrap(), 64);
+    assert_eq!(
+        db.get_mint_keysets(&mint)
+            .await
+            .unwrap()
+            .unwrap_or_default()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.list_transactions(Some(&mint), None, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.get_saga(&saga.id).await.unwrap().unwrap().mint_url,
+        new_url,
+        "saga still points at the old mint url"
+    );
+    assert_eq!(db.list_mint_identities().await.unwrap().len(), 1);
+}
+
 /// Removing the last URL of an identity removes the identity.
 pub async fn remove_mint_drops_orphan_identity<DB>(db: DB)
 where
@@ -2212,6 +2355,8 @@ macro_rules! wallet_identity_db_test {
             mint_identity_corroborated_merge_is_automatic,
             mint_identity_merge_resolution,
             mint_identity_rotation_sole_locator,
+            mint_identity_rotation_multi_locator_is_refused,
+            update_mint_url_moves_promoted_mint,
             remove_mint_drops_orphan_identity
         );
     };
