@@ -53,6 +53,99 @@ impl WalletKey {
     }
 }
 
+/// Identifier used to select a mint's wallet.
+///
+/// A mint's public key is its stable identity (a mint URL can move, see
+/// `update_mint_url`), so lookups favor the key. The NUT-06 pubkey is optional,
+/// so [`MintId::Url`] is the fallback for mints that advertise none.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum MintId {
+    /// Mint public key (NUT-06)
+    PublicKey(PublicKey),
+    /// Mint URL
+    Url(MintUrl),
+}
+
+impl MintId {
+    /// Favor the pubkey when the mint advertises one, else fall back to the URL.
+    pub fn prefer_pubkey(mint_url: MintUrl, pubkey: Option<PublicKey>) -> Self {
+        match pubkey {
+            Some(pubkey) => MintId::PublicKey(pubkey),
+            None => MintId::Url(mint_url),
+        }
+    }
+}
+
+impl fmt::Display for MintId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MintId::PublicKey(pubkey) => write!(f, "{pubkey}"),
+            MintId::Url(mint_url) => write!(f, "{mint_url}"),
+        }
+    }
+}
+
+impl From<PublicKey> for MintId {
+    fn from(pubkey: PublicKey) -> Self {
+        MintId::PublicKey(pubkey)
+    }
+}
+
+impl From<MintUrl> for MintId {
+    fn from(mint_url: MintUrl) -> Self {
+        MintId::Url(mint_url)
+    }
+}
+
+impl From<&PublicKey> for MintId {
+    fn from(pubkey: &PublicKey) -> Self {
+        MintId::PublicKey(*pubkey)
+    }
+}
+
+impl From<&MintUrl> for MintId {
+    fn from(mint_url: &MintUrl) -> Self {
+        MintId::Url(mint_url.clone())
+    }
+}
+
+impl From<&MintId> for MintId {
+    fn from(mint_id: &MintId) -> Self {
+        mint_id.clone()
+    }
+}
+
+impl FromStr for MintId {
+    type Err = Error;
+
+    /// Parse as a public key first, then as a URL, then fail.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Ok(pubkey) = PublicKey::from_str(s) {
+            return Ok(MintId::PublicKey(pubkey));
+        }
+        if let Ok(mint_url) = MintUrl::from_str(s) {
+            return Ok(MintId::Url(mint_url));
+        }
+        Err(Error::InvalidMintId(s.to_string()))
+    }
+}
+
+impl TryFrom<&str> for MintId {
+    type Error = Error;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl TryFrom<String> for MintId {
+    type Error = Error;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
 /// Proof info
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofInfo {

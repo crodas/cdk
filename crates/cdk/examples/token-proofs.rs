@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get the keysets for this mint using a wallet
     let mint_wallet = wallet
         .get_wallets_for_mint(&mint_url)
-        .await
+        .await?
         .into_iter()
         .next()
         .ok_or("No wallet found for mint")?;

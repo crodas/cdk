@@ -100,26 +100,24 @@ impl WalletRepository {
     ///
     /// # Arguments
     ///
-    /// * `mint_url` - The mint URL to set the TTL for
+    /// * `mint_id` - Mint identifier (public key hex or URL) to set the TTL for
     /// * `ttl_secs` - Optional TTL in seconds. If None, cache never expires.
     pub async fn set_metadata_cache_ttl_for_mint(
         &self,
-        mint_url: MintUrl,
+        mint_id: String,
         ttl_secs: Option<u64>,
     ) -> Result<(), FfiError> {
-        let cdk_mint_url: cdk::mint_url::MintUrl = mint_url.try_into()?;
-        let wallets = self.inner.get_wallets().await;
+        let wallets = self.inner.get_wallets_for_mint(mint_id).await?;
 
-        if let Some(wallet) = wallets.iter().find(|w| w.mint_url == cdk_mint_url) {
-            let ttl = ttl_secs.map(std::time::Duration::from_secs);
-            wallet.set_metadata_cache_ttl(ttl);
-            Ok(())
-        } else {
-            Err(FfiError::internal(format!(
-                "Mint not found: {}",
-                cdk_mint_url
-            )))
+        if wallets.is_empty() {
+            return Err(FfiError::internal("Mint not found"));
         }
+
+        let ttl = ttl_secs.map(std::time::Duration::from_secs);
+        for wallet in wallets {
+            wallet.set_metadata_cache_ttl(ttl);
+        }
+        Ok(())
     }
 
     /// Set metadata cache TTL (time-to-live) in seconds for all mints
@@ -189,22 +187,18 @@ impl WalletRepository {
         ))))
     }
 
-    /// Remove mint from WalletRepository
+    /// Remove a wallet from the WalletRepository by mint identifier and unit
+    ///
+    /// The identifier is a mint public key hex or URL (public key preferred).
     pub async fn remove_wallet(
         &self,
-        mint_url: MintUrl,
+        mint_id: String,
         currency_unit: CurrencyUnit,
     ) -> Result<(), FfiError> {
-        // 1. Convert MintUrl safely without unwrap()
-        let cdk_mint_url: cdk::mint_url::MintUrl = mint_url
-            .try_into()
-            .map_err(|_| FfiError::internal("invalid mint url"))?; // Map the error to your FfiError type
-
-        // 2. Await the inner call and propagate its result with '?'
         self.inner
-            .remove_wallet(cdk_mint_url, currency_unit.into())
+            .remove_wallet(mint_id, currency_unit.into())
             .await
-            .map_err(|e| e.into()) // Ensure the inner error can convert to FfiError
+            .map_err(|e| e.into())
     }
 
     /// Wait until the rate-limit budgets drawn down by every wallet in this
@@ -218,13 +212,9 @@ impl WalletRepository {
         self.inner.flush_rate_limits().await;
     }
 
-    /// Check if mint is in wallet
-    pub async fn has_mint(&self, mint_url: MintUrl) -> bool {
-        if let Ok(cdk_mint_url) = mint_url.try_into() {
-            self.inner.has_mint(&cdk_mint_url).await
-        } else {
-            false
-        }
+    /// Check if a mint is in the wallet, by mint identifier (public key or URL)
+    pub async fn has_mint(&self, mint_id: String) -> bool {
+        self.inner.has_mint(mint_id).await
     }
 
     /// Get the NUT-27 mint backup public key as hex.
@@ -272,7 +262,12 @@ impl WalletRepository {
         let balances = self.inner.get_balances().await?;
         let mut balance_map = HashMap::new();
         for (wallet_key, amount) in balances {
-            balance_map.insert(wallet_key.into(), amount.into());
+            let mint_id = self.inner.mint_id_for(&wallet_key.mint_url).await;
+            let key = WalletKey {
+                mint_id: mint_id.to_string(),
+                unit: wallet_key.unit.into(),
+            };
+            balance_map.insert(key, amount.into());
         }
         Ok(balance_map)
     }
@@ -286,17 +281,17 @@ impl WalletRepository {
             .collect()
     }
 
-    /// Get a specific wallet from WalletRepository by mint URL
+    /// Get a specific wallet from WalletRepository by mint identifier and unit
     ///
-    /// Returns an error if no wallet exists for the given mint URL.
+    /// The identifier is a mint public key hex or URL (public key preferred).
+    /// Returns an error if no wallet exists for the resolved mint and unit.
     pub async fn get_wallet(
         &self,
-        mint_url: MintUrl,
+        mint_id: String,
         unit: CurrencyUnit,
     ) -> Result<Arc<crate::wallet::Wallet>, FfiError> {
-        let cdk_mint_url: cdk::mint_url::MintUrl = mint_url.try_into()?;
         let unit_cdk: cdk::nuts::CurrencyUnit = unit.into();
-        let wallet = self.inner.get_wallet(&cdk_mint_url, &unit_cdk).await?;
+        let wallet = self.inner.get_wallet(mint_id, &unit_cdk).await?;
         Ok(Arc::new(crate::wallet::Wallet::from_inner(Arc::new(
             wallet,
         ))))
@@ -372,7 +367,10 @@ mod tests {
 
         assert_eq!(wallet.mint_url(), mint_url());
         assert_eq!(wallet.unit(), CurrencyUnit::Sat);
-        assert!(repo.get_wallet(mint_url(), CurrencyUnit::Sat).await.is_ok());
+        assert!(repo
+            .get_wallet(mint_url().url, CurrencyUnit::Sat)
+            .await
+            .is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -406,8 +404,14 @@ mod tests {
 
         assert_eq!(sat.unit(), CurrencyUnit::Sat);
         assert_eq!(usd.unit(), CurrencyUnit::Usd);
-        assert!(repo.get_wallet(mint_url(), CurrencyUnit::Sat).await.is_ok());
-        assert!(repo.get_wallet(mint_url(), CurrencyUnit::Usd).await.is_ok());
+        assert!(repo
+            .get_wallet(mint_url().url, CurrencyUnit::Sat)
+            .await
+            .is_ok());
+        assert!(repo
+            .get_wallet(mint_url().url, CurrencyUnit::Usd)
+            .await
+            .is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread")]

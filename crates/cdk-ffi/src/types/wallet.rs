@@ -11,7 +11,7 @@ use super::amount::{Amount, SplitTarget};
 use super::proof::{Proofs, SpendingConditions};
 use crate::error::FfiError;
 use crate::token::Token;
-use crate::{CurrencyUnit, MintUrl, PublicKey};
+use crate::{CurrencyUnit, PublicKey};
 
 /// FFI-compatible SendMemo
 #[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
@@ -1040,32 +1040,15 @@ impl From<cdk::wallet::MeltConfirmOptions> for MeltConfirmOptions {
 }
 
 /// FFI-compatible WalletKey
+///
+/// `mint_id` is the mint's public key hex when it advertises one, otherwise its
+/// URL (see `WalletRepository::mint_id_for`).
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct WalletKey {
-    /// Mint Url
-    pub mint_url: MintUrl,
+    /// Mint identifier (public key hex or URL)
+    pub mint_id: String,
     /// Currency Unit
     pub unit: CurrencyUnit,
-}
-
-impl TryFrom<WalletKey> for cdk::WalletKey {
-    type Error = FfiError;
-
-    fn try_from(value: WalletKey) -> Result<Self, Self::Error> {
-        Ok(Self {
-            mint_url: value.mint_url.try_into()?,
-            unit: value.unit.into(),
-        })
-    }
-}
-
-impl From<cdk::WalletKey> for WalletKey {
-    fn from(value: cdk::WalletKey) -> Self {
-        Self {
-            mint_url: value.mint_url.into(),
-            unit: value.unit.into(),
-        }
-    }
 }
 
 #[cfg(test)]

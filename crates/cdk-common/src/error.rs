@@ -366,6 +366,9 @@ pub enum Error {
     #[error("Unknown wallet: `{0}`")]
     #[cfg(feature = "wallet")]
     UnknownWallet(WalletKey),
+    /// Invalid mint identifier (neither a public key nor a URL)
+    #[error("Invalid mint identifier: `{0}`")]
+    InvalidMintId(String),
     /// Max Fee Ecxeded
     #[error("Max fee exceeded")]
     MaxFeeExceeded,
@@ -827,6 +830,12 @@ impl Error {
             // Catch-all
             _ => false,
         }
+    }
+}
+
+impl From<std::convert::Infallible> for Error {
+    fn from(err: std::convert::Infallible) -> Self {
+        match err {}
     }
 }
 

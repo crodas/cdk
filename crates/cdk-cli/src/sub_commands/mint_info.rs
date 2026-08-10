@@ -24,7 +24,12 @@ pub async fn mint_info(
                 println!("{}", escape_control(&serde_json::to_string_pretty(&info)?));
             }
             Err(fetch_err) => {
-                let wallets: Vec<Wallet> = wallet_repository.get_wallets_for_mint(mint_url).await;
+                let wallets: Vec<Wallet> = wallet_repository
+                    .get_wallets_for_mint(mint_url)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("Cannot fetch mint info {mint_url}: fetch failed {fetch_err}, lookup failed {e}")
+                    })?;
 
                 if let Some(wallet) = wallets.first() {
                     match wallet.load_mint_info().await {

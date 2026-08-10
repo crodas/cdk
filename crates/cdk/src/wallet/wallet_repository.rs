@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use cdk_common::database;
 use cdk_common::database::WalletDatabase;
-use cdk_common::wallet::WalletKey;
+use cdk_common::wallet::{MintId, WalletKey};
 use tokio::sync::RwLock;
 use tracing::instrument;
 use zeroize::Zeroize;
@@ -337,16 +337,67 @@ impl WalletRepository {
         &self.seed
     }
 
-    /// Get wallet for a mint URL and currency unit
+    /// Resolve a [`MintId`] to the mint URL used as the internal storage key.
     ///
-    /// Returns an error if no wallet exists for the given mint URL and unit combination.
-    #[instrument(skip(self))]
-    pub async fn get_wallet(
-        &self,
-        mint_url: &MintUrl,
-        unit: &CurrencyUnit,
-    ) -> Result<Wallet, Error> {
-        let key = WalletKey::new(mint_url.clone(), unit.clone());
+    /// A [`MintId::PublicKey`] is mapped to its URL through the persisted mint
+    /// info (the pubkey advertised via NUT-06). Mints without a stored pubkey
+    /// can only be selected by [`MintId::Url`].
+    async fn resolve_mint_id(&self, id: &MintId) -> Result<MintUrl, Error> {
+        match id {
+            MintId::Url(mint_url) => Ok(mint_url.clone()),
+            MintId::PublicKey(pubkey) => {
+                let mints = self.localstore.get_mints().await.map_err(Error::Database)?;
+                mints
+                    .into_iter()
+                    .find_map(|(mint_url, info)| {
+                        info.and_then(|info| info.pubkey)
+                            .filter(|stored| stored == pubkey)
+                            .map(|_| mint_url)
+                    })
+                    .ok_or_else(|| Error::UnknownMint {
+                        mint_url: id.to_string(),
+                    })
+            }
+        }
+    }
+
+    /// Build the preferred [`MintId`] for a mint URL: its stored NUT-06 pubkey
+    /// when the mint advertises one, else the URL.
+    pub async fn mint_id_for(&self, mint_url: &MintUrl) -> MintId {
+        let pubkey = self
+            .localstore
+            .get_mint(mint_url.clone())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|info| info.pubkey);
+        MintId::prefer_pubkey(mint_url.clone(), pubkey)
+    }
+
+    /// Resolve an identifier to a mint URL, returning `None` on a parse or
+    /// resolution miss. Used by the boolean lookups.
+    async fn try_resolve_mint_id<T>(&self, id: T) -> Option<MintUrl>
+    where
+        T: TryInto<MintId>,
+        Error: From<T::Error>,
+    {
+        let id = id.try_into().ok()?;
+        self.resolve_mint_id(&id).await.ok()
+    }
+
+    /// Get wallet for a mint identifier and currency unit
+    ///
+    /// The identifier is parsed as a mint public key first, then as a URL. See
+    /// [`MintId`]. Returns an error if no wallet exists for the resolved mint
+    /// and unit combination.
+    #[instrument(skip(self, id))]
+    pub async fn get_wallet<T>(&self, id: T, unit: &CurrencyUnit) -> Result<Wallet, Error>
+    where
+        T: TryInto<MintId>,
+        Error: From<T::Error>,
+    {
+        let mint_url = self.resolve_mint_id(&id.try_into()?).await?;
+        let key = WalletKey::new(mint_url, unit.clone());
         self.wallets
             .read()
             .await
@@ -355,16 +406,22 @@ impl WalletRepository {
             .ok_or_else(|| Error::UnknownWallet(key))
     }
 
-    /// Get all wallets for a specific mint URL (any currency unit)
-    #[instrument(skip(self))]
-    pub async fn get_wallets_for_mint(&self, mint_url: &MintUrl) -> Vec<Wallet> {
-        self.wallets
+    /// Get all wallets for a specific mint identifier (any currency unit)
+    #[instrument(skip(self, id))]
+    pub async fn get_wallets_for_mint<T>(&self, id: T) -> Result<Vec<Wallet>, Error>
+    where
+        T: TryInto<MintId>,
+        Error: From<T::Error>,
+    {
+        let mint_url = self.resolve_mint_id(&id.try_into()?).await?;
+        Ok(self
+            .wallets
             .read()
             .await
             .iter()
-            .filter(|(key, _)| &key.mint_url == mint_url)
+            .filter(|(key, _)| key.mint_url == mint_url)
             .map(|(_, wallet)| wallet.clone())
-            .collect()
+            .collect())
     }
 
     /// Create an OIDC client using a wallet connector for this mint when available.
@@ -375,17 +432,25 @@ impl WalletRepository {
         openid_discovery: String,
         client_id: Option<String>,
     ) -> OidcClient {
-        match self.get_wallets_for_mint(mint_url).await.into_iter().next() {
+        match self
+            .get_wallets_for_mint(mint_url)
+            .await
+            .ok()
+            .and_then(|wallets| wallets.into_iter().next())
+        {
             Some(wallet) => wallet.oidc_client(openid_discovery, client_id),
             None => OidcClient::new(openid_discovery, client_id),
         }
     }
 
-    /// Check if a specific wallet exists (mint URL + unit combination)
-    #[instrument(skip(self))]
-    pub async fn has_wallet(&self, mint_url: &MintUrl, unit: &CurrencyUnit) -> bool {
-        let key = WalletKey::new(mint_url.clone(), unit.clone());
-        self.wallets.read().await.contains_key(&key)
+    /// Check if a specific wallet exists (mint identifier + unit combination)
+    #[instrument(skip(self, id))]
+    pub async fn has_wallet<T>(&self, id: T, unit: &CurrencyUnit) -> bool
+    where
+        T: TryInto<MintId>,
+        Error: From<T::Error>,
+    {
+        self.get_wallet(id, unit).await.is_ok()
     }
 
     /// Add wallets for a mint to the repository
@@ -460,14 +525,20 @@ impl WalletRepository {
 
     /// Update configuration for an existing mint and unit
     ///
-    /// This re-creates the wallet with the new configuration.
-    #[instrument(skip(self, config))]
-    pub async fn set_mint_config(
+    /// This re-creates the wallet with the new configuration. The identifier is
+    /// resolved to the known mint URL, so the mint must already exist.
+    #[instrument(skip(self, id, config))]
+    pub async fn set_mint_config<T>(
         &self,
-        mint_url: MintUrl,
+        id: T,
         unit: CurrencyUnit,
         config: WalletConfig,
-    ) -> Result<Wallet, Error> {
+    ) -> Result<Wallet, Error>
+    where
+        T: TryInto<MintId>,
+        Error: From<T::Error>,
+    {
+        let mint_url = self.resolve_mint_id(&id.try_into()?).await?;
         // Re-create wallet with new config
         self.create_wallet(mint_url, unit, Some(config)).await
     }
@@ -518,12 +589,13 @@ impl WalletRepository {
     /// live budget rather than starting full and bursting again. Once no wallet
     /// holds it and its budget has fully recovered, a later wallet creation
     /// evicts it; the persisted budget still survives a re-add.
-    #[instrument(skip(self))]
-    pub async fn remove_wallet(
-        &self,
-        mint_url: MintUrl,
-        currency_unit: CurrencyUnit,
-    ) -> Result<(), Error> {
+    #[instrument(skip(self, id))]
+    pub async fn remove_wallet<T>(&self, id: T, currency_unit: CurrencyUnit) -> Result<(), Error>
+    where
+        T: TryInto<MintId>,
+        Error: From<T::Error>,
+    {
+        let mint_url = self.resolve_mint_id(&id.try_into()?).await?;
         let key = WalletKey::new(mint_url, currency_unit);
         let mut wallets = self.wallets.write().await;
 
@@ -542,13 +614,21 @@ impl WalletRepository {
     }
 
     /// Check if any wallet exists for a mint (regardless of currency unit)
-    #[instrument(skip(self))]
-    pub async fn has_mint(&self, mint_url: &MintUrl) -> bool {
+    #[instrument(skip(self, id))]
+    pub async fn has_mint<T>(&self, id: T) -> bool
+    where
+        T: TryInto<MintId>,
+        Error: From<T::Error>,
+    {
+        let mint_url = match self.try_resolve_mint_id(id).await {
+            Some(mint_url) => mint_url,
+            None => return false,
+        };
         self.wallets
             .read()
             .await
             .keys()
-            .any(|key| &key.mint_url == mint_url)
+            .any(|key| key.mint_url == mint_url)
     }
     /// Get balances for all wallets
     ///
@@ -1207,6 +1287,60 @@ mod tests {
         assert!(repo.has_wallet(&mint_url, &CurrencyUnit::Sat).await);
         let retrieved = repo.get_wallet(&mint_url, &CurrencyUnit::Sat).await;
         assert!(retrieved.is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_wallet_resolves_by_mint_pubkey_and_url() {
+        use cdk_common::nuts::SecretKey;
+        use cdk_common::wallet::MintId;
+
+        let repo = create_test_repository().await;
+
+        // Mint A advertises a pubkey; mint B does not.
+        let pubkey = SecretKey::generate().public_key();
+        let mint_a: MintUrl = "https://mint-a.example.com".parse().unwrap();
+        let mint_b: MintUrl = "https://mint-b.example.com".parse().unwrap();
+
+        repo.create_wallet(mint_a.clone(), CurrencyUnit::Sat, None)
+            .await
+            .expect("mint A wallet should be created");
+        repo.create_wallet(mint_b.clone(), CurrencyUnit::Sat, None)
+            .await
+            .expect("mint B wallet should be created");
+        repo.localstore
+            .add_mint(
+                mint_a.clone(),
+                Some(mint_info_with_units(vec![CurrencyUnit::Sat]).pubkey(pubkey)),
+            )
+            .await
+            .expect("mint A metadata should persist");
+
+        // A public key selects the mint that advertises it.
+        let by_pubkey = repo
+            .get_wallet(MintId::PublicKey(pubkey), &CurrencyUnit::Sat)
+            .await
+            .expect("pubkey should resolve to mint A");
+        assert_eq!(by_pubkey.mint_url, mint_a);
+
+        // A mint without a pubkey is still reachable by URL.
+        let by_url = repo
+            .get_wallet(MintId::Url(mint_b.clone()), &CurrencyUnit::Sat)
+            .await
+            .expect("url should resolve to mint B");
+        assert_eq!(by_url.mint_url, mint_b);
+
+        // The parsing form accepts the pubkey as a hex string.
+        assert!(repo
+            .get_wallet(pubkey.to_hex(), &CurrencyUnit::Sat)
+            .await
+            .is_ok());
+
+        // An unknown public key does not resolve.
+        let unknown = SecretKey::generate().public_key();
+        let miss = repo
+            .get_wallet(MintId::PublicKey(unknown), &CurrencyUnit::Sat)
+            .await;
+        assert!(matches!(miss, Err(Error::UnknownMint { .. })));
     }
 
     #[tokio::test]
