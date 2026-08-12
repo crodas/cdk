@@ -214,6 +214,22 @@ jobs:
           useDaemon: false
         continue-on-error: true
 
+      - name: Verify cross-build toolchain
+        working-directory: cdk-nitro/rust
+        shell: bash
+        run: |
+          # A missing target otherwise surfaces minutes later as a confusing
+          # "can't find crate for `core`" in the middle of a dependency build.
+          echo "cdk flake commit: $(git -C ../../cdk rev-parse HEAD) (CDK_REF=${CDK_REF})"
+          nix develop -L ../../cdk#cross-build --command bash -c '
+            set -euo pipefail
+            echo "shell targets: ${CROSS_BUILD_TARGETS:-<unset>}"
+            if [ ! -d "$(rustc --print sysroot)/lib/rustlib/${{ matrix.target }}/lib" ]; then
+              echo "::error::${{ matrix.target }} is missing from the cross-build shell. Point CDK_REF at a commit whose flake.nix lists it."
+              exit 1
+            fi
+          '
+
       - name: Build (Nix)
         working-directory: cdk-nitro/rust
         run: |

@@ -117,17 +117,31 @@
           else
             null;
 
+        # Cross-compilation targets, shared by every toolchain that needs them so
+        # the release workflow matrices cannot drift away from what the shells
+        # actually install.
+        androidCrossTargets = [
+          "aarch64-linux-android"
+          "armv7-linux-androideabi"
+          "i686-linux-android"
+          "x86_64-linux-android"
+        ];
+
+        # Matches the Apple matrix in the swift and nitro publish workflows.
+        appleCrossTargets = [
+          "aarch64-apple-ios"
+          "aarch64-apple-ios-sim"
+          "x86_64-apple-ios"
+          "aarch64-apple-darwin"
+          "x86_64-apple-darwin"
+        ];
+
+        crossTargets = androidCrossTargets ++ appleCrossTargets;
+
         # Toolchains
         # latest stable
         stable_toolchain = pkgs.rust-bin.stable."1.97.1".default.override {
-          targets = [
-            "wasm32-unknown-unknown"
-            "aarch64-apple-ios"
-            "x86_64-apple-ios"
-            "aarch64-apple-ios-sim"
-            "aarch64-apple-darwin"
-            "x86_64-apple-darwin"
-          ];
+          targets = [ "wasm32-unknown-unknown" ] ++ appleCrossTargets;
           extensions = [
             "rustfmt"
             "clippy"
@@ -1679,61 +1693,68 @@
             # Shell for cross-compiling Rust to Android/iOS/macOS (used by Kotlin + Nitro publish workflows)
             cross-build =
               let
-                pkgsAndroid = import nixpkgs {
-                  inherit system;
-                  config = {
-                    android_sdk.accept_license = true;
-                    allowUnfree = true;
-                  };
-                };
-                androidComposition = pkgsAndroid.androidenv.composeAndroidPackages {
-                  platformVersions = [ "34" ];
-                  buildToolsVersions = [ "34.0.0" ];
-                  includeNDK = true;
-                  ndkVersions = [ "27.0.12077973" ];
-                  includeEmulator = false;
-                  includeSystemImages = false;
-                };
-                androidSdk = androidComposition.androidsdk;
-                ndkHome = "${androidSdk}/libexec/android-sdk/ndk/27.0.12077973";
-                toolchainBin = "${ndkHome}/toolchains/llvm/prebuilt/linux-x86_64/bin";
-                androidRustFlags = "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384";
                 buildToolchain = pkgs.rust-bin.stable."1.97.1".default.override {
-                  targets = [
-                    "aarch64-linux-android"
-                    "armv7-linux-androideabi"
-                    "i686-linux-android"
-                    "x86_64-linux-android"
-                    "aarch64-apple-ios"
-                    "aarch64-apple-ios-sim"
-                    "x86_64-apple-ios"
-                    "aarch64-apple-darwin"
-                  ];
+                  targets = crossTargets;
                 };
+
+                # Android tooling is Linux-only here, and both workflows that
+                # build Android run on ubuntu. Pulling androidenv in on a macOS
+                # runner also drags nixpkgs' xcbuild `xcrun` shim into PATH,
+                # which shadows /usr/bin/xcrun and hands cc-rs the wrong
+                # -isysroot for the iOS simulator targets.
+                androidEnv =
+                  let
+                    pkgsAndroid = import nixpkgs {
+                      inherit system;
+                      config = {
+                        android_sdk.accept_license = true;
+                        allowUnfree = true;
+                      };
+                    };
+                    androidComposition = pkgsAndroid.androidenv.composeAndroidPackages {
+                      platformVersions = [ "34" ];
+                      buildToolsVersions = [ "34.0.0" ];
+                      includeNDK = true;
+                      ndkVersions = [ "27.0.12077973" ];
+                      includeEmulator = false;
+                      includeSystemImages = false;
+                    };
+                    androidSdk = androidComposition.androidsdk;
+                    ndkHome = "${androidSdk}/libexec/android-sdk/ndk/27.0.12077973";
+                    toolchainBin = "${ndkHome}/toolchains/llvm/prebuilt/linux-x86_64/bin";
+                    androidRustFlags = "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384";
+                  in
+                  {
+                    ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
+                    ANDROID_NDK_HOME = ndkHome;
+                    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "${toolchainBin}/aarch64-linux-android24-clang";
+                    CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER = "${toolchainBin}/armv7a-linux-androideabi24-clang";
+                    CARGO_TARGET_I686_LINUX_ANDROID_LINKER = "${toolchainBin}/i686-linux-android24-clang";
+                    CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER = "${toolchainBin}/x86_64-linux-android24-clang";
+                    CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS = androidRustFlags;
+                    CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_RUSTFLAGS = androidRustFlags;
+                    CARGO_TARGET_I686_LINUX_ANDROID_RUSTFLAGS = androidRustFlags;
+                    CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS = androidRustFlags;
+                    CC_aarch64_linux_android = "${toolchainBin}/aarch64-linux-android24-clang";
+                    CC_armv7_linux_androideabi = "${toolchainBin}/armv7a-linux-androideabi24-clang";
+                    CC_i686_linux_android = "${toolchainBin}/i686-linux-android24-clang";
+                    CC_x86_64_linux_android = "${toolchainBin}/x86_64-linux-android24-clang";
+                    AR_aarch64_linux_android = "${toolchainBin}/llvm-ar";
+                    AR_armv7_linux_androideabi = "${toolchainBin}/llvm-ar";
+                    AR_i686_linux_android = "${toolchainBin}/llvm-ar";
+                    AR_x86_64_linux_android = "${toolchainBin}/llvm-ar";
+                  };
               in
-              pkgs.mkShell {
+              pkgs.mkShell ({
                 buildInputs = [
                   buildToolchain
                 ];
-                ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
-                ANDROID_NDK_HOME = ndkHome;
-                CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "${toolchainBin}/aarch64-linux-android24-clang";
-                CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER = "${toolchainBin}/armv7a-linux-androideabi24-clang";
-                CARGO_TARGET_I686_LINUX_ANDROID_LINKER = "${toolchainBin}/i686-linux-android24-clang";
-                CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER = "${toolchainBin}/x86_64-linux-android24-clang";
-                CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS = androidRustFlags;
-                CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_RUSTFLAGS = androidRustFlags;
-                CARGO_TARGET_I686_LINUX_ANDROID_RUSTFLAGS = androidRustFlags;
-                CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS = androidRustFlags;
-                CC_aarch64_linux_android = "${toolchainBin}/aarch64-linux-android24-clang";
-                CC_armv7_linux_androideabi = "${toolchainBin}/armv7a-linux-androideabi24-clang";
-                CC_i686_linux_android = "${toolchainBin}/i686-linux-android24-clang";
-                CC_x86_64_linux_android = "${toolchainBin}/x86_64-linux-android24-clang";
-                AR_aarch64_linux_android = "${toolchainBin}/llvm-ar";
-                AR_armv7_linux_androideabi = "${toolchainBin}/llvm-ar";
-                AR_i686_linux_android = "${toolchainBin}/llvm-ar";
-                AR_x86_64_linux_android = "${toolchainBin}/llvm-ar";
-              };
+                # Lets CI assert a target is installed before it spends minutes
+                # compiling only to hit "can't find crate for `core`".
+                CROSS_BUILD_TARGETS = lib.concatStringsSep " " crossTargets;
+              }
+              # A plain conditional, so androidEnv is never forced on Darwin.
+              // (if isDarwin then { } else androidEnv));
 
             # Backwards-compatible alias
             kotlin-build = self.devShells.${system}.cross-build;
