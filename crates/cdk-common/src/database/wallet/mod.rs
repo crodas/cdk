@@ -13,7 +13,8 @@ use crate::nuts::{
     CurrencyUnit, Id, KeySetInfo, Keys, MintInfo, PublicKey, SpendingConditions, State,
 };
 use crate::wallet::{
-    self, MintQuote as WalletMintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId,
+    self, MintId, MintQuote as WalletMintQuote, ProofInfo, Transaction, TransactionDirection,
+    TransactionId,
 };
 
 #[cfg(feature = "test")]
@@ -27,13 +28,19 @@ where
     Err: Into<Error> + From<Error>,
 {
     /// Get mint from storage
-    async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, Err>;
+    async fn get_mint(&self, id: MintId) -> Result<Option<MintInfo>, Err>;
+
+    /// Resolve an identifier to the mint's current URL.
+    ///
+    /// A mint keeps its identity across a move, so an old URL still resolves
+    /// here and returns the URL the mint is reachable at now.
+    async fn get_mint_url(&self, id: MintId) -> Result<Option<MintUrl>, Err>;
 
     /// Get all mints from storage
     async fn get_mints(&self) -> Result<HashMap<MintUrl, Option<MintInfo>>, Err>;
 
     /// Get mint keysets for mint url
-    async fn get_mint_keysets(&self, mint_url: MintUrl) -> Result<Option<Vec<KeySetInfo>>, Err>;
+    async fn get_mint_keysets(&self, id: MintId) -> Result<Option<Vec<KeySetInfo>>, Err>;
 
     /// Get mint keyset by id
     async fn get_keyset_by_id(&self, keyset_id: &Id) -> Result<Option<KeySetInfo>, Err>;
@@ -60,7 +67,7 @@ where
     /// Get proofs from storage
     async fn get_proofs(
         &self,
-        mint_url: Option<MintUrl>,
+        id: Option<MintId>,
         unit: Option<CurrencyUnit>,
         state: Option<Vec<State>>,
         spending_conditions: Option<Vec<SpendingConditions>>,
@@ -72,7 +79,7 @@ where
     /// Get balance
     async fn get_balance(
         &self,
-        mint_url: Option<MintUrl>,
+        id: Option<MintId>,
         unit: Option<CurrencyUnit>,
         state: Option<Vec<State>>,
     ) -> Result<u64, Err>;
@@ -86,7 +93,7 @@ where
     /// List transactions from storage
     async fn list_transactions(
         &self,
-        mint_url: Option<MintUrl>,
+        id: Option<MintId>,
         direction: Option<TransactionDirection>,
         unit: Option<CurrencyUnit>,
     ) -> Result<Vec<Transaction>, Err>;
@@ -105,12 +112,12 @@ where
     /// Add transaction to storage
     async fn add_transaction(&self, transaction: Transaction) -> Result<(), Err>;
 
-    /// Update mint url
-    async fn update_mint_url(
-        &self,
-        old_mint_url: MintUrl,
-        new_mint_url: MintUrl,
-    ) -> Result<(), Err>;
+    /// Point a mint at a new URL.
+    ///
+    /// Only the mint row changes: everything else references the mint by id, so
+    /// proofs, keysets, quotes and transactions follow without being rewritten.
+    /// The previous URL is kept as an alias so stale references still resolve.
+    async fn update_mint_url(&self, id: MintId, new_mint_url: MintUrl) -> Result<(), Err>;
 
     /// Atomically increment Keyset counter and return new value
     async fn increment_keyset_counter(&self, keyset_id: &Id, count: u32) -> Result<u32, Err>;
@@ -118,18 +125,18 @@ where
     /// Atomically increment a namespaced derivation counter and return its new value.
     async fn increment_derivation_counter(&self, namespace: &str, count: u32) -> Result<u32, Err>;
 
-    /// Add Mint to storage
+    /// Add a mint to storage, or update the one already holding this identity.
+    ///
+    /// The mint's public key is its identity, so info carrying a known pubkey
+    /// updates that mint (including its URL, if the mint moved) instead of
+    /// inserting a second row. A URL alone falls back to matching on the URL.
     async fn add_mint(&self, mint_url: MintUrl, mint_info: Option<MintInfo>) -> Result<(), Err>;
 
     /// Remove Mint from storage
-    async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), Err>;
+    async fn remove_mint(&self, id: MintId) -> Result<(), Err>;
 
     /// Add mint keyset to storage
-    async fn add_mint_keysets(
-        &self,
-        mint_url: MintUrl,
-        keysets: Vec<KeySetInfo>,
-    ) -> Result<(), Err>;
+    async fn add_mint_keysets(&self, id: MintId, keysets: Vec<KeySetInfo>) -> Result<(), Err>;
 
     /// Add mint quote to storage
     async fn add_mint_quote(&self, quote: WalletMintQuote) -> Result<(), Err>;

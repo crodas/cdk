@@ -556,7 +556,10 @@ async fn test_wallet_repository_mint_management() {
     assert!(wallet.is_ok(), "Should be able to get wallet for mint");
 
     // Get wallets for this mint
-    let mint_wallets = wallet_repository.get_wallets_for_mint(&mint_url).await.unwrap();
+    let mint_wallets = wallet_repository
+        .get_wallets_for_mint(&mint_url)
+        .await
+        .unwrap();
 
     // Remove all wallets for the mint
     for wallet in mint_wallets {

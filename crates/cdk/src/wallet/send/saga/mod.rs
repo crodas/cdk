@@ -481,7 +481,7 @@ impl<'a> SendSaga<'a, Initial> {
                     .wallet
                     .localstore
                     .get_proofs(
-                        Some(self.wallet.mint_url.clone()),
+                        Some(self.wallet.mint_url.clone().into()),
                         Some(self.wallet.unit.clone()),
                         Some(vec![State::Unspent]),
                         Some(vec![]),

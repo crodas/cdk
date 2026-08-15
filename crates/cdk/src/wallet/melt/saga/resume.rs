@@ -1550,7 +1550,7 @@ mod tests {
         let seed = Mnemonic::generate(12).unwrap().to_seed_normalized("");
         db.add_mint(mint_url.clone(), None).await.unwrap();
         db.add_mint_keysets(
-            mint_url.clone(),
+            mint_url.clone().into(),
             vec![cdk_common::nuts::KeySetInfo {
                 id: keyset.id,
                 unit: keyset.unit.clone(),

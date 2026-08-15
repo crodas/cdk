@@ -50,7 +50,7 @@ mod tests {
             .await
             .unwrap();
 
-        let res = db.get_mint(mint_url).await.unwrap();
+        let res = db.get_mint(mint_url.into()).await.unwrap();
         assert_eq!(mint_info, res.clone().unwrap());
         assert_eq!("test", &res.unwrap().description.unwrap());
     }
@@ -112,7 +112,7 @@ mod tests {
         // Retrieve the proof from the database
         let retrieved_proofs = db
             .get_proofs(
-                Some(mint_url),
+                Some(mint_url.into()),
                 Some(CurrencyUnit::Sat),
                 Some(vec![State::Unspent]),
                 None,

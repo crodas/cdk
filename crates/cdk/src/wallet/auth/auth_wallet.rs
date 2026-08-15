@@ -298,7 +298,7 @@ impl AuthWallet {
         Ok(self
             .localstore
             .get_proofs(
-                Some(self.mint_url.clone()),
+                Some(self.mint_url.clone().into()),
                 Some(CurrencyUnit::Auth),
                 Some(vec![State::Unspent]),
                 None,
@@ -333,7 +333,7 @@ impl AuthWallet {
         let auth_proof = match self
             .localstore
             .get_proofs(
-                Some(self.mint_url.clone()),
+                Some(self.mint_url.clone().into()),
                 Some(CurrencyUnit::Auth),
                 Some(vec![State::Unspent]),
                 None,

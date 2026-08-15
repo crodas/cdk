@@ -337,28 +337,19 @@ impl WalletRepository {
         &self.seed
     }
 
-    /// Resolve a [`MintId`] to the mint URL used as the internal storage key.
+    /// Resolve a [`MintId`] to the mint URL used as the in-memory map key.
     ///
-    /// A [`MintId::PublicKey`] is mapped to its URL through the persisted mint
-    /// info (the pubkey advertised via NUT-06). Mints without a stored pubkey
-    /// can only be selected by [`MintId::Url`].
+    /// Storage owns the identifier index, so a public key resolves for any mint
+    /// whose stored info carries one, and a URL the mint has moved away from
+    /// still resolves to where it answers now.
     async fn resolve_mint_id(&self, id: &MintId) -> Result<MintUrl, Error> {
-        match id {
-            MintId::Url(mint_url) => Ok(mint_url.clone()),
-            MintId::PublicKey(pubkey) => {
-                let mints = self.localstore.get_mints().await.map_err(Error::Database)?;
-                mints
-                    .into_iter()
-                    .find_map(|(mint_url, info)| {
-                        info.and_then(|info| info.pubkey)
-                            .filter(|stored| stored == pubkey)
-                            .map(|_| mint_url)
-                    })
-                    .ok_or_else(|| Error::UnknownMint {
-                        mint_url: id.to_string(),
-                    })
-            }
-        }
+        self.localstore
+            .get_mint_url(id.clone())
+            .await
+            .map_err(Error::Database)?
+            .ok_or_else(|| Error::UnknownMint {
+                mint_url: id.to_string(),
+            })
     }
 
     /// Build the preferred [`MintId`] for a mint URL: its stored NUT-06 pubkey
@@ -366,7 +357,7 @@ impl WalletRepository {
     pub async fn mint_id_for(&self, mint_url: &MintUrl) -> MintId {
         let pubkey = self
             .localstore
-            .get_mint(mint_url.clone())
+            .get_mint(mint_url.clone().into())
             .await
             .ok()
             .flatten()
@@ -562,6 +553,46 @@ impl WalletRepository {
         wallets.insert(key, wallet.clone());
 
         Ok(wallet)
+    }
+
+    /// Point a mint at a new URL after it has moved.
+    ///
+    /// Storage keeps the mint's identity, so only its URL changes there. The
+    /// repository owns the rest: every wallet for this mint is rebuilt so its
+    /// HTTP client and per-host rate-limit budget follow the new host, and the
+    /// in-memory map is re-keyed. The mint stays reachable by its old URL.
+    #[instrument(skip(self, id))]
+    pub async fn update_mint_url<T>(&self, id: T, new_mint_url: MintUrl) -> Result<(), Error>
+    where
+        T: TryInto<MintId>,
+        Error: From<T::Error>,
+    {
+        let old_mint_url = self.resolve_mint_id(&id.try_into()?).await?;
+
+        if old_mint_url == new_mint_url {
+            return Ok(());
+        }
+
+        self.localstore
+            .update_mint_url(old_mint_url.clone().into(), new_mint_url.clone())
+            .await?;
+
+        let mut wallets = self.wallets.write().await;
+        let moved = wallets
+            .keys()
+            .filter(|key| key.mint_url == old_mint_url)
+            .map(|key| key.unit.clone())
+            .collect::<Vec<_>>();
+
+        for unit in moved {
+            wallets.remove(&WalletKey::new(old_mint_url.clone(), unit.clone()));
+            let wallet = self
+                .create_wallet_internal(new_mint_url.clone(), unit.clone(), None)
+                .await?;
+            wallets.insert(WalletKey::new(new_mint_url.clone(), unit), wallet);
+        }
+
+        Ok(())
     }
 
     /// Wait until the rate-limit budgets drawn down by every wallet in this
@@ -1482,7 +1513,7 @@ mod tests {
 
         // Verify mint is still in DB (remove_wallet does not touch DB)
         assert!(localstore
-            .get_mint(mint_url.clone())
+            .get_mint(mint_url.clone().into())
             .await
             .unwrap()
             .is_some());

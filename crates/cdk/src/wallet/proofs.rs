@@ -54,7 +54,7 @@ impl Wallet {
         Ok(self
             .localstore
             .get_proofs(
-                Some(self.mint_url.clone()),
+                Some(self.mint_url.clone().into()),
                 Some(self.unit.clone()),
                 state,
                 spending_conditions,
@@ -124,7 +124,7 @@ impl Wallet {
         let proofs = self
             .localstore
             .get_proofs(
-                Some(self.mint_url.clone()),
+                Some(self.mint_url.clone().into()),
                 Some(self.unit.clone()),
                 Some(vec![State::Pending, State::Reserved, State::PendingSpent]),
                 None,

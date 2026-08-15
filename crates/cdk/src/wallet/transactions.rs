@@ -20,7 +20,7 @@ impl Wallet {
         let mut transactions = self
             .localstore
             .list_transactions(
-                Some(self.mint_url.clone()),
+                Some(self.mint_url.clone().into()),
                 direction,
                 Some(self.unit.clone()),
             )

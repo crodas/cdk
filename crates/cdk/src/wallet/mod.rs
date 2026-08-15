@@ -468,19 +468,6 @@ impl Wallet {
         self.get_keyset_count_fee(&keyset_id, proof_count).await
     }
 
-    /// Update Mint information and related entries in the event a mint changes
-    /// its URL
-    #[instrument(skip(self))]
-    pub async fn update_mint_url(&mut self, new_mint_url: MintUrl) -> Result<(), Error> {
-        self.localstore
-            .update_mint_url(self.mint_url.clone(), new_mint_url.clone())
-            .await?;
-
-        self.mint_url = new_mint_url;
-
-        Ok(())
-    }
-
     /// Query mint for current mint information
     #[instrument(skip(self))]
     pub async fn fetch_mint_info(&self) -> Result<Option<MintInfo>, Error> {
@@ -671,7 +658,7 @@ impl Wallet {
         // Check that mint is in store of mints
         if self
             .localstore
-            .get_mint(self.mint_url.clone())
+            .get_mint(self.mint_url.clone().into())
             .await?
             .is_none()
         {

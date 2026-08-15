@@ -1,13 +1,12 @@
 use anyhow::Result;
 use cdk::mint_url::MintUrl;
-use cdk::nuts::CurrencyUnit;
 use cdk::wallet::WalletRepository;
 use clap::Args;
 
 #[derive(Args)]
 pub struct UpdateMintUrlSubCommand {
-    /// Old Mint Url
-    old_mint_url: MintUrl,
+    /// Mint identifier: public key or current URL
+    mint_id: String,
     /// New Mint Url
     new_mint_url: MintUrl,
 }
@@ -15,21 +14,17 @@ pub struct UpdateMintUrlSubCommand {
 pub async fn update_mint_url(
     wallet_repository: &WalletRepository,
     sub_command_args: &UpdateMintUrlSubCommand,
-    unit: &CurrencyUnit,
 ) -> Result<()> {
     let UpdateMintUrlSubCommand {
-        old_mint_url,
+        mint_id,
         new_mint_url,
     } = sub_command_args;
 
-    let mut wallet = wallet_repository
-        .get_wallet(&sub_command_args.old_mint_url, unit)
-        .await?
-        .clone();
+    wallet_repository
+        .update_mint_url(mint_id.as_str(), new_mint_url.clone())
+        .await?;
 
-    wallet.update_mint_url(new_mint_url.clone()).await?;
-
-    println!("Mint Url changed from {old_mint_url} to {new_mint_url}");
+    println!("Mint {mint_id} now at {new_mint_url}");
 
     Ok(())
 }

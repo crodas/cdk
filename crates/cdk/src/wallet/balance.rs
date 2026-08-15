@@ -12,7 +12,7 @@ impl Wallet {
         let balance = self
             .localstore
             .get_balance(
-                Some(self.mint_url.clone()),
+                Some(self.mint_url.clone().into()),
                 Some(self.unit.clone()),
                 Some(vec![State::Unspent]),
             )

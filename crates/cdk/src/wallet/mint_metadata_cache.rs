@@ -335,12 +335,15 @@ impl MintMetadataCache {
         let mut new_metadata = (*self.metadata.load().clone()).clone();
 
         // Load mint info
-        if let Some(mint_info) = storage.get_mint(self.mint_url.clone()).await? {
+        if let Some(mint_info) = storage.get_mint(self.mint_url.clone().into()).await? {
             new_metadata.mint_info = mint_info;
         }
 
         // Load keysets and their keys
-        if let Some(keysets) = storage.get_mint_keysets(self.mint_url.clone()).await? {
+        if let Some(keysets) = storage
+            .get_mint_keysets(self.mint_url.clone().into())
+            .await?
+        {
             new_metadata.active_keysets.clear();
             for keyset_info in keysets {
                 let keyset_arc = Arc::new(keyset_info.clone());
@@ -600,7 +603,7 @@ impl MintMetadataCache {
 
         if !keysets.is_empty() {
             storage
-                .add_mint_keysets(mint_url.clone(), keysets)
+                .add_mint_keysets(mint_url.clone().into(), keysets)
                 .await
                 .inspect_err(|e| tracing::warn!("Failed to save keysets for {}: {}", mint_url, e))
                 .ok();

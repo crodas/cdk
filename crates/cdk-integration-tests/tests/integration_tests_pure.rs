@@ -258,7 +258,7 @@ async fn test_mint_nut06() {
     let mint_bob = create_and_start_test_mint()
         .await
         .expect("Failed to create test mint");
-    let mut wallet_alice = create_test_wallet_for_mint(mint_bob.clone())
+    let wallet_alice = create_test_wallet_for_mint(mint_bob.clone())
         .await
         .expect("Failed to create test wallet");
 
@@ -309,10 +309,12 @@ async fn test_mint_nut06() {
         .unwrap()
         .contains(&initial_mint_url.to_string()));
 
-    // Wallet updates mint URL
+    // The mint moves. Storage keeps the mint's identity, so the wallet still
+    // reaches it by the URL it was created with.
     let new_mint_url = MintUrl::from_str("https://new-mint-url").expect("Failed to parse mint URL");
     wallet_alice
-        .update_mint_url(new_mint_url.clone())
+        .localstore
+        .update_mint_url(initial_mint_url.clone().into(), new_mint_url.clone())
         .await
         .expect("Failed to update mint URL");
 

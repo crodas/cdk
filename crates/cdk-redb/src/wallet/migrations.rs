@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use cdk_common::mint_url::MintUrl;
 use cdk_common::wallet::Transaction;
-use cdk_common::Id;
+use cdk_common::{Id, MintInfo};
 use redb::{
     Database, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable, ReadableTable,
     TableDefinition,
@@ -14,8 +14,8 @@ use redb::{
 
 use super::Error;
 use crate::wallet::{
-    KEYSETS_TABLE, KEYSET_COUNTER, KEYSET_U32_MAPPING, MINT_KEYS_TABLE, P2PK_SIGNING_KEYS_TABLE,
-    TRANSACTIONS_TABLE,
+    KEYSETS_TABLE, KEYSET_COUNTER, KEYSET_U32_MAPPING, MINT_ALIAS_TABLE, MINT_KEYS_TABLE,
+    P2PK_SIGNING_KEYS_TABLE, TRANSACTIONS_TABLE,
 };
 
 // <Mint_url, Info>
@@ -269,6 +269,50 @@ pub(crate) fn migrate_05_to_06(db: Arc<Database>) -> Result<u32, Error> {
     tracing::info!("Finished migration from version 5 to 6: Rekeying saga transactions");
 
     Ok(6)
+}
+
+/// Build the alias index that lets a mint be found by public key as well as by
+/// URL, so a mint that moves stays reachable under both.
+pub(crate) fn migrate_06_to_07(db: Arc<Database>) -> Result<u32, Error> {
+    tracing::info!("Starting migration from version 6 to 7: Indexing mints by public key");
+    let write_txn = db.begin_write().map_err(Error::from)?;
+
+    let aliases = {
+        let table = write_txn.open_table(MINTS_TABLE).map_err(Error::from)?;
+        let mut aliases = Vec::new();
+
+        for entry in table.iter().map_err(Error::from)? {
+            let (mint_url, mint_info) = entry.map_err(Error::from)?;
+            let mint_url = mint_url.value().to_owned();
+
+            if let Some(pubkey) = serde_json::from_str::<Option<MintInfo>>(mint_info.value())
+                .ok()
+                .flatten()
+                .and_then(|info| info.pubkey)
+            {
+                aliases.push((pubkey.to_hex(), mint_url));
+            }
+        }
+
+        aliases
+    };
+
+    {
+        let mut table = write_txn
+            .open_table(MINT_ALIAS_TABLE)
+            .map_err(Error::from)?;
+
+        for (alias, mint_url) in aliases {
+            table
+                .insert(alias.as_str(), mint_url.as_str())
+                .map_err(Error::from)?;
+        }
+    }
+
+    write_txn.commit()?;
+    tracing::info!("Finished migration from version 6 to 7: Indexing mints by public key");
+
+    Ok(7)
 }
 
 #[cfg(test)]
