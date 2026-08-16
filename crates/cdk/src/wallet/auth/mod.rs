@@ -1,7 +1,12 @@
 mod auth_connector;
+mod auth_provider;
 mod auth_wallet;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 pub use auth_connector::AuthMintConnector;
+pub use auth_provider::AuthTokenProvider;
 pub use auth_wallet::AuthWallet;
 use cdk_common::{Amount, AuthProof, AuthToken, Proofs};
 use tracing::instrument;
@@ -34,15 +39,46 @@ impl Wallet {
             .await
     }
 
+    /// Total balance of unspent blind auth proofs
+    #[instrument(skip_all)]
+    pub async fn total_blind_auth_balance(&self) -> Result<Amount, Error> {
+        self.auth_wallet
+            .read()
+            .await
+            .as_ref()
+            .ok_or(Error::AuthSettingsUndefined)?
+            .total_blind_auth_balance()
+            .await
+    }
+
     /// Set Clear Auth Token (CAT) for authentication
+    ///
+    /// The auth wallet is created on demand when the mint has not been queried
+    /// yet, so the token takes effect whatever the call order.
     #[instrument(skip_all)]
     pub async fn set_cat(&self, cat: String) -> Result<(), Error> {
-        let auth_wallet = self.auth_wallet.read().await;
-        if let Some(auth_wallet) = auth_wallet.as_ref() {
-            auth_wallet
-                .set_auth_token(AuthToken::ClearAuth(cat))
-                .await?;
+        let token = AuthToken::ClearAuth(cat);
+        let mut auth_wallet = self.auth_wallet.write().await;
+
+        match auth_wallet.as_ref() {
+            Some(auth_wallet) => auth_wallet.set_auth_token(token).await?,
+            None => {
+                let new_auth_wallet = AuthWallet::with_auth_client(
+                    self.mint_url.clone(),
+                    self.localstore.clone(),
+                    self.metadata_cache.clone(),
+                    HashMap::new(),
+                    None,
+                    self.client
+                        .auth_connector(self.mint_url.clone(), Some(token)),
+                );
+
+                self.client
+                    .set_auth_provider(Some(Arc::new(new_auth_wallet.clone())));
+                *auth_wallet = Some(new_auth_wallet);
+            }
         }
+
         Ok(())
     }
 
@@ -64,18 +100,5 @@ impl Wallet {
             auth_wallet.refresh_access_token().await?;
         }
         Ok(())
-    }
-
-    /// Set the auth client (AuthWallet) for this wallet
-    ///
-    /// This allows updating the auth wallet without recreating the wallet.
-    /// Also updates the client's auth wallet to keep them in sync.
-    #[instrument(skip_all)]
-    pub async fn set_auth_client(&self, auth_wallet: Option<AuthWallet>) {
-        let mut auth_wallet_guard = self.auth_wallet.write().await;
-        *auth_wallet_guard = auth_wallet.clone();
-
-        // Also update the client's auth wallet to keep them in sync
-        self.client.set_auth_wallet(auth_wallet).await;
     }
 }

@@ -60,7 +60,7 @@ async fn test_invalid_credentials() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_quote_status_without_auth() {
-    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"), None);
+    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"));
 
     // Test mint quote status
     {
@@ -97,7 +97,7 @@ async fn test_quote_status_without_auth() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_mint_without_auth() {
-    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"), None);
+    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"));
     {
         let request = MintQuoteBolt11Request {
             unit: CurrencyUnit::Sat,
@@ -166,7 +166,7 @@ async fn test_mint_bat_without_cat() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_swap_without_auth() {
-    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"), None);
+    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"));
 
     let request = SwapRequest::new(vec![], vec![]);
 
@@ -181,7 +181,7 @@ async fn test_swap_without_auth() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_melt_without_auth() {
-    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"), None);
+    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"));
 
     // Test melt quote request
     {
@@ -255,7 +255,7 @@ async fn test_melt_without_auth() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_check_without_auth() {
-    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"), None);
+    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"));
 
     let request = CheckStateRequest { ys: vec![] };
 
@@ -270,7 +270,7 @@ async fn test_check_without_auth() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_restore_without_auth() {
-    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"), None);
+    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"));
 
     let request = RestoreRequest { outputs: vec![] };
 
@@ -601,7 +601,7 @@ async fn test_melt_with_invalid_auth() {
     println!("{:#?}", proofs);
     let proof = proofs.first().expect("wallet has one proof");
 
-    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"), None);
+    let client = HttpClient::new(MintUrl::from_str(MINT_URL).expect("Valid mint url"));
     {
         let invalid_auth_proof = AuthProof {
             keyset_id: proof.keyset_id,

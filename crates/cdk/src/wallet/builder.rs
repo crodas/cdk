@@ -10,13 +10,12 @@ use crate::cdk_database::WalletDatabase;
 use crate::error::Error;
 use crate::mint_url::MintUrl;
 use crate::nuts::CurrencyUnit;
-use crate::wallet::auth::{AuthMintConnector, AuthWallet};
+use crate::wallet::auth::AuthWallet;
 use crate::wallet::mint_connector::transport::{Async, RateLimitedTransport};
-use crate::wallet::mint_connector::{RateLimitedAuthHttpClient, RateLimitedHttpClient};
+use crate::wallet::mint_connector::RateLimitedHttpClient;
 use crate::wallet::mint_metadata_cache::MintMetadataCache;
 use crate::wallet::{
-    AuthHttpClient, HttpClient, MintConnector, RateLimitConfig, RateLimiterManager,
-    SubscriptionManager, Wallet,
+    HttpClient, MintConnector, RateLimitConfig, RateLimiterManager, SubscriptionManager, Wallet,
 };
 
 /// Builder for creating a new [`Wallet`]
@@ -30,13 +29,17 @@ use crate::wallet::{
 /// share one live budget, build them through a
 /// [`WalletRepository`](crate::wallet::WalletRepository), which injects one
 /// manager into every wallet it creates.
+///
+/// A limiter only paces what it wraps. `build()` wraps the client it builds
+/// itself; when a custom client is supplied with [`WalletBuilder::client`], the
+/// caller must build that client over a
+/// [`RateLimitedTransport`](crate::wallet::RateLimitedTransport) for the
+/// injected limiter to have any effect.
 pub struct WalletBuilder {
     mint_url: Option<MintUrl>,
     unit: Option<CurrencyUnit>,
     localstore: Option<Arc<dyn WalletDatabase<database::Error> + Send + Sync>>,
     target_proof_count: Option<usize>,
-    auth_wallet: Option<AuthWallet>,
-    auth_connector: Option<Arc<dyn AuthMintConnector + Send + Sync>>,
     seed: Option<[u8; 64]>,
     use_http_subscription: bool,
     client: Option<Arc<dyn MintConnector + Send + Sync>>,
@@ -65,8 +68,6 @@ impl Default for WalletBuilder {
             unit: None,
             localstore: None,
             target_proof_count: Some(3),
-            auth_wallet: None,
-            auth_connector: None,
             seed: None,
             client: None,
             metadata_cache_ttl: Some(Duration::from_secs(3600)),
@@ -145,21 +146,6 @@ impl WalletBuilder {
         self
     }
 
-    /// Set the auth wallet
-    pub fn auth_wallet(mut self, auth_wallet: AuthWallet) -> Self {
-        self.auth_wallet = Some(auth_wallet);
-        self
-    }
-
-    /// Set the auth connector used when an auth wallet is created from mint info
-    pub fn auth_connector(
-        mut self,
-        auth_connector: Arc<dyn AuthMintConnector + Send + Sync>,
-    ) -> Self {
-        self.auth_connector = Some(auth_connector);
-        self
-    }
-
     /// Set the seed bytes
     pub fn seed(mut self, seed: [u8; 64]) -> Self {
         self.seed.zeroize();
@@ -232,8 +218,9 @@ impl WalletBuilder {
 
     /// Set auth CAT (Clear Auth Token)
     ///
-    /// The auth wallet is constructed in [`WalletBuilder::build`] so its HTTP
-    /// client can share the same rate-limit budget as the main client.
+    /// The auth wallet is constructed in [`WalletBuilder::build`], from the
+    /// wallet's own mint connector, so auth requests go out over the same
+    /// transport as everything else.
     ///
     /// # Errors
     ///
@@ -247,7 +234,6 @@ impl WalletBuilder {
         }
 
         self.auth_cat = Some(cat);
-        self.auth_wallet = None;
         Ok(self)
     }
 
@@ -286,6 +272,7 @@ impl WalletBuilder {
         // reuse one connection pool. An injected limiter (e.g. the one
         // WalletRepository shares across all its wallets) wins over building a
         // per-wallet one.
+        let injected_limiter = self.rate_limiter.is_some();
         let rate_limiter = match self.rate_limiter.take() {
             Some(limiter) => Some(limiter),
             None => self
@@ -300,42 +287,12 @@ impl WalletBuilder {
             ))
         });
 
-        // The limiter only paces traffic through a client the wallet itself
-        // builds around `shared_transport`: the main client (unless a custom one
-        // replaces it) and the blind-auth client (only on the CAT path). If a
-        // custom client is supplied and there is no CAT, the limiter is wired to
-        // nothing, so keep it off the wallet rather than exposing runtime setters
-        // that mutate a disconnected limiter.
-        let has_custom_client = self.client.is_some();
-        let has_auth_cat = self.auth_cat.is_some();
-        let limiter_is_wired = rate_limiter.is_some() && (!has_custom_client || has_auth_cat);
-
-        // The auth wallet comes either from a CAT set on the builder (built here
-        // so it can share the transport) or from a pre-built wallet supplied
-        // directly, which is used verbatim.
-        let auth_wallet = match self.auth_cat.take() {
-            Some(cat) => {
-                let cat = AuthToken::ClearAuth(cat);
-                let auth_client: Arc<dyn AuthMintConnector + Send + Sync> = match &shared_transport
-                {
-                    Some(transport) => Arc::new(RateLimitedAuthHttpClient::with_shared_transport(
-                        mint_url.clone(),
-                        transport.clone(),
-                        Some(cat),
-                    )),
-                    None => Arc::new(AuthHttpClient::new(mint_url.clone(), Some(cat))),
-                };
-                Some(AuthWallet::with_auth_client(
-                    mint_url.clone(),
-                    localstore.clone(),
-                    metadata_cache.clone(),
-                    HashMap::new(),
-                    None,
-                    auth_client,
-                ))
-            }
-            None => self.auth_wallet.take(),
-        };
+        // A limiter the builder constructs only paces the client the builder
+        // itself builds around `shared_transport`, so a custom client leaves it
+        // wired to nothing. An injected limiter is recorded either way: whoever
+        // injected it is also responsible for the transport the custom client
+        // runs on, as `WalletRepository` does for its proxy and Tor clients.
+        let limiter_is_wired = injected_limiter || self.client.is_none();
 
         let client = match self.client.take() {
             Some(client) => client,
@@ -343,12 +300,27 @@ impl WalletBuilder {
                 Some(transport) => Arc::new(RateLimitedHttpClient::with_shared_transport(
                     mint_url.clone(),
                     transport,
-                    auth_wallet.clone(),
                 )) as Arc<dyn MintConnector + Send + Sync>,
-                None => Arc::new(HttpClient::new(mint_url.clone(), auth_wallet.clone()))
+                None => Arc::new(HttpClient::new(mint_url.clone()))
                     as Arc<dyn MintConnector + Send + Sync>,
             },
         };
+
+        // Deriving the auth wallet from the client is what keeps blind-auth
+        // traffic on the same transport, and so the same proxy, Tor circuit and
+        // rate-limit budget, as everything else the wallet sends.
+        let auth_wallet = self.auth_cat.take().map(|cat| {
+            let auth_wallet = AuthWallet::with_auth_client(
+                mint_url.clone(),
+                localstore.clone(),
+                metadata_cache.clone(),
+                HashMap::new(),
+                None,
+                client.auth_connector(mint_url.clone(), Some(AuthToken::ClearAuth(cat))),
+            );
+            client.set_auth_provider(Some(Arc::new(auth_wallet.clone())));
+            auth_wallet
+        });
 
         Ok(Wallet {
             mint_url,
@@ -357,7 +329,6 @@ impl WalletBuilder {
             metadata_cache,
             target_proof_count: self.target_proof_count.unwrap_or(3),
             auth_wallet: Arc::new(TokioRwLock::new(auth_wallet)),
-            auth_connector: self.auth_connector.take(),
             #[cfg(feature = "npubcash")]
             npubcash_client: Arc::new(TokioRwLock::new(None)),
             seed,
@@ -403,7 +374,6 @@ mod tests {
             .unwrap();
         // Construction is deferred to build(): only the raw CAT is stored.
         assert_eq!(builder.auth_cat.as_deref(), Some("cat"));
-        assert!(builder.auth_wallet.is_none());
     }
 
     #[test]
@@ -456,11 +426,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_client_drops_the_rate_limiter() {
-        // A custom client replaces the wallet's rate-limited transport and there
-        // is no CAT, so the limiter is wired to nothing. The wallet must not keep
-        // it, otherwise the runtime setters would silently mutate a disconnected
-        // limiter that never touches the main client's traffic.
+    async fn custom_client_drops_a_builder_owned_rate_limiter() {
+        // A custom client replaces the transport the builder would have paced,
+        // so a limiter the builder constructed itself is wired to nothing. The
+        // wallet must not keep it, otherwise the runtime setters would silently
+        // mutate a disconnected limiter.
         use crate::wallet::test_utils::MockMintConnector;
 
         let wallet = base_builder()
@@ -472,19 +442,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_client_with_auth_cat_keeps_limiter_for_auth() {
-        // With a custom main client but a CAT, the limiter still paces the
-        // blind-auth client the wallet builds, so it is retained: the setters
-        // then reconfigure the auth client's pacing.
+    async fn custom_client_keeps_an_injected_rate_limiter() {
+        // Whoever injects a limiter also owns the transport the custom client
+        // runs on, as WalletRepository does for its proxy and Tor clients, so
+        // the wallet keeps it and the runtime setters reach that transport.
         use crate::wallet::test_utils::MockMintConnector;
+
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        let limiter = RateLimiterManager::new(RateLimitConfig::default(), Some(store));
 
         let wallet = base_builder()
             .await
             .shared_client(Arc::new(MockMintConnector::new()))
+            .with_rate_limiter(limiter)
+            .build()
+            .unwrap();
+        assert!(wallet.rate_limiter.is_some());
+    }
+
+    #[tokio::test]
+    async fn auth_cat_derives_the_auth_client_from_the_connector() {
+        // The CAT path must not build its own auth client: it has to come from
+        // the wallet's connector, carrying the CAT, so auth requests inherit
+        // that connector's transport.
+        use crate::wallet::test_utils::MockMintConnector;
+
+        let client = Arc::new(MockMintConnector::new());
+
+        let wallet = base_builder()
+            .await
+            .shared_client(client.clone())
             .set_auth_cat("cat".to_string())
             .unwrap()
             .build()
             .unwrap();
-        assert!(wallet.rate_limiter.is_some());
+
+        assert!(wallet.auth_wallet.read().await.is_some());
+        assert_eq!(
+            *client.auth_connector_calls.lock().unwrap(),
+            vec![Some(AuthToken::ClearAuth("cat".to_string()))]
+        );
     }
 }

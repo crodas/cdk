@@ -39,7 +39,7 @@ use tokio::sync::Mutex;
 use web_time::Instant;
 
 use crate::nuts::Id;
-use crate::wallet::{AuthMintConnector, AuthWallet, MintConnector};
+use crate::wallet::{AuthMintConnector, MintConnector};
 use crate::{Error, Wallet};
 
 /// Metadata freshness and versioning information
@@ -157,13 +157,6 @@ impl Wallet {
     /// Get information about metadata cache info
     pub fn get_metadata_cache_info(&self) -> FreshnessStatus {
         self.metadata_cache.metadata.load().status.clone()
-    }
-}
-
-impl AuthWallet {
-    /// Get information about metadata cache info
-    pub fn get_metadata_cache_info(&self) -> FreshnessStatus {
-        self.metadata_cache.metadata.load().auth_status.clone()
     }
 }
 

@@ -15,9 +15,9 @@ pub use crate::lightning_address::{LnurlPayInvoiceResponse, LnurlPayResponse};
 use crate::nuts::{
     BatchCheckMintQuoteRequest, BatchMintRequest, CheckStateRequest, CheckStateResponse, Id,
     KeySet, KeysetResponse, MeltRequest, MintInfo, MintRequest, MintResponse, PaymentMethod,
-    RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
+    ProtectedEndpoint, RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
 };
-use crate::wallet::{AuthMintConnector, AuthWallet};
+use crate::wallet::{AuthMintConnector, AuthTokenProvider};
 use crate::OidcClient;
 
 pub mod http_client;
@@ -32,9 +32,6 @@ pub type AuthHttpClient = http_client::AuthHttpClient<transport::Async>;
 pub type HttpClient = http_client::HttpClient<transport::Async>;
 /// Rate-limited HTTP Client with async transport
 pub type RateLimitedHttpClient = http_client::HttpClient<RateLimitedTransport<transport::Async>>;
-/// Rate-limited Auth HTTP Client with async transport
-pub type RateLimitedAuthHttpClient =
-    http_client::AuthHttpClient<RateLimitedTransport<transport::Async>>;
 /// Tor Auth HTTP Client with async transport (only when `tor` feature is enabled and not on wasm32)
 #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
 pub type TorAuthHttpClient = http_client::AuthHttpClient<transport::TorAsync>;
@@ -175,9 +172,17 @@ pub trait MintConnector: Debug {
     /// Restore request [NUT-13]
     async fn post_restore(&self, request: RestoreRequest) -> Result<RestoreResponse, Error>;
 
-    /// Get the auth wallet for the client
-    async fn get_auth_wallet(&self) -> Option<AuthWallet>;
+    /// Install the provider the connector consults for auth tokens.
+    ///
+    /// Called by the wallet once it knows the mint enforces auth, so
+    /// implementations that never authenticate can ignore it.
+    fn set_auth_provider(&self, _provider: Option<Arc<dyn AuthTokenProvider>>) {}
 
-    /// Set auth wallet on client
-    async fn set_auth_wallet(&self, wallet: Option<AuthWallet>);
+    /// Auth token to attach to a request for `endpoint`, if any.
+    async fn auth_for_request(
+        &self,
+        _endpoint: &ProtectedEndpoint,
+    ) -> Result<Option<AuthToken>, Error> {
+        Ok(None)
+    }
 }

@@ -74,7 +74,8 @@ pub mod util;
 pub mod wallet_repository;
 mod wallet_trait;
 
-pub use auth::{AuthMintConnector, AuthWallet};
+pub(crate) use auth::AuthWallet;
+pub use auth::{AuthMintConnector, AuthTokenProvider};
 #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
 pub use bip321::resolve_bip353_payment_instruction;
 pub use bip321::{
@@ -86,7 +87,7 @@ pub use cdk_common::wallet::{
     NUT13Options, P2PKLockedProofSendMode, ReceiveOptions, SendMemo, SendOptions,
 };
 pub use melt::{MeltConfirmOptions, MeltOutcome, PendingMelt, PreparedMelt};
-pub use mint_connector::transport::Transport as HttpTransport;
+pub use mint_connector::transport::{RateLimitedTransport, Transport as HttpTransport};
 pub use mint_connector::{
     AuthHttpClient, HttpClient, LnurlPayInvoiceResponse, LnurlPayResponse, MintConnector,
     RateLimitConfig, RateLimiterManager, TokenBucket,
@@ -152,7 +153,6 @@ pub struct Wallet {
     /// The targeted amount of proofs to have at each size
     pub target_proof_count: usize,
     auth_wallet: Arc<TokioRwLock<Option<AuthWallet>>>,
-    auth_connector: Option<Arc<dyn AuthMintConnector + Send + Sync>>,
     #[cfg(feature = "npubcash")]
     npubcash_client: Arc<TokioRwLock<Option<Arc<cdk_npubcash::NpubCashClient>>>>,
     seed: [u8; 64],
@@ -161,10 +161,10 @@ pub struct Wallet {
     /// Handle to the client-side rate limiter, when the wallet paces any of the
     /// clients it builds.
     ///
-    /// `None` when rate limiting was disabled, or when a custom client replaced
-    /// the transport and no rate-limited auth client remains. Cloning the manager
-    /// shares its per-host budgets, so this reconfigures the same limiter the
-    /// transport paces through.
+    /// `None` when rate limiting was disabled, or when a custom client the
+    /// builder does not pace replaced the one it would have built. Cloning the
+    /// manager shares its per-host budgets, so this reconfigures the same
+    /// limiter the transport paces through.
     rate_limiter: Option<RateLimiterManager>,
 }
 
@@ -528,29 +528,18 @@ impl Wallet {
                     None => {
                         tracing::info!("Mint has auth enabled; creating auth wallet");
 
-                        let new_auth_wallet = match self.auth_connector.as_ref() {
-                            Some(auth_connector) => AuthWallet::with_auth_client(
-                                self.mint_url.clone(),
-                                self.localstore.clone(),
-                                self.metadata_cache.clone(),
-                                protected_endpoints,
-                                oidc_client,
-                                auth_connector.clone(),
-                            ),
-                            None => AuthWallet::with_auth_client(
-                                self.mint_url.clone(),
-                                self.localstore.clone(),
-                                self.metadata_cache.clone(),
-                                protected_endpoints,
-                                oidc_client,
-                                self.client.auth_connector(self.mint_url.clone(), None),
-                            ),
-                        };
+                        let new_auth_wallet = AuthWallet::with_auth_client(
+                            self.mint_url.clone(),
+                            self.localstore.clone(),
+                            self.metadata_cache.clone(),
+                            protected_endpoints,
+                            oidc_client,
+                            self.client.auth_connector(self.mint_url.clone(), None),
+                        );
                         *auth_wallet = Some(new_auth_wallet.clone());
 
                         self.client
-                            .set_auth_wallet(Some(new_auth_wallet.clone()))
-                            .await;
+                            .set_auth_provider(Some(Arc::new(new_auth_wallet.clone())));
 
                         if let Err(e) = new_auth_wallet.refresh_keysets().await {
                             tracing::error!("Could not fetch auth keysets: {}", e);
@@ -559,7 +548,7 @@ impl Wallet {
                 }
             } else if auth_wallet.take().is_some() {
                 tracing::info!("Mint does not advertise auth; removing auth wallet");
-                self.client.set_auth_wallet(None).await;
+                self.client.set_auth_provider(None);
             }
         }
 
@@ -1562,7 +1551,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_mint_info_uses_configured_auth_connector_for_auth_settings() {
+    async fn set_cat_before_fetch_mint_info_authenticates_protected_requests() {
+        use cdk_common::{ClearAuthSettings, ProtectedEndpoint};
+
+        use crate::nuts::{AuthToken, Method as AuthMethod, RoutePath};
+        use crate::wallet::test_utils::{
+            create_test_db, create_test_wallet_with_mock, test_mint_info, MockMintConnector,
+        };
+
+        let endpoint = ProtectedEndpoint::new(AuthMethod::Post, RoutePath::Swap);
+        let db = create_test_db().await;
+        let mock_client = Arc::new(MockMintConnector::new());
+        let mut mint_info = test_mint_info();
+        mint_info.time = None;
+        mint_info.nuts.nut21 = Some(ClearAuthSettings::new(
+            "https://issuer.example/.well-known/openid-configuration".to_string(),
+            "wallet-client".to_string(),
+            vec![endpoint.clone()],
+        ));
+        mock_client.set_mint_info_response(Ok(mint_info));
+        let wallet = create_test_wallet_with_mock(db, mock_client.clone()).await;
+
+        // The CAT is set before the mint is ever queried, so there is no auth
+        // wallet yet: set_cat has to build one from the wallet's connector.
+        wallet
+            .set_cat("cat".to_string())
+            .await
+            .expect("setting the CAT should create the auth wallet");
+        assert_eq!(
+            *mock_client.auth_connector_calls.lock().unwrap(),
+            vec![Some(AuthToken::ClearAuth("cat".to_string()))]
+        );
+
+        wallet
+            .fetch_mint_info()
+            .await
+            .expect("mint info should load from mock connector");
+
+        let auth_wallet = wallet.auth_wallet.read().await;
+        let token = auth_wallet
+            .as_ref()
+            .expect("auth wallet should still be the one set_cat created")
+            .get_auth_for_request(&endpoint)
+            .await
+            .expect("clear auth token should be available");
+
+        assert_eq!(token, Some(AuthToken::ClearAuth("cat".to_string())));
+    }
+
+    #[tokio::test]
+    async fn fetch_mint_info_derives_the_auth_connector_from_the_client() {
         use crate::wallet::test_utils::{
             create_test_db, test_mint_info, test_mint_url, MockMintConnector,
         };
@@ -1577,6 +1615,7 @@ mod tests {
         let auth_connector = Arc::new(CountingAuthConnector::new(build_test_auth_keyset(1)));
         let keysets_calls = auth_connector.keysets_calls.clone();
         let keyset_calls = auth_connector.keyset_calls.clone();
+        mock_client.set_auth_connector(auth_connector);
 
         let wallet = WalletBuilder::new()
             .mint_url(test_mint_url())
@@ -1584,7 +1623,6 @@ mod tests {
             .localstore(db)
             .seed([0u8; 64])
             .shared_client(mock_client)
-            .auth_connector(auth_connector)
             .build()
             .expect("wallet should build");
 

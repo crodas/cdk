@@ -922,7 +922,7 @@ async fn test_fake_melt_change_in_quote() {
     )
     .unwrap();
 
-    let client = HttpClient::new(get_mint_url_from_env().parse().unwrap(), None);
+    let client = HttpClient::new(get_mint_url_from_env().parse().unwrap());
 
     let melt_request = MeltRequest::new(
         melt_quote.id.clone(),

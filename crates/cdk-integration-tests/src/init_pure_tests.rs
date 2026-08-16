@@ -21,25 +21,20 @@ use cdk::nuts::{
 };
 use cdk::types::{FeeReserve, QuoteTTL};
 use cdk::util::unix_time;
-use cdk::wallet::{AuthWallet, MintConnector, Wallet, WalletBuilder};
+use cdk::wallet::{MintConnector, Wallet, WalletBuilder};
 use cdk::{Amount, Error, MeltQuoteCreateResponse, Mint, StreamExt};
 use cdk_common::{MeltQuoteRequest, MeltQuoteResponse, MintQuoteRequest, MintQuoteResponse};
 use cdk_fake_wallet::FakeWallet;
-use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 pub struct DirectMintConnection {
     pub mint: Mint,
-    auth_wallet: Arc<RwLock<Option<AuthWallet>>>,
 }
 
 impl DirectMintConnection {
     pub fn new(mint: Mint) -> Self {
-        Self {
-            mint,
-            auth_wallet: Arc::new(RwLock::new(None)),
-        }
+        Self { mint }
     }
 }
 
@@ -364,18 +359,6 @@ impl MintConnector for DirectMintConnection {
 
     async fn post_restore(&self, request: RestoreRequest) -> Result<RestoreResponse, Error> {
         self.mint.restore(request).await
-    }
-
-    /// Get the auth wallet for the client
-    async fn get_auth_wallet(&self) -> Option<AuthWallet> {
-        self.auth_wallet.read().await.clone()
-    }
-
-    /// Set auth wallet on client
-    async fn set_auth_wallet(&self, wallet: Option<AuthWallet>) {
-        let mut auth_wallet = self.auth_wallet.write().await;
-
-        *auth_wallet = wallet;
     }
 }
 

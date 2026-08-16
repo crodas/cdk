@@ -494,19 +494,13 @@ async fn stream_client(
     let mut headers: Vec<(&str, String)> = Vec::new();
 
     {
-        let auth_wallet = client.http_client.get_auth_wallet().await;
-        let token = match auth_wallet.as_ref() {
-            Some(auth_wallet) => {
-                let endpoint = cdk_common::ProtectedEndpoint::new(Method::Get, RoutePath::Ws);
-                match auth_wallet.get_auth_for_request(&endpoint).await {
-                    Ok(token) => token,
-                    Err(err) => {
-                        tracing::warn!("Failed to get auth token: {:?}", err);
-                        None
-                    }
-                }
+        let endpoint = cdk_common::ProtectedEndpoint::new(Method::Get, RoutePath::Ws);
+        let token = match client.http_client.auth_for_request(&endpoint).await {
+            Ok(token) => token,
+            Err(err) => {
+                tracing::warn!("Failed to get auth token: {:?}", err);
+                None
             }
-            None => None,
         };
 
         if let Some(auth_token) = token {

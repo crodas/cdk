@@ -16,11 +16,15 @@ use tracing::instrument;
 use zeroize::Zeroize;
 
 use super::builder::WalletBuilder;
-use super::{AuthMintConnector, Error, MintConnector, RateLimitConfig, RateLimiterManager};
+use super::{Error, MintConnector, RateLimitConfig, RateLimiterManager};
 use crate::mint_url::MintUrl;
 use crate::nuts::CurrencyUnit;
 #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
 use crate::wallet::mint_connector::transport::TorAsync;
+use crate::wallet::mint_connector::transport::{Async, RateLimitedTransport, Transport};
+use crate::wallet::mint_connector::RateLimitedHttpClient;
+#[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
+use crate::wallet::mint_connector::RateLimitedTorHttpClient;
 use crate::{OidcClient, Wallet};
 
 /// Data extracted from a token
@@ -50,9 +54,11 @@ pub struct TokenData {
 #[derive(Clone, Default)]
 pub struct WalletConfig {
     /// Custom mint connector implementation
+    ///
+    /// The blind-auth connector is derived from it, through
+    /// [`MintConnector::auth_connector`](super::MintConnector::auth_connector),
+    /// so both ride the same transport.
     pub mint_connector: Option<Arc<dyn super::MintConnector + Send + Sync>>,
-    /// Custom auth connector implementation
-    pub auth_connector: Option<Arc<dyn super::auth::AuthMintConnector + Send + Sync>>,
     /// Target number of proofs to maintain at each denomination
     pub target_proof_count: Option<usize>,
     /// Metadata cache TTL
@@ -73,10 +79,6 @@ impl fmt::Debug for WalletConfig {
                 "mint_connector",
                 &self.mint_connector.as_ref().map(|_| "[CONFIGURED]"),
             )
-            .field(
-                "auth_connector",
-                &self.auth_connector.as_ref().map(|_| "[CONFIGURED]"),
-            )
             .field("target_proof_count", &self.target_proof_count)
             .field("metadata_cache_ttl", &self.metadata_cache_ttl)
             .finish()
@@ -95,15 +97,6 @@ impl WalletConfig {
         connector: Arc<dyn super::MintConnector + Send + Sync>,
     ) -> Self {
         self.mint_connector = Some(connector);
-        self
-    }
-
-    /// Set custom auth connector
-    pub fn with_auth_connector(
-        mut self,
-        connector: Arc<dyn super::auth::AuthMintConnector + Send + Sync>,
-    ) -> Self {
-        self.auth_connector = Some(connector);
         self
     }
 
@@ -255,30 +248,15 @@ impl WalletRepositoryBuilder {
     }
 }
 
-fn proxy_http_client(
-    mint_url: MintUrl,
-    proxy_url: &url::Url,
-    accept_invalid_certs: bool,
-) -> Result<crate::wallet::HttpClient, Error> {
+fn proxied_transport(proxy_url: &url::Url, accept_invalid_certs: bool) -> Result<Async, Error> {
     validate_proxy_url(proxy_url)?;
 
-    crate::wallet::HttpClient::with_proxy(mint_url, proxy_url.clone(), None, accept_invalid_certs)
-}
+    let mut transport = Async::default();
+    transport
+        .with_proxy(proxy_url.clone(), None, accept_invalid_certs)
+        .map_err(|err| Error::HttpError(None, err.to_string()))?;
 
-fn proxy_auth_http_client(
-    mint_url: MintUrl,
-    proxy_url: &url::Url,
-    accept_invalid_certs: bool,
-) -> Result<crate::wallet::AuthHttpClient, Error> {
-    validate_proxy_url(proxy_url)?;
-
-    crate::wallet::AuthHttpClient::with_proxy(
-        mint_url,
-        proxy_url.clone(),
-        None,
-        accept_invalid_certs,
-        None,
-    )
+    Ok(transport)
 }
 
 fn validate_proxy_url(proxy_url: &url::Url) -> Result<(), Error> {
@@ -587,42 +565,53 @@ impl WalletRepository {
         &self,
         mint_url: &MintUrl,
     ) -> Result<crate::nuts::MintInfo, Error> {
-        // Create an HTTP client based on the repository configuration
-        let client: Arc<dyn MintConnector + Send + Sync> =
-            if let Some(proxy_url) = &self.proxy_config {
-                Arc::new(proxy_http_client(
-                    mint_url.clone(),
-                    proxy_url,
-                    self.danger_accept_invalid_certs,
-                )?)
-            } else {
-                #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
-                if let Some(tor) = &self.shared_tor_transport {
-                    let transport = tor.clone();
-                    Arc::new(crate::wallet::TorHttpClient::with_transport(
-                        mint_url.clone(),
-                        transport,
-                        None,
-                    ))
-                } else {
-                    Arc::new(crate::wallet::HttpClient::new(mint_url.clone(), None))
-                }
+        self.mint_connector(mint_url.clone())?.get_mint_info().await
+    }
 
-                #[cfg(not(all(feature = "tor", not(target_arch = "wasm32"))))]
-                {
-                    Arc::new(crate::wallet::HttpClient::new(mint_url.clone(), None))
-                }
-            };
+    /// Mint connector for `mint_url`, over the repository's proxy or Tor
+    /// transport, paced by the repository's shared rate limiter.
+    ///
+    /// Every wallet gets one connector, and its blind-auth connector is derived
+    /// from it, so all of a wallet's traffic rides one transport.
+    fn mint_connector(
+        &self,
+        mint_url: MintUrl,
+    ) -> Result<Arc<dyn MintConnector + Send + Sync>, Error> {
+        if let Some(proxy_url) = &self.proxy_config {
+            let transport = proxied_transport(proxy_url, self.danger_accept_invalid_certs)?;
+            return Ok(Arc::new(RateLimitedHttpClient::with_shared_transport(
+                mint_url,
+                Arc::new(RateLimitedTransport::with_manager(
+                    transport,
+                    self.rate_limiter.clone(),
+                )),
+            )));
+        }
 
-        client.get_mint_info().await
+        #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
+        if let Some(tor) = &self.shared_tor_transport {
+            return Ok(Arc::new(RateLimitedTorHttpClient::with_shared_transport(
+                mint_url,
+                Arc::new(RateLimitedTransport::with_manager(
+                    tor.clone(),
+                    self.rate_limiter.clone(),
+                )),
+            )));
+        }
+
+        Ok(Arc::new(RateLimitedHttpClient::with_shared_transport(
+            mint_url,
+            Arc::new(RateLimitedTransport::with_manager(
+                Async::default(),
+                self.rate_limiter.clone(),
+            )),
+        )))
     }
 
     /// Internal: Create wallet with optional custom configuration
     ///
-    /// Priority order for configuration:
-    /// 1. Custom connector from config (if provided)
-    /// 2. Global settings (proxy/Tor)
-    /// 3. Default HttpClient
+    /// A connector supplied in the config wins; otherwise the wallet gets the
+    /// repository's own connector, over its proxy or Tor transport.
     async fn create_wallet_internal(
         &self,
         mint_url: MintUrl,
@@ -631,141 +620,26 @@ impl WalletRepository {
     ) -> Result<Wallet, Error> {
         let target_proof_count = config.and_then(|c| c.target_proof_count).unwrap_or(3);
         let metadata_cache_ttl = config.and_then(|c| c.metadata_cache_ttl);
-        let configured_auth_connector = config.and_then(|c| c.auth_connector.clone());
 
-        // Check if custom connector is provided in config
-        if let Some(cfg) = config {
-            if let Some(custom_connector) = &cfg.mint_connector {
-                // Use custom connector with WalletBuilder
-                let mut builder = WalletBuilder::new()
-                    .mint_url(mint_url.clone())
-                    .unit(unit.clone())
-                    .localstore(self.localstore.clone())
-                    .seed(self.seed)
-                    .target_proof_count(target_proof_count)
-                    .with_rate_limiter(self.rate_limiter.clone())
-                    .shared_client(custom_connector.clone());
-
-                if let Some(auth_connector) = configured_auth_connector.clone() {
-                    builder = builder.auth_connector(auth_connector);
-                }
-
-                if let Some(ttl) = metadata_cache_ttl {
-                    builder = builder.set_metadata_cache_ttl(Some(ttl));
-                }
-
-                return builder.build();
-            }
-        }
-
-        // Fall back to existing logic: proxy/Tor/default
-        let wallet = if let Some(proxy_url) = &self.proxy_config {
-            // Create wallet with proxy-configured client
-            let client = proxy_http_client(
-                mint_url.clone(),
-                proxy_url,
-                self.danger_accept_invalid_certs,
-            )?;
-            let auth_connector = match configured_auth_connector.clone() {
-                Some(auth_connector) => auth_connector,
-                None => Arc::new(proxy_auth_http_client(
-                    mint_url.clone(),
-                    proxy_url,
-                    self.danger_accept_invalid_certs,
-                )?) as Arc<dyn AuthMintConnector + Send + Sync>,
-            };
-            let mut builder = WalletBuilder::new()
-                .mint_url(mint_url.clone())
-                .unit(unit.clone())
-                .localstore(self.localstore.clone())
-                .seed(self.seed)
-                .target_proof_count(target_proof_count)
-                .with_rate_limiter(self.rate_limiter.clone())
-                .client(client)
-                .auth_connector(auth_connector);
-
-            if let Some(ttl) = metadata_cache_ttl {
-                builder = builder.set_metadata_cache_ttl(Some(ttl));
-            }
-
-            builder.build()?
-        } else {
-            #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
-            if let Some(tor) = &self.shared_tor_transport {
-                // Create wallet with Tor transport client, cloning the shared transport
-                let client = crate::wallet::TorHttpClient::with_transport(
-                    mint_url.clone(),
-                    tor.clone(),
-                    None,
-                );
-                let auth_connector = configured_auth_connector.clone().unwrap_or_else(|| {
-                    Arc::new(crate::wallet::TorAuthHttpClient::with_transport(
-                        mint_url.clone(),
-                        tor.clone(),
-                        None,
-                    )) as Arc<dyn AuthMintConnector + Send + Sync>
-                });
-
-                let mut builder = WalletBuilder::new()
-                    .mint_url(mint_url.clone())
-                    .unit(unit.clone())
-                    .localstore(self.localstore.clone())
-                    .seed(self.seed)
-                    .target_proof_count(target_proof_count)
-                    .with_rate_limiter(self.rate_limiter.clone())
-                    .client(client)
-                    .auth_connector(auth_connector);
-
-                if let Some(ttl) = metadata_cache_ttl {
-                    builder = builder.set_metadata_cache_ttl(Some(ttl));
-                }
-
-                builder.build()?
-            } else {
-                // Create wallet with default client
-                let mut builder = WalletBuilder::new()
-                    .mint_url(mint_url.clone())
-                    .unit(unit.clone())
-                    .localstore(self.localstore.clone())
-                    .seed(self.seed)
-                    .target_proof_count(target_proof_count)
-                    .with_rate_limiter(self.rate_limiter.clone());
-
-                if let Some(auth_connector) = configured_auth_connector.clone() {
-                    builder = builder.auth_connector(auth_connector);
-                }
-
-                if let Some(ttl) = metadata_cache_ttl {
-                    builder = builder.set_metadata_cache_ttl(Some(ttl));
-                }
-
-                builder.build()?
-            }
-
-            #[cfg(not(all(feature = "tor", not(target_arch = "wasm32"))))]
-            {
-                // Create wallet with default client
-                let mut builder = WalletBuilder::new()
-                    .mint_url(mint_url.clone())
-                    .unit(unit.clone())
-                    .localstore(self.localstore.clone())
-                    .seed(self.seed)
-                    .target_proof_count(target_proof_count)
-                    .with_rate_limiter(self.rate_limiter.clone());
-
-                if let Some(auth_connector) = configured_auth_connector.clone() {
-                    builder = builder.auth_connector(auth_connector);
-                }
-
-                if let Some(ttl) = metadata_cache_ttl {
-                    builder = builder.set_metadata_cache_ttl(Some(ttl));
-                }
-
-                builder.build()?
-            }
+        let client = match config.and_then(|c| c.mint_connector.clone()) {
+            Some(custom_connector) => custom_connector,
+            None => self.mint_connector(mint_url.clone())?,
         };
 
-        Ok(wallet)
+        let mut builder = WalletBuilder::new()
+            .mint_url(mint_url)
+            .unit(unit)
+            .localstore(self.localstore.clone())
+            .seed(self.seed)
+            .target_proof_count(target_proof_count)
+            .with_rate_limiter(self.rate_limiter.clone())
+            .shared_client(client);
+
+        if let Some(ttl) = metadata_cache_ttl {
+            builder = builder.set_metadata_cache_ttl(Some(ttl));
+        }
+
+        builder.build()
     }
 
     /// Load all wallets from database
@@ -1260,6 +1134,23 @@ mod tests {
         listener_handle.abort();
         assert!(result.is_err());
         assert_eq!(direct_connections.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn proxied_wallets_are_paced_by_the_repository_limiter() {
+        // The proxied client is built over the repository's rate-limited
+        // transport, so the wallet keeps the limiter and its runtime setters
+        // reach the traffic that actually goes through the proxy.
+        let proxy_url: url::Url = "http://127.0.0.1:1/".parse().expect("valid proxy url");
+        let repo = create_test_repository_with_proxy(proxy_url).await;
+        let mint_url: MintUrl = "https://mint.example.com".parse().unwrap();
+
+        let wallet = repo
+            .create_wallet(mint_url, CurrencyUnit::Sat, None)
+            .await
+            .expect("wallet should be created");
+
+        assert!(wallet.rate_limiter.is_some());
     }
 
     #[tokio::test]

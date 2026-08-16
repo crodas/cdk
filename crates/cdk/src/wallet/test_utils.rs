@@ -16,9 +16,9 @@ use cdk_common::nuts::{
 };
 use cdk_common::wallet::{MeltQuote, MintQuote};
 use cdk_common::{
-    Amount, CheckStateRequest, CheckStateResponse, MeltQuoteCreateResponse, MeltQuoteRequest,
-    MeltQuoteResponse, MeltRequest, MintQuoteRequest, MintQuoteResponse, MintRequest, MintResponse,
-    RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
+    Amount, AuthToken, CheckStateRequest, CheckStateResponse, MeltQuoteCreateResponse,
+    MeltQuoteRequest, MeltQuoteResponse, MeltRequest, MintQuoteRequest, MintQuoteResponse,
+    MintRequest, MintResponse, RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
 };
 
 use crate::nuts::{
@@ -26,7 +26,7 @@ use crate::nuts::{
     MeltQuoteState, NUT04Settings, NUT05Settings, PaymentMethod, SecretKey, State,
 };
 use crate::secret::Secret;
-use crate::wallet::{MintConnector, Wallet};
+use crate::wallet::{AuthHttpClient, AuthMintConnector, MintConnector, Wallet};
 use crate::Error;
 
 /// Create test database
@@ -502,6 +502,12 @@ pub struct MockMintConnector {
     /// Response for DNS TXT resolution calls
     #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
     pub dns_txt_response: Mutex<Option<Result<Vec<String>, Error>>>,
+    /// Auth connector handed out by [`MintConnector::auth_connector`], and the
+    /// CATs it was asked for, so tests can assert the auth wallet is derived
+    /// from the connector rather than injected alongside it.
+    pub auth_connector: Mutex<Option<Arc<dyn AuthMintConnector + Send + Sync>>>,
+    /// CATs passed to each [`MintConnector::auth_connector`] call.
+    pub auth_connector_calls: Mutex<Vec<Option<AuthToken>>>,
 }
 
 impl Default for MockMintConnector {
@@ -540,7 +546,13 @@ impl MockMintConnector {
             lnurl_invoice_response: Mutex::new(None),
             #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
             dns_txt_response: Mutex::new(None),
+            auth_connector: Mutex::new(None),
+            auth_connector_calls: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn set_auth_connector(&self, connector: Arc<dyn AuthMintConnector + Send + Sync>) {
+        *self.auth_connector.lock().unwrap() = Some(connector);
     }
 
     pub fn set_check_state_response(&self, response: Result<CheckStateResponse, Error>) {
@@ -732,6 +744,19 @@ impl MockMintConnector {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl MintConnector for MockMintConnector {
+    fn auth_connector(
+        &self,
+        mint_url: MintUrl,
+        cat: Option<AuthToken>,
+    ) -> Arc<dyn AuthMintConnector + Send + Sync> {
+        self.auth_connector_calls.lock().unwrap().push(cat.clone());
+
+        match self.auth_connector.lock().unwrap().clone() {
+            Some(connector) => connector,
+            None => Arc::new(AuthHttpClient::new(mint_url, cat)),
+        }
+    }
+
     #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
     async fn resolve_dns_txt(&self, _domain: &str) -> Result<Vec<String>, Error> {
         self.dns_txt_response
@@ -904,12 +929,6 @@ impl MintConnector for MockMintConnector {
             .take()
             .expect("MockMintConnector: post_restore called without configured response")
     }
-
-    async fn get_auth_wallet(&self) -> Option<crate::wallet::AuthWallet> {
-        None
-    }
-
-    async fn set_auth_wallet(&self, _wallet: Option<crate::wallet::AuthWallet>) {}
 
     async fn post_melt(
         &self,

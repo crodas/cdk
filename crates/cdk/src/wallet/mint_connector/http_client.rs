@@ -30,7 +30,7 @@ use crate::nuts::{
     Id, KeySet, KeysResponse, KeysetResponse, MeltOnchainRequest, MeltRequest, MintInfo,
     MintRequest, MintResponse, RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
 };
-use crate::wallet::auth::{AuthMintConnector, AuthWallet};
+use crate::wallet::auth::{AuthMintConnector, AuthTokenProvider};
 use crate::OidcClient;
 
 type Cache = (u64, HashSet<(nut19::Method, nut19::Path)>);
@@ -90,7 +90,7 @@ where
     transport: Arc<T>,
     mint_url: MintUrl,
     cache_support: Arc<StdRwLock<Cache>>,
-    auth_wallet: Arc<RwLock<Option<AuthWallet>>>,
+    auth_provider: Arc<StdRwLock<Option<Arc<dyn AuthTokenProvider>>>>,
 }
 
 impl<T> fmt::Debug for HttpClient<T>
@@ -102,7 +102,7 @@ where
             .field("transport", &core::any::type_name::<T>())
             .field("mint_url", &self.mint_url)
             .field("cache_support", &"[INTERNAL]")
-            .field("auth_wallet", &"[REDACTED]")
+            .field("auth_provider", &"[REDACTED]")
             .finish()
     }
 }
@@ -193,42 +193,29 @@ where
     }
 
     /// Create new [`HttpClient`] with a provided transport implementation.
-    pub fn with_transport(
-        mint_url: MintUrl,
-        transport: T,
-        auth_wallet: Option<AuthWallet>,
-    ) -> Self {
-        Self::with_shared_transport(mint_url, Arc::new(transport), auth_wallet)
+    pub fn with_transport(mint_url: MintUrl, transport: T) -> Self {
+        Self::with_shared_transport(mint_url, Arc::new(transport))
     }
 
     /// Create new [`HttpClient`] sharing an existing transport instance.
     ///
     /// Lets several clients (for example the main and blind-auth clients) reuse
     /// one transport, and so its connection pool and any rate limiter it wraps.
-    pub fn with_shared_transport(
-        mint_url: MintUrl,
-        transport: Arc<T>,
-        auth_wallet: Option<AuthWallet>,
-    ) -> Self {
+    pub fn with_shared_transport(mint_url: MintUrl, transport: Arc<T>) -> Self {
         Self {
             transport,
             mint_url,
-            auth_wallet: Arc::new(RwLock::new(auth_wallet)),
+            auth_provider: Default::default(),
             cache_support: Default::default(),
         }
     }
 
     /// Create new [`HttpClient`]
-    pub fn new(mint_url: MintUrl, auth_wallet: Option<AuthWallet>) -> Self
+    pub fn new(mint_url: MintUrl) -> Self
     where
         T: Default,
     {
-        Self {
-            transport: T::default().into(),
-            mint_url,
-            auth_wallet: Arc::new(RwLock::new(auth_wallet)),
-            cache_support: Default::default(),
-        }
+        Self::with_shared_transport(mint_url, T::default().into())
     }
 
     /// Get auth token for a protected endpoint
@@ -238,14 +225,8 @@ where
         method: Method,
         path: RoutePath,
     ) -> Result<Option<AuthToken>, Error> {
-        let auth_wallet = self.auth_wallet.read().await;
-        match auth_wallet.as_ref() {
-            Some(auth_wallet) => {
-                let endpoint = ProtectedEndpoint::new(method, path);
-                auth_wallet.get_auth_for_request(&endpoint).await
-            }
-            None => Ok(None),
-        }
+        self.auth_for_request(&ProtectedEndpoint::new(method, path))
+            .await
     }
 
     /// Create new [`HttpClient`] with a proxy for specific TLDs.
@@ -265,12 +246,7 @@ where
             .with_proxy(proxy, host_matcher, accept_invalid_certs)
             .map_err(Self::map_http_error)?;
 
-        Ok(Self {
-            transport: transport.into(),
-            mint_url,
-            auth_wallet: Arc::new(RwLock::new(None)),
-            cache_support: Default::default(),
-        })
+        Ok(Self::with_shared_transport(mint_url, transport.into()))
     }
 
     /// Generic implementation of a retriable http request
@@ -409,9 +385,9 @@ where
         mint_url: MintUrl,
         cat: Option<AuthToken>,
     ) -> Arc<dyn AuthMintConnector + Send + Sync> {
-        Arc::new(AuthHttpClient::with_transport(
+        Arc::new(AuthHttpClient::with_shared_transport(
             mint_url,
-            self.transport.as_ref().clone(),
+            self.transport.clone(),
             cat,
         ))
     }
@@ -953,12 +929,26 @@ where
         Ok(info)
     }
 
-    async fn get_auth_wallet(&self) -> Option<AuthWallet> {
-        self.auth_wallet.read().await.clone()
+    fn set_auth_provider(&self, provider: Option<Arc<dyn AuthTokenProvider>>) {
+        if let Ok(mut auth_provider) = self.auth_provider.write() {
+            *auth_provider = provider;
+        }
     }
 
-    async fn set_auth_wallet(&self, wallet: Option<AuthWallet>) {
-        *self.auth_wallet.write().await = wallet;
+    async fn auth_for_request(
+        &self,
+        endpoint: &ProtectedEndpoint,
+    ) -> Result<Option<AuthToken>, Error> {
+        let provider = self
+            .auth_provider
+            .read()
+            .ok()
+            .and_then(|provider| provider.clone());
+
+        match provider {
+            Some(provider) => provider.auth_for_request(endpoint).await,
+            None => Ok(None),
+        }
     }
 
     /// Spendable check [NUT-07]
@@ -1061,27 +1051,6 @@ where
                 cat.unwrap_or(AuthToken::ClearAuth("".to_string())),
             )),
         }
-    }
-
-    /// Create new [`AuthHttpClient`] with a proxy for specific TLDs.
-    /// Specifying `None` for `host_matcher` will use the proxy for all
-    /// requests.
-    pub fn with_proxy(
-        mint_url: MintUrl,
-        proxy: Url,
-        host_matcher: Option<&str>,
-        accept_invalid_certs: bool,
-        cat: Option<AuthToken>,
-    ) -> Result<Self, Error>
-    where
-        T: Default,
-    {
-        let mut transport = T::default();
-        transport
-            .with_proxy(proxy, host_matcher, accept_invalid_certs)
-            .map_err(HttpClient::<T>::map_http_error)?;
-
-        Ok(Self::with_transport(mint_url, transport, cat))
     }
 }
 
@@ -1292,15 +1261,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn http_client_debug_does_not_traverse_auth_wallet() {
+    #[tokio::test]
+    async fn auth_connector_shares_the_clients_transport() {
+        // Auth requests must go out over the same transport as everything else,
+        // so a proxy, a Tor circuit or a rate limiter applies to both.
         let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
-        let client = HttpClient::with_transport(mint_url, MockTransport::default(), None);
+        let transport = MockTransport::default();
+        let get_urls = transport.get_urls.clone();
+        *transport.get_response.lock().expect("lock") =
+            Some(serde_json::to_string(&MintInfo::default()).expect("serialize mint info"));
+
+        let client = HttpClient::with_transport(mint_url.clone(), transport);
+        let auth_client = client.auth_connector(mint_url, None);
+
+        auth_client
+            .get_mint_info()
+            .await
+            .expect("mock transport should answer");
+
+        let urls = get_urls.lock().expect("lock").clone();
+        assert_eq!(urls.len(), 1, "auth request did not reach the transport");
+        assert!(urls[0].contains("/v1/info"));
+    }
+
+    #[test]
+    fn http_client_debug_does_not_traverse_auth_provider() {
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, MockTransport::default());
 
         let debug = format!("{client:?}");
 
         assert!(debug.contains("https://mint.example.com"));
-        assert!(debug.contains("auth_wallet: \"[REDACTED]\""));
+        assert!(debug.contains("auth_provider: \"[REDACTED]\""));
     }
 
     /// Regression test: `post_mint_quote` must send only the
@@ -1333,7 +1325,7 @@ mod tests {
         let captured = transport.captured_payload.clone();
 
         let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
-        let client = HttpClient::with_transport(mint_url, transport, None);
+        let client = HttpClient::with_transport(mint_url, transport);
 
         let request = MintQuoteRequest::Custom {
             method: PaymentMethod::Custom("paypal".to_string()),
@@ -1397,7 +1389,7 @@ mod tests {
         };
         let post_urls = transport.post_urls.clone();
         let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
-        let client = HttpClient::with_transport(mint_url, transport, None);
+        let client = HttpClient::with_transport(mint_url, transport);
         *client.cache_support.write().expect("cache lock") =
             (1, HashSet::from([(nut19::Method::Post, nut19::Path::Swap)]));
 
@@ -1431,7 +1423,7 @@ mod tests {
         };
         let post_urls = transport.post_urls.clone();
         let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
-        let client = HttpClient::with_transport(mint_url, transport, None);
+        let client = HttpClient::with_transport(mint_url, transport);
         *client.cache_support.write().expect("cache lock") =
             (1, HashSet::from([(nut19::Method::Post, nut19::Path::Swap)]));
 
@@ -1459,7 +1451,7 @@ mod tests {
         };
         let post_urls = transport.post_urls.clone();
         let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
-        let client = HttpClient::with_transport(mint_url, transport, None);
+        let client = HttpClient::with_transport(mint_url, transport);
         *client.cache_support.write().expect("cache lock") =
             (1, HashSet::from([(nut19::Method::Post, nut19::Path::Swap)]));
 
@@ -1491,7 +1483,7 @@ mod tests {
         };
         let post_urls = transport.post_urls.clone();
         let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
-        let client = HttpClient::with_transport(mint_url, transport, None);
+        let client = HttpClient::with_transport(mint_url, transport);
         *client.cache_support.write().expect("cache lock") =
             (1, HashSet::from([(nut19::Method::Post, nut19::Path::Swap)]));
 
@@ -1521,7 +1513,7 @@ mod tests {
         };
         let post_urls = transport.post_urls.clone();
         let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
-        let client = HttpClient::with_transport(mint_url, transport, None);
+        let client = HttpClient::with_transport(mint_url, transport);
 
         let result: Result<serde_json::Value, Error> = client
             .retriable_http_request(
@@ -1542,7 +1534,7 @@ mod tests {
         let get_urls = transport.get_urls.clone();
         let post_urls = transport.post_urls.clone();
         let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
-        let client = HttpClient::with_transport(mint_url, transport, None);
+        let client = HttpClient::with_transport(mint_url, transport);
         let invalid_method = PaymentMethod::Custom("../../v1/swap".to_string());
 
         let result = client
@@ -1650,7 +1642,7 @@ mod tests {
             ..Default::default()
         };
         let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
-        let client = HttpClient::with_transport(mint_url, transport, None);
+        let client = HttpClient::with_transport(mint_url, transport);
 
         let response = client
             .get_mint_quote_status(PaymentMethod::Custom("paypal".to_string()), "test-quote-id")
@@ -1688,7 +1680,7 @@ mod tests {
             ..Default::default()
         };
         let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
-        let client = HttpClient::with_transport(mint_url, transport, None);
+        let client = HttpClient::with_transport(mint_url, transport);
 
         let responses = client
             .post_batch_check_mint_quote_status(
@@ -1729,7 +1721,7 @@ mod tests {
             ..Default::default()
         };
         let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
-        let client = HttpClient::with_transport(mint_url, transport, None);
+        let client = HttpClient::with_transport(mint_url, transport);
 
         let response = client
             .post_melt_quote(MeltQuoteRequest::Custom(MeltQuoteCustomRequest {
@@ -1756,7 +1748,7 @@ mod tests {
         let transport = MockTransport::default();
         let get_urls = transport.get_urls.clone();
         let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
-        let client = HttpClient::with_transport(mint_url, transport, None);
+        let client = HttpClient::with_transport(mint_url, transport);
 
         let result = client
             .fetch_lnurl_invoice("http://127.0.0.1:8332/?amount=1000")

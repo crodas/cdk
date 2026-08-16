@@ -524,7 +524,7 @@ async fn test_fake_melt_change_in_quote() {
     )
     .unwrap();
 
-    let client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let client = HttpClient::new(MINT_URL.parse().unwrap());
 
     let melt_request = MeltRequest::new(
         melt_quote.id.clone(),
@@ -609,7 +609,7 @@ async fn test_fake_mint_without_witness() {
         .expect("payment")
         .expect("no error");
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
 
     let active_keyset_id = wallet.active_keyset().await.unwrap().id;
     let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
@@ -664,7 +664,7 @@ async fn test_fake_mint_with_wrong_witness() {
         .expect("payment")
         .expect("no error");
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
 
     let active_keyset_id = wallet.active_keyset().await.unwrap().id;
     let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
@@ -754,7 +754,7 @@ async fn test_fake_mint_inflated() {
             .sign(&secret_key)
             .expect("failed to sign the mint request");
     }
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
 
     let response = http_client
         .post_mint(
@@ -827,7 +827,7 @@ async fn test_fake_mint_inflated_does_not_consume_quote() {
         .sign(&secret_key)
         .expect("failed to sign inflated mint request");
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let inflated_response = http_client
         .post_mint(
             &PaymentMethod::Known(KnownMethod::Bolt11),
@@ -968,12 +968,12 @@ async fn test_fake_mint_concurrent_same_quote_different_outputs() {
 
     let (result_one, result_two) = tokio::join!(
         async {
-            HttpClient::new(MINT_URL.parse().unwrap(), None)
+            HttpClient::new(MINT_URL.parse().unwrap())
                 .post_mint(&PaymentMethod::Known(KnownMethod::Bolt11), request_one)
                 .await
         },
         async {
-            HttpClient::new(MINT_URL.parse().unwrap(), None)
+            HttpClient::new(MINT_URL.parse().unwrap())
                 .post_mint(&PaymentMethod::Known(KnownMethod::Bolt11), request_two)
                 .await
         }
@@ -1075,7 +1075,7 @@ async fn test_fake_mint_multiple_units() {
             .sign(&secret_key)
             .expect("failed to sign the mint request");
     }
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
 
     let response = http_client
         .post_mint(
@@ -1168,7 +1168,7 @@ async fn test_fake_mint_multiple_unit_swap() {
 
         let swap_request = SwapRequest::new(inputs, pre_mint.blinded_messages());
 
-        let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+        let http_client = HttpClient::new(MINT_URL.parse().unwrap());
         let response = http_client.post_swap(swap_request.clone()).await;
 
         match response {
@@ -1214,7 +1214,7 @@ async fn test_fake_mint_multiple_unit_swap() {
 
         let swap_request = SwapRequest::new(inputs, usd_outputs);
 
-        let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+        let http_client = HttpClient::new(MINT_URL.parse().unwrap());
         let response = http_client.post_swap(swap_request.clone()).await;
 
         match response {
@@ -1300,7 +1300,7 @@ async fn test_fake_mint_multiple_unit_melt() {
 
         let melt_request = MeltRequest::new(melt_quote.id, inputs, None);
 
-        let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+        let http_client = HttpClient::new(MINT_URL.parse().unwrap());
         let response = http_client
             .post_melt(
                 &PaymentMethod::Known(KnownMethod::Bolt11),
@@ -1357,7 +1357,7 @@ async fn test_fake_mint_multiple_unit_melt() {
 
         let melt_request = MeltRequest::new(quote.id, inputs, Some(usd_outputs));
 
-        let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+        let http_client = HttpClient::new(MINT_URL.parse().unwrap());
 
         let response = http_client
             .post_melt(
@@ -1428,7 +1428,7 @@ async fn test_fake_mint_input_output_mismatch() {
 
     let swap_request = SwapRequest::new(inputs, pre_mint.blinded_messages());
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let response = http_client.post_swap(swap_request.clone()).await;
 
     match response {
@@ -1479,7 +1479,7 @@ async fn test_fake_mint_swap_inflated() {
 
     let swap_request = SwapRequest::new(proofs, pre_mint.blinded_messages());
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let response = http_client.post_swap(swap_request.clone()).await;
 
     match response {
@@ -1533,7 +1533,7 @@ async fn test_fake_mint_swap_spend_after_fail() {
 
     let swap_request = SwapRequest::new(proofs.clone(), pre_mint.blinded_messages());
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let response = http_client.post_swap(swap_request.clone()).await;
 
     assert!(response.is_ok());
@@ -1548,7 +1548,7 @@ async fn test_fake_mint_swap_spend_after_fail() {
 
     let swap_request = SwapRequest::new(proofs.clone(), pre_mint.blinded_messages());
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let response = http_client.post_swap(swap_request.clone()).await;
 
     match response {
@@ -1569,7 +1569,7 @@ async fn test_fake_mint_swap_spend_after_fail() {
 
     let swap_request = SwapRequest::new(proofs, pre_mint.blinded_messages());
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let response = http_client.post_swap(swap_request.clone()).await;
 
     match response {
@@ -1623,7 +1623,7 @@ async fn test_fake_mint_melt_spend_after_fail() {
 
     let swap_request = SwapRequest::new(proofs.clone(), pre_mint.blinded_messages());
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let response = http_client.post_swap(swap_request.clone()).await;
 
     assert!(response.is_ok());
@@ -1638,7 +1638,7 @@ async fn test_fake_mint_melt_spend_after_fail() {
 
     let swap_request = SwapRequest::new(proofs.clone(), pre_mint.blinded_messages());
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let response = http_client.post_swap(swap_request.clone()).await;
 
     match response {
@@ -1658,7 +1658,7 @@ async fn test_fake_mint_melt_spend_after_fail() {
 
     let melt_request = MeltRequest::new(melt_quote.id, proofs, None);
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let response = http_client
         .post_melt(
             &PaymentMethod::Known(KnownMethod::Bolt11),
@@ -1719,7 +1719,7 @@ async fn test_fake_mint_duplicate_proofs_swap() {
 
     let swap_request = SwapRequest::new(inputs.clone(), pre_mint.blinded_messages());
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let response = http_client.post_swap(swap_request.clone()).await;
 
     match response {
@@ -1744,7 +1744,7 @@ async fn test_fake_mint_duplicate_proofs_swap() {
 
     let swap_request = SwapRequest::new(inputs, outputs);
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let response = http_client.post_swap(swap_request.clone()).await;
 
     match response {
@@ -1799,7 +1799,7 @@ async fn test_fake_mint_duplicate_proofs_melt() {
 
     let melt_request = MeltRequest::new(melt_quote.id, inputs, None);
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let response = http_client
         .post_melt(
             &PaymentMethod::Known(KnownMethod::Bolt11),
@@ -2193,7 +2193,7 @@ async fn test_wallet_proof_recovery_after_failed_swap() {
     let swap_request = SwapRequest::new(unspent_proofs.clone(), preswap.blinded_messages());
 
     // Use HTTP client directly to bypass wallet's validation and trigger recovery
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let response = http_client.post_swap(swap_request).await;
     assert!(response.is_err(), "Swap should have failed");
 
@@ -2756,7 +2756,7 @@ async fn test_check_mint_quote_status_updates_amount_issued_for_bolt12() {
         "quote should be fully issued after minting"
     );
 
-    let http_client = HttpClient::new(MINT_URL.parse().unwrap(), None);
+    let http_client = HttpClient::new(MINT_URL.parse().unwrap());
     let mint_response = http_client
         .get_mint_quote_status(PaymentMethod::BOLT12, &mint_quote.id)
         .await

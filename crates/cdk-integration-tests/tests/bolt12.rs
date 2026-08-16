@@ -436,7 +436,7 @@ async fn test_regtest_bolt12_mint_extra() -> Result<()> {
         mint_request.sign(&secret_key)?;
     }
 
-    let http_client = HttpClient::new(get_mint_url_from_env().parse().unwrap(), None);
+    let http_client = HttpClient::new(get_mint_url_from_env().parse().unwrap());
 
     let response = http_client
         .post_mint(&PaymentMethod::BOLT12, mint_request.clone())

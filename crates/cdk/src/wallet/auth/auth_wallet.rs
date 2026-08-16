@@ -18,7 +18,6 @@ use crate::nuts::{
     nut12, AuthRequired, AuthToken, BlindAuthToken, CurrencyUnit, KeySetInfo, PreMintSecrets,
     Proofs, ProtectedEndpoint, State,
 };
-use crate::wallet::mint_connector::AuthHttpClient;
 use crate::wallet::mint_metadata_cache::MintMetadataCache;
 use crate::{Amount, Error, OidcClient};
 
@@ -67,27 +66,6 @@ impl fmt::Debug for AuthWallet {
 }
 
 impl AuthWallet {
-    /// Create a new [`AuthWallet`] instance
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        mint_url: MintUrl,
-        cat: Option<AuthToken>,
-        localstore: Arc<dyn WalletDatabase<database::Error> + Send + Sync>,
-        metadata_cache: Arc<MintMetadataCache>,
-        protected_endpoints: HashMap<ProtectedEndpoint, AuthRequired>,
-        oidc_client: Option<OidcClient>,
-    ) -> Self {
-        let http_client = Arc::new(AuthHttpClient::new(mint_url.clone(), cat));
-        Self::with_auth_client(
-            mint_url,
-            localstore,
-            metadata_cache,
-            protected_endpoints,
-            oidc_client,
-            http_client,
-        )
-    }
-
     /// Create a new [`AuthWallet`] instance with a provided auth connector.
     pub fn with_auth_client(
         mint_url: MintUrl,
@@ -106,12 +84,6 @@ impl AuthWallet {
             auth_client,
             oidc_client: Arc::new(RwLock::new(oidc_client)),
         }
-    }
-
-    /// Get the current auth token
-    #[instrument(skip(self))]
-    pub async fn get_auth_token(&self) -> Result<AuthToken, Error> {
-        self.auth_client.get_auth_token().await
     }
 
     /// Set a new auth token
@@ -156,12 +128,6 @@ impl AuthWallet {
     #[instrument(skip_all)]
     pub async fn set_refresh_token(&self, token: Option<String>) {
         *self.refresh_token.write().await = token;
-    }
-
-    /// Get the OIDC client if one exists
-    #[instrument(skip(self))]
-    pub async fn get_oidc_client(&self) -> Option<OidcClient> {
-        self.oidc_client.read().await.clone()
     }
 
     /// Set a new OIDC client
@@ -543,6 +509,7 @@ mod tests {
 
     use super::*;
     use crate::nuts::{Method, RoutePath};
+    use crate::wallet::mint_connector::AuthHttpClient;
 
     async fn auth_wallet(
         protected_endpoints: HashMap<ProtectedEndpoint, AuthRequired>,
@@ -556,13 +523,15 @@ mod tests {
         );
         let metadata_cache = Arc::new(MintMetadataCache::new(mint_url.clone()));
 
-        AuthWallet::new(
+        let auth_client = Arc::new(AuthHttpClient::new(mint_url.clone(), None));
+
+        AuthWallet::with_auth_client(
             mint_url,
-            None,
             localstore,
             metadata_cache,
             protected_endpoints,
             None,
+            auth_client,
         )
     }
 

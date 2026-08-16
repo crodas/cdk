@@ -1189,7 +1189,7 @@ async fn test_onchain_attempt_to_mint_unpaid() {
         signature: None,
     };
 
-    let response = cdk::wallet::HttpClient::new(get_mint_url_from_env().parse().unwrap(), None)
+    let response = cdk::wallet::HttpClient::new(get_mint_url_from_env().parse().unwrap())
         .post_mint(&PaymentMethod::from_str("onchain").unwrap(), request)
         .await;
 
