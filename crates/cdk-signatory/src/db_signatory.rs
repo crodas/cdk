@@ -15,18 +15,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use bitcoin::bip32::{DerivationPath, Xpriv};
+use bitcoin::secp256k1::schnorr::Signature;
 use bitcoin::secp256k1::{self, Secp256k1};
 use cdk_common::database::MintKeyDatabaseTransaction;
 use cdk_common::dhke::{sign_message, verify_message};
 use cdk_common::mint::MintKeySetInfo;
 use cdk_common::nuts::{BlindSignature, BlindedMessage, CurrencyUnit, Id, MintKeySet, Proof};
-use cdk_common::{database, Error, PublicKey};
+use cdk_common::{database, Error, PublicKey, SecretKey};
 use tokio::sync::{watch, Mutex};
 use tracing::instrument;
 
 use crate::common::{
     check_unit_string_collision, create_new_keyset, derivation_path_from_unit, init_keysets,
 };
+use crate::identity::derive_identity_key;
 use crate::signatory::{RotateKeyArguments, Signatory, SignatoryKeySet, SignatoryKeysets};
 
 /// Immutable in-memory view of the keysets, swapped atomically on every change.
@@ -70,8 +72,13 @@ pub struct DbSignatory {
     custom_paths: HashMap<CurrencyUnit, DerivationPath>,
     /// Units to initialize on boot, as `init_keysets` expects them.
     supported_units: HashMap<CurrencyUnit, (u64, Vec<u64>)>,
+    /// Root of the keyset derivation tree. The identity key is a sibling of it,
+    /// not its parent.
     xpriv: Xpriv,
-    xpub: PublicKey,
+    /// Published as the mint's `pubkey`, and the key [`Signatory::sign`] signs
+    /// with.
+    identity_pubkey: PublicKey,
+    identity_key: SecretKey,
     /// Latest keyset snapshot, published on every reload (initial load and each
     /// rotation).
     keyset_updates: watch::Sender<SignatoryKeysets>,
@@ -96,9 +103,10 @@ impl DbSignatory {
         let secp_ctx = Secp256k1::new();
         let xpriv = Xpriv::new_master(bitcoin::Network::Bitcoin, seed).expect("RNG busted");
 
-        let xpub: PublicKey = xpriv.to_keypair(&secp_ctx).public_key().into();
+        let identity_key = derive_identity_key(seed)?;
+        let identity_pubkey = identity_key.public_key();
         let (keyset_updates, _) = watch::channel(SignatoryKeysets {
-            pubkey: xpub,
+            pubkey: identity_pubkey,
             keysets: vec![],
         });
 
@@ -108,7 +116,8 @@ impl DbSignatory {
             localstore,
             custom_paths,
             supported_units,
-            xpub,
+            identity_pubkey,
+            identity_key,
             secp_ctx,
             xpriv,
             keyset_updates,
@@ -303,7 +312,7 @@ impl DbSignatory {
     fn publish_latest(&self) {
         self.keyset_updates.send_modify(|out| {
             let latest = self.keysets.load();
-            out.pubkey = self.xpub;
+            out.pubkey = self.identity_pubkey;
             out.keysets = latest.by_id.values().map(|k| k.into()).collect();
         });
     }
@@ -324,7 +333,7 @@ impl DbSignatory {
     /// Snapshot the current keysets from memory (lock-free).
     fn keysets_snapshot(&self) -> SignatoryKeysets {
         SignatoryKeysets {
-            pubkey: self.xpub,
+            pubkey: self.identity_pubkey,
             keysets: self
                 .keysets
                 .load()
@@ -396,6 +405,11 @@ impl Signatory for DbSignatory {
             verify_message(&key_pair.secret_key, proof.c, proof.secret.as_bytes())?;
             Ok(())
         })
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn sign(&self, payload: Vec<u8>) -> Result<Signature, Error> {
+        Ok(self.identity_key.sign(&payload)?)
     }
 
     #[tracing::instrument(skip_all)]
@@ -726,6 +740,63 @@ mod test {
             "expected ExpiredKeyset error, got: {:?}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn sign_verifies_against_published_pubkey() {
+        let store = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("in-memory db"),
+        );
+        let signatory = DbSignatory::new(
+            store,
+            b"test-seed-for-identity-signing",
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("DbSignatory::new");
+
+        let payload = b"an arbitrary stream of bytes".to_vec();
+        let signature = signatory.sign(payload.clone()).await.expect("sign");
+
+        let keysets = signatory.keysets().await.expect("keysets");
+        keysets
+            .pubkey
+            .verify(&payload, &signature)
+            .expect("signature must verify against the published pubkey");
+
+        assert!(
+            keysets.pubkey.verify(b"tampered", &signature).is_err(),
+            "a tampered payload must not verify"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_key_is_stable_across_instances_with_the_same_seed() {
+        let seed = b"test-seed-for-stable-identity";
+        let make = || async {
+            let store = Arc::new(
+                cdk_sqlite::mint::memory::empty()
+                    .await
+                    .expect("in-memory db"),
+            );
+            DbSignatory::new(store, seed, Default::default(), Default::default())
+                .await
+                .expect("DbSignatory::new")
+        };
+
+        let first = make().await;
+        let second = make().await;
+
+        let payload = b"payload".to_vec();
+        let signature = first.sign(payload.clone()).await.expect("sign");
+        let peer_pubkey = second.keysets().await.expect("keysets").pubkey;
+
+        peer_pubkey
+            .verify(&payload, &signature)
+            .expect("a peer with the same seed must hold the same identity key");
     }
 
     #[tokio::test]

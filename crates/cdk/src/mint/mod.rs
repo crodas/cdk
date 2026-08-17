@@ -322,11 +322,18 @@ impl Mint {
             );
         }
 
-        // Persist missing pubkey early to avoid losing it on next boot and ensure stable identity across restarts
         let mut computed_info = mint_info;
-        if computed_info.pubkey.is_none() {
-            computed_info.pubkey = Some(keysets.pubkey);
+        if let Some(authored) = computed_info
+            .pubkey
+            .filter(|pubkey| *pubkey != keysets.pubkey)
+        {
+            tracing::warn!(
+                "Configured mint pubkey {} is not the signatory identity key {}; advertising the signatory's",
+                authored,
+                keysets.pubkey
+            );
         }
+        computed_info.pubkey = Some(keysets.pubkey);
 
         match localstore
             .kv_read(
@@ -339,8 +346,15 @@ impl Mint {
             Some(bytes) => {
                 let mut stored: MintInfo = serde_json::from_slice(&bytes)?;
                 let mut mutated = false;
-                if stored.pubkey.is_none() && computed_info.pubkey.is_some() {
-                    stored.pubkey = computed_info.pubkey;
+                if stored.pubkey != Some(keysets.pubkey) {
+                    if let Some(previous) = stored.pubkey {
+                        tracing::warn!(
+                            "Advertised mint pubkey changes from {} to {}: the signatory holds the new identity key",
+                            previous,
+                            keysets.pubkey
+                        );
+                    }
+                    stored.pubkey = Some(keysets.pubkey);
                     mutated = true;
                 }
 
@@ -1496,6 +1510,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
+    use bitcoin::secp256k1::schnorr::Signature;
     use cdk_common::melt::MeltQuoteRequest;
     use cdk_common::mint::{OperationKind, SagaStateEnum};
     use cdk_common::nut00::KnownMethod;
@@ -1559,6 +1574,10 @@ mod tests {
         }
 
         async fn verify_proofs(&self, _proofs: Vec<cdk_common::Proof>) -> Result<(), Error> {
+            Err(Error::Custom("unsupported in mock".to_string()))
+        }
+
+        async fn sign(&self, _payload: Vec<u8>) -> Result<Signature, Error> {
             Err(Error::Custom("unsupported in mock".to_string()))
         }
 
@@ -1724,6 +1743,51 @@ mod tests {
         );
 
         mint.stop().await.expect("mint should stop");
+    }
+
+    /// The identity key derivation changed, so a mint upgraded in place has a
+    /// stored pubkey the signatory can no longer sign for. Boot must adopt the
+    /// signatory's key instead of advertising the stale one.
+    #[tokio::test]
+    async fn stale_stored_pubkey_adopts_the_signatory_identity() {
+        let snap = rotated_snapshots(1).await.remove(0);
+        let identity = snap.pubkey;
+        let stale = SecretKey::generate().public_key();
+        assert_ne!(stale, identity);
+
+        let localstore = Arc::new(
+            new_with_state(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                MintInfo {
+                    pubkey: Some(stale),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("in-memory db"),
+        );
+
+        let mint = Mint::new(
+            MintInfo::default(),
+            Arc::new(MockSignatory::new(snap)),
+            localstore,
+            HashMap::new(),
+            1000,
+            1000,
+        )
+        .await
+        .expect("mint should boot");
+
+        assert_eq!(
+            mint.mint_info().await.expect("mint info").pubkey,
+            Some(identity),
+            "a stale stored pubkey must be migrated to the signatory identity key"
+        );
     }
 
     #[tokio::test]
@@ -1967,6 +2031,10 @@ mod tests {
 
         async fn verify_proofs(&self, proofs: Vec<cdk_common::Proof>) -> Result<(), Error> {
             self.inner.verify_proofs(proofs).await
+        }
+
+        async fn sign(&self, payload: Vec<u8>) -> Result<Signature, Error> {
+            self.inner.sign(payload).await
         }
 
         async fn keysets(&self) -> Result<SignatoryKeysets, Error> {

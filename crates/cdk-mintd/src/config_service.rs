@@ -5,10 +5,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bip39::Mnemonic;
-use bitcoin::bip32::Xpriv;
 use bitcoin::hashes::{sha256, Hash};
-use bitcoin::secp256k1::Secp256k1;
-use bitcoin::Network;
 use cdk_signatory::signatory::Signatory;
 use thiserror::Error;
 
@@ -143,6 +140,17 @@ pub enum ConfigurationServiceError {
         "configured signing identity does not match this mint database; signer migration is not supported by config apply"
     )]
     SigningIdentityChange,
+
+    /// `mint_info.pubkey` in the config is not the key the signer derives.
+    #[error(
+        "configured mint_info.pubkey {configured} is not the mint identity key {derived} derived from the seed; remove it or set it to {derived}"
+    )]
+    AuthoredMintPubkey {
+        /// The pubkey written in the configuration.
+        configured: String,
+        /// The pubkey the configured signer actually derives.
+        derived: String,
+    },
 
     /// Persistent configuration storage failed.
     #[error(transparent)]
@@ -362,11 +370,15 @@ async fn resolve_signing_identity_async(
     }
 }
 
+/// Recomputes the identity pubkey a local signatory would derive from `seed`.
+///
+/// Must stay in step with `cdk_signatory::identity::derive_identity_key`, which
+/// is what the signatory actually uses; a divergence here surfaces as a
+/// spurious `SigningIdentityChange`.
 fn root_pubkey(seed: &[u8]) -> Result<cdk::nuts::PublicKey, ConfigurationServiceError> {
-    let secp = Secp256k1::new();
-    let xpriv = Xpriv::new_master(Network::Bitcoin, seed)
-        .map_err(|error| ConfigurationServiceError::SigningIdentity(error.to_string()))?;
-    Ok(xpriv.to_keypair(&secp).public_key().into())
+    cdk_signatory::identity::derive_identity_key(seed)
+        .map(|key| key.public_key())
+        .map_err(|error| ConfigurationServiceError::SigningIdentity(error.to_string()))
 }
 
 fn signing_identity_from_pubkey(pubkey: cdk::nuts::PublicKey) -> SigningIdentity {
@@ -382,14 +394,15 @@ fn validate_authored_mint_pubkey(
     settings: &Settings,
     signing_identity: &SigningIdentity,
 ) -> Result<(), ConfigurationServiceError> {
-    if settings
-        .mint_info
-        .pubkey
-        .is_some_and(|pubkey| pubkey != signing_identity.pubkey)
-    {
-        return Err(ConfigurationServiceError::SigningIdentityChange);
+    match settings.mint_info.pubkey {
+        Some(configured) if configured != signing_identity.pubkey => {
+            Err(ConfigurationServiceError::AuthoredMintPubkey {
+                configured: configured.to_string(),
+                derived: signing_identity.pubkey.to_string(),
+            })
+        }
+        Some(_) | None => Ok(()),
     }
-    Ok(())
 }
 
 fn same_primary_database(configured: &Database, bootstrap: &Database) -> bool {
@@ -1355,10 +1368,17 @@ engine = "sqlite"
             secret_one.display(),
             other.pubkey
         );
-        assert!(matches!(
-            ConfigurationService::validate_import(&mismatch).await,
-            Err(ConfigurationServiceError::SigningIdentityChange)
-        ));
+        let error = ConfigurationService::validate_import(&mismatch)
+            .await
+            .expect_err("a mismatched mint_info.pubkey must be rejected");
+        assert!(
+            matches!(error, ConfigurationServiceError::AuthoredMintPubkey { .. }),
+            "expected an authored pubkey mismatch, got: {error}"
+        );
+        assert!(
+            error.to_string().contains(&other.pubkey.to_string()),
+            "the error must name the configured key so the operator can fix it"
+        );
 
         let matching = format!(
             r#"

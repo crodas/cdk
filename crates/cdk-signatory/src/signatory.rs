@@ -6,6 +6,7 @@
 //! There is an in memory implementation, when the keys are stored in memory, in the same process,
 //! but it is isolated from the rest of the application, and they communicate through a channel with
 //! the defined API.
+use bitcoin::secp256k1::schnorr::Signature;
 use cdk_common::common::IssuerVersion;
 use cdk_common::error::Error;
 use cdk_common::mint::MintKeySetInfo;
@@ -34,7 +35,8 @@ pub struct RotateKeyArguments {
 #[derive(Debug, Clone)]
 /// Signatory keysets
 pub struct SignatoryKeysets {
-    /// The public key
+    /// The mint's identity public key, also the key [`Signatory::sign`] signs
+    /// with.
     pub pubkey: PublicKey,
     /// The list of keysets
     pub keysets: Vec<SignatoryKeySet>,
@@ -149,6 +151,20 @@ pub trait Signatory {
 
     /// Verify [`Proof`] meets conditions and is signed by the mint (ignores P2PK/HTLC signatures"
     async fn verify_proofs(&self, proofs: Vec<Proof>) -> Result<(), Error>;
+
+    /// Sign an arbitrary payload with the mint's identity key.
+    ///
+    /// The signature is BIP340 Schnorr over `SHA256(payload)` and verifies
+    /// against `SignatoryKeysets::pubkey` via `PublicKey::verify`. Callers pass
+    /// the message bytes, not a digest: hashing happens here. No keyset key is
+    /// involved.
+    ///
+    /// Nothing is prefixed to the payload, because NUT-06 signs its canonical
+    /// bytes bare and a tag here would not verify. Domain separation is
+    /// therefore the caller's job: every payload handed to this method must
+    /// carry a purpose marker of its own, or two protocols sharing the identity
+    /// key will accept each other's signatures.
+    async fn sign(&self, payload: Vec<u8>) -> Result<Signature, Error>;
 
     /// Retrieve the list of all mint keysets
     async fn keysets(&self) -> Result<SignatoryKeysets, Error>;
