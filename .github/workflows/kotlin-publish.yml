@@ -199,6 +199,9 @@ jobs:
           echo "---"
           cat cdk-kotlin/rust/Cargo.toml
 
+      - name: Seed Cargo.lock from the workspace lockfile
+        run: ./.github/scripts/seed-binding-lockfile.sh cdk-kotlin/rust
+
       - name: Push to cdk-kotlin release branch
         working-directory: cdk-kotlin
         env:
@@ -272,11 +275,23 @@ jobs:
           useDaemon: false
         continue-on-error: true
 
+      - name: Verify pinned Rust toolchain
+        working-directory: cdk-kotlin/rust
+        shell: bash
+        run: |
+          # flake.nix and rust-toolchain.toml pin rustc independently; a drift
+          # between them would silently change what gets released.
+          CHANNEL=$(grep '^channel' ../rust-toolchain.toml | cut -d'"' -f2)
+          nix develop --fallback -L ../../cdk#kotlin-build --command rustc -vV
+          nix develop --fallback -L ../../cdk#kotlin-build --command rustc -vV \
+            | grep -qx "release: ${CHANNEL}" \
+            || { echo "::error::nix rustc does not match rust-toolchain.toml (${CHANNEL})"; exit 1; }
+
       - name: Build (Nix)
         working-directory: cdk-kotlin/rust
         run: |
           nix develop --fallback -L ../../cdk#kotlin-build --command \
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --locked --release --target ${{ matrix.target }}
 
       # uniffi 0.30 reads the component interface statically from the library
       # (it does not load it), so the arm64 Android .so works as the source on
@@ -289,7 +304,7 @@ jobs:
         run: |
           mkdir -p ../generated-bindings
           nix develop --fallback -L ../../cdk#kotlin-build --command \
-            cargo run --release --bin uniffi-bindgen-kotlin -- generate \
+            cargo run --locked --release --bin uniffi-bindgen-kotlin -- generate \
               --library "target/${{ matrix.target }}/release/${{ matrix.artifact }}" \
               --language kotlin \
               --config uniffi.toml \
@@ -336,6 +351,10 @@ jobs:
   kotlin-publish:
     name: "kotlin: Publish to cdk-kotlin"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     needs: [kotlin-build-native]
     concurrency:
       # Prevent duplicate publishes of the same immutable version without
@@ -408,6 +427,12 @@ jobs:
           name: kotlin-bindings-generated
           path: cdk-kotlin/cdk-jvm/src/main/kotlin
 
+      - name: Write build manifest
+        working-directory: cdk
+        run: |
+          ./.github/scripts/write-build-manifest.sh kotlin \
+            ../cdk-kotlin ../cdk-kotlin/build-manifest.json
+
       - name: Commit to release branch
         working-directory: cdk-kotlin
         run: |
@@ -442,6 +467,12 @@ jobs:
             env -u ANDROID_SDK_ROOT \
             ./gradlew --no-parallel publishAndReleaseToMavenCentral
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            cdk-kotlin/cdk-android/src/main/jniLibs/*/libcdk_ffi_kotlin.so
+
       - name: Create release on cdk-kotlin
         working-directory: cdk-kotlin
         env:
@@ -463,7 +494,8 @@ jobs:
             --repo ${{ vars.CDK_KOTLIN_REPO }} \
             --target "${COMMIT_SHA}" \
             --title "Release ${TAG}" \
-            "${RELEASE_OPTIONS[@]}"
+            "${RELEASE_OPTIONS[@]}" \
+            build-manifest.json
 
       - name: Merge to default branch
         if: ${{ !inputs.nightly }}
