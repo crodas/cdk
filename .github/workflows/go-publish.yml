@@ -227,7 +227,7 @@ jobs:
 
           # Windows
           - target: x86_64-pc-windows-msvc
-            runner: windows-latest
+            runner: windows-2022
             artifact: cdk_ffi.dll
 
     steps:
@@ -236,15 +236,22 @@ jobs:
         with:
           ref: ${{ env.CDK_CHECKOUT_REF }}
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          # rust-toolchain.toml is the single source of truth here; rustup
+          # installs it on demand. Never resolve to floating stable.
+          rustup show active-toolchain
+          rustup target add ${{ matrix.target }}
+          CHANNEL=$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)
+          rustc -vV
+          rustc -vV | grep -qx "release: ${CHANNEL}" \
+            || { echo "::error::expected rustc ${CHANNEL} per rust-toolchain.toml"; exit 1; }
 
       - name: Build cdk-ffi
         shell: bash
         run: |
-          cargo build --release --package cdk-ffi \
+          cargo build --locked --release --package cdk-ffi \
             --target ${{ matrix.target }}
 
       - name: Fix dylib install name
@@ -304,12 +311,24 @@ jobs:
   go-publish:
     name: "go: Publish to cdk-go"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     needs: [go-build-native]
     steps:
       - name: Clone cdk-go
         run: |
           git clone --branch "${RELEASE_BRANCH}" \
             https://x-access-token:${{ secrets.FFI_DEPLOY_KEY }}@github.com/${{ vars.CDK_GO_REPO }}.git cdk-go
+
+      - name: Checkout monorepo (for the build manifest)
+        uses: actions/checkout@v5
+        with:
+          path: cdk
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Download all native artifacts
         uses: actions/download-artifact@v8
@@ -441,6 +460,12 @@ jobs:
           echo "Updated ${CHECKSUM_FILE}:"
           cat "${CHECKSUM_FILE}"
 
+      - name: Write build manifest
+        working-directory: cdk
+        run: |
+          ./.github/scripts/write-build-manifest.sh go \
+            ../cdk-go ../cdk-go/build-manifest.json
+
       - name: Commit to release branch
         working-directory: cdk-go
         run: |
@@ -457,6 +482,12 @@ jobs:
       - name: Build release archive
         run: |
           tar -czf "cdk-go-bindings-${TAG}.tar.gz" -C cdk-go bindings/cdkffi
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            cdk-go-bindings-${{ inputs.release_tag }}.tar.gz
 
       - name: Create release on cdk-go (creates tag and uploads asset atomically)
         working-directory: cdk-go
@@ -480,7 +511,8 @@ jobs:
             --target "${COMMIT_SHA}" \
             --title "Release ${TAG}" \
             "${RELEASE_OPTIONS[@]}" \
-            "../cdk-go-bindings-${TAG}.tar.gz"
+            "../cdk-go-bindings-${TAG}.tar.gz" \
+            build-manifest.json
 
       - name: Merge to default branch
         if: ${{ !inputs.nightly }}
