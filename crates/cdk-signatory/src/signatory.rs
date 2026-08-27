@@ -150,6 +150,18 @@ pub trait Signatory {
         blinded_messages: Vec<BlindedMessage>,
     ) -> Result<Vec<BlindSignature>, Error>;
 
+    /// Blind sign messages whose keyset was already reserved by an earlier step.
+    ///
+    /// Behaves like [`Signatory::blind_sign`] but tolerates a keyset that has
+    /// since been rotated out of active service. Rotation retires a keyset for
+    /// new issuance; it must not retract a signing obligation the mint already
+    /// accepted, such as NUT-08 melt change outputs validated before payment.
+    /// Expired and unknown keysets are still rejected.
+    async fn blind_sign_reserved(
+        &self,
+        blinded_messages: Vec<BlindedMessage>,
+    ) -> Result<Vec<BlindSignature>, Error>;
+
     /// Verify [`Proof`] meets conditions and is signed by the mint (ignores P2PK/HTLC signatures"
     async fn verify_proofs(&self, proofs: Vec<Proof>) -> Result<(), Error>;
 

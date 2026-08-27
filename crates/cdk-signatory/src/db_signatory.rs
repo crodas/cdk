@@ -321,6 +321,50 @@ impl DbSignatory {
         )
     }
 
+    /// Shared signing body. `require_active` is false only for outputs the mint
+    /// already accepted on a then-active keyset, so a later rotation cannot
+    /// strand them.
+    fn sign(
+        &self,
+        blinded_messages: Vec<BlindedMessage>,
+        require_active: bool,
+    ) -> Result<Vec<BlindSignature>, Error> {
+        let keysets = self.keysets.load();
+
+        blinded_messages
+            .into_iter()
+            .map(|blinded_message| {
+                let BlindedMessage {
+                    amount,
+                    blinded_secret,
+                    keyset_id,
+                    ..
+                } = blinded_message;
+
+                let (info, key) = keysets.by_id.get(&keyset_id).ok_or(Error::UnknownKeySet)?;
+                if require_active && !info.active {
+                    return Err(Error::InactiveKeyset);
+                }
+                if info.is_expired() {
+                    return Err(Error::ExpiredKeyset);
+                }
+
+                let key_pair = key.keys.get(&amount).ok_or(Error::UnknownKeySet)?;
+                let c = sign_message(&key_pair.secret_key, &blinded_secret)?;
+
+                let blinded_signature = BlindSignature::new(
+                    amount,
+                    c,
+                    keyset_id,
+                    &blinded_message.blinded_secret,
+                    &key_pair.secret_key,
+                )?;
+
+                Ok(blinded_signature)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }
+
     /// Snapshot the current keysets from memory (lock-free).
     fn keysets_snapshot(&self) -> SignatoryKeysets {
         SignatoryKeysets {
@@ -347,40 +391,15 @@ impl Signatory for DbSignatory {
         &self,
         blinded_messages: Vec<BlindedMessage>,
     ) -> Result<Vec<BlindSignature>, Error> {
-        let keysets = self.keysets.load();
+        self.sign(blinded_messages, true)
+    }
 
-        blinded_messages
-            .into_iter()
-            .map(|blinded_message| {
-                let BlindedMessage {
-                    amount,
-                    blinded_secret,
-                    keyset_id,
-                    ..
-                } = blinded_message;
-
-                let (info, key) = keysets.by_id.get(&keyset_id).ok_or(Error::UnknownKeySet)?;
-                if !info.active {
-                    return Err(Error::InactiveKeyset);
-                }
-                if info.is_expired() {
-                    return Err(Error::ExpiredKeyset);
-                }
-
-                let key_pair = key.keys.get(&amount).ok_or(Error::UnknownKeySet)?;
-                let c = sign_message(&key_pair.secret_key, &blinded_secret)?;
-
-                let blinded_signature = BlindSignature::new(
-                    amount,
-                    c,
-                    keyset_id,
-                    &blinded_message.blinded_secret,
-                    &key_pair.secret_key,
-                )?;
-
-                Ok(blinded_signature)
-            })
-            .collect::<Result<Vec<_>, _>>()
+    #[instrument(skip_all)]
+    async fn blind_sign_reserved(
+        &self,
+        blinded_messages: Vec<BlindedMessage>,
+    ) -> Result<Vec<BlindSignature>, Error> {
+        self.sign(blinded_messages, false)
     }
 
     #[tracing::instrument(skip_all)]
@@ -781,6 +800,105 @@ mod test {
         assert_eq!(
             published.final_expiry, new_expiry,
             "published keyset must carry the info's final_expiry, not the cached key's"
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_sign_reserved_accepts_rotated_keyset() {
+        let store = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("in-memory db"),
+        );
+        let signatory = DbSignatory::new(
+            store,
+            b"test-seed-for-unit-tests",
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("DbSignatory::new");
+
+        let rotate = |final_expiry| RotateKeyArguments {
+            unit: CurrencyUnit::Sat,
+            amounts: vec![1, 2, 4, 8],
+            input_fee_ppk: 0,
+            keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
+            final_expiry,
+        };
+
+        let reserved = signatory
+            .rotate_keyset(rotate(None))
+            .await
+            .expect("rotate_keyset");
+        signatory
+            .rotate_keyset(rotate(None))
+            .await
+            .expect("rotate_keyset again");
+
+        let msg = || {
+            BlindedMessage::new(
+                Amount::from(1),
+                reserved.id,
+                SecretKey::generate().public_key(),
+            )
+        };
+
+        assert!(
+            matches!(
+                signatory.blind_sign(vec![msg()]).await,
+                Err(Error::InactiveKeyset)
+            ),
+            "plain signing must still refuse a retired keyset"
+        );
+
+        let sigs = signatory
+            .blind_sign_reserved(vec![msg()])
+            .await
+            .expect("reserved signing must tolerate a retired keyset");
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].keyset_id, reserved.id);
+    }
+
+    #[tokio::test]
+    async fn blind_sign_reserved_rejects_expired_keyset() {
+        let store = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("in-memory db"),
+        );
+        let signatory = DbSignatory::new(
+            store,
+            b"test-seed-for-unit-tests",
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("DbSignatory::new");
+
+        let expired_keyset = signatory
+            .rotate_keyset(RotateKeyArguments {
+                unit: CurrencyUnit::Sat,
+                amounts: vec![1, 2, 4, 8],
+                input_fee_ppk: 0,
+                keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
+                final_expiry: Some(unix_time() - 1),
+            })
+            .await
+            .expect("rotate_keyset");
+
+        let msg = BlindedMessage::new(
+            Amount::from(1),
+            expired_keyset.id,
+            SecretKey::generate().public_key(),
+        );
+
+        let result = signatory.blind_sign_reserved(vec![msg]).await;
+
+        assert!(
+            matches!(result, Err(Error::ExpiredKeyset)),
+            "expected ExpiredKeyset error, got: {:?}",
+            result
         );
     }
 

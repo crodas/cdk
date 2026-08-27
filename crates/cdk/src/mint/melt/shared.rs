@@ -22,8 +22,9 @@ use crate::Mint;
 
 /// Retrieves fee and amount configuration for the keyset matching the change outputs.
 ///
-/// Searches active keysets for one matching the first output's keyset_id.
-/// Used during change calculation for melts.
+/// Matches on keyset id regardless of active state: the outputs were validated
+/// against an active keyset when the melt was accepted, and a rotation since
+/// then must not swap in a denomination schedule the keyset has no keys for.
 ///
 /// # Arguments
 ///
@@ -41,7 +42,7 @@ pub fn get_keyset_fee_and_amounts(
         .load()
         .iter()
         .filter_map(|keyset| {
-            if keyset.active && Some(keyset.id) == outputs.first().map(|x| x.keyset_id) {
+            if Some(keyset.id) == outputs.first().map(|x| x.keyset_id) {
                 Some((keyset.input_fee_ppk, keyset.amounts.clone()).into())
             } else {
                 None
@@ -448,6 +449,11 @@ async fn begin_melt_change_without_signatures(
 /// transaction. [`MeltChangeResult::AlreadyCompleted`] indicates that another
 /// finalizer completed cleanup after this finalizer released its initial locks.
 ///
+/// Signing goes through [`Mint::blind_sign_reserved`] because the payment has
+/// already settled by this point: the outputs were validated against an active
+/// keyset at setup, and a rotation in between must not leave a paid melt
+/// permanently unfinalizable.
+///
 /// # Errors
 ///
 /// Returns error if:
@@ -511,7 +517,9 @@ pub(super) async fn process_melt_change(
     }
 
     // External call: sign change outputs (no DB transaction held)
-    let change_sigs = mint.blind_sign(blinded_messages_to_sign.clone()).await?;
+    let change_sigs = mint
+        .blind_sign_reserved(blinded_messages_to_sign.clone())
+        .await?;
 
     // Open a transaction with quote, melt-request, and change-output locks
     // acquired in the same order as finalization and rollback.

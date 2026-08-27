@@ -562,6 +562,113 @@ async fn test_msat_total_spent_rounds_up_when_recording_sat_melt() {
     assert_eq!(change_amount, Amount::from(999));
 }
 
+/// Change splitting must follow the denomination schedule of the keyset the
+/// outputs actually name. Falling back to a synthetic powers-of-two schedule
+/// after a rotation would pick amounts the reserved keyset has no keys for.
+#[tokio::test]
+async fn test_change_split_uses_reserved_keyset_schedule_after_rotation() {
+    use cdk_common::nuts::BlindedMessage;
+    use cdk_common::SecretKey;
+
+    use crate::mint::melt::shared::get_keyset_fee_and_amounts;
+
+    let mint = create_test_mint().await.unwrap();
+    let reserved = mint
+        .rotate_keyset(CurrencyUnit::Sat, vec![1, 3, 9, 27], 100, true, None)
+        .await
+        .unwrap();
+    mint.rotate_keyset(
+        CurrencyUnit::Sat,
+        (0..32).map(|i| 2u64.pow(i)).collect(),
+        0,
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let outputs = vec![BlindedMessage::new(
+        Amount::from(1),
+        reserved.id,
+        SecretKey::generate().public_key(),
+    )];
+
+    let fee_and_amounts = get_keyset_fee_and_amounts(&mint.keysets, &outputs);
+
+    assert_eq!(fee_and_amounts.fee(), 100);
+    assert_eq!(fee_and_amounts.amounts(), &[1, 3, 9, 27]);
+}
+
+/// A melt whose change outputs were accepted on a then-active keyset must stay
+/// finalizable if the keyset rotates before the payment settles. Otherwise the
+/// quote is already Paid and the proofs already Spent, but every finalization
+/// retry fails with `InactiveKeyset` and the saga never drains.
+#[tokio::test]
+async fn test_paid_melt_change_survives_keyset_rotation() {
+    use crate::test_helpers::mint::create_test_blinded_messages;
+
+    let mint = create_test_mint().await.unwrap();
+    let proofs = mint_test_proofs(&mint, Amount::from(10_000)).await.unwrap();
+    let quote = create_test_melt_quote(&mint, Amount::from(9_000)).await;
+    let (change_outputs, _premint) = create_test_blinded_messages(&mint, Amount::from(1_000))
+        .await
+        .unwrap();
+    let reserved_keyset_id = change_outputs[0].keyset_id;
+    let melt_request = MeltRequest::new(quote.id.clone(), proofs, Some(change_outputs));
+
+    let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
+    let saga = MeltSaga::new(
+        std::sync::Arc::new(mint.clone()),
+        mint.localstore(),
+        mint.pubsub_manager(),
+    );
+    let setup_saga = saga
+        .setup_melt(
+            &melt_request,
+            verification,
+            PaymentMethod::Known(KnownMethod::Bolt11),
+        )
+        .await
+        .unwrap();
+    let operation_id = setup_saga.operation_id;
+
+    mint.rotate_keyset(
+        CurrencyUnit::Sat,
+        (0..32).map(|i| 2u64.pow(i)).collect(),
+        0,
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !mint
+            .get_keyset_info(&reserved_keyset_id)
+            .expect("reserved keyset must still exist")
+            .active,
+        "rotation should have retired the reserved keyset"
+    );
+
+    let change = finalize_melt_quote(
+        &mint,
+        &mint.localstore(),
+        &mint.pubsub_manager(),
+        &quote,
+        Amount::new(9_000, CurrencyUnit::Sat),
+        Some("rotation_preimage".to_string()),
+        &PaymentIdentifier::CustomId("rotation_lookup".to_string()),
+        Some(operation_id),
+    )
+    .await
+    .expect("a paid melt must remain finalizable after its change keyset rotates")
+    .expect("change was requested and is owed");
+
+    assert!(change.iter().all(|sig| sig.keyset_id == reserved_keyset_id));
+    let change_amount =
+        Amount::try_sum(change.iter().map(|sig| sig.amount)).expect("change cannot overflow");
+    assert_eq!(change_amount, Amount::from(1_000));
+}
+
 #[tokio::test]
 async fn test_finalizing_recovery_uses_persisted_payment_fee() {
     let mint = create_test_mint().await.unwrap();

@@ -1329,6 +1329,35 @@ impl Mint {
         result
     }
 
+    /// Blind sign outputs the mint accepted on a keyset that has since rotated.
+    ///
+    /// Only for outputs already validated as active and persisted by an earlier
+    /// step, such as NUT-08 melt change. Expired keysets are still rejected.
+    #[tracing::instrument(skip_all)]
+    pub async fn blind_sign_reserved(
+        &self,
+        blinded_message: Vec<BlindedMessage>,
+    ) -> Result<Vec<BlindSignature>, Error> {
+        #[cfg(test)]
+        {
+            if crate::test_helpers::mint::should_fail_in_test() {
+                return Err(Error::SignatureMissingOrInvalid);
+            }
+        }
+
+        #[cfg(feature = "prometheus")]
+        let metrics = MintMetricGuard::new("blind_sign_reserved");
+
+        let result = self.signatory.blind_sign_reserved(blinded_message).await;
+
+        #[cfg(feature = "prometheus")]
+        {
+            metrics.record(result.is_ok());
+        }
+
+        result
+    }
+
     /// Verify [`Proof`] meets conditions and is signed
     #[tracing::instrument(skip_all)]
     pub async fn verify_proofs(&self, proofs: Proofs) -> Result<(), Error> {
@@ -1557,6 +1586,13 @@ mod tests {
         }
 
         async fn blind_sign(
+            &self,
+            _blinded_messages: Vec<BlindedMessage>,
+        ) -> Result<Vec<BlindSignature>, Error> {
+            Err(Error::Custom("unsupported in mock".to_string()))
+        }
+
+        async fn blind_sign_reserved(
             &self,
             _blinded_messages: Vec<BlindedMessage>,
         ) -> Result<Vec<BlindSignature>, Error> {
@@ -1968,6 +2004,13 @@ mod tests {
             blinded_messages: Vec<BlindedMessage>,
         ) -> Result<Vec<BlindSignature>, Error> {
             self.inner.blind_sign(blinded_messages).await
+        }
+
+        async fn blind_sign_reserved(
+            &self,
+            blinded_messages: Vec<BlindedMessage>,
+        ) -> Result<Vec<BlindSignature>, Error> {
+            self.inner.blind_sign_reserved(blinded_messages).await
         }
 
         async fn verify_proofs(&self, proofs: Vec<cdk_common::Proof>) -> Result<(), Error> {

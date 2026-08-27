@@ -44,18 +44,11 @@ where
             .await
             .map_err(|_| Status::internal("Failed to load signatory"))
     }
-}
 
-#[tonic::async_trait]
-impl<S, T> signatory_server::Signatory for CdkSignatoryServer<S, T>
-where
-    S: Signatory + Send + Sync + 'static,
-    T: SignatoryLoader<S> + 'static,
-{
-    #[tracing::instrument(skip_all)]
-    async fn blind_sign(
+    async fn sign(
         &self,
         request: Request<proto::BlindedMessages>,
+        reserved: bool,
     ) -> Result<Response<proto::BlindSignResponse>, Status> {
         let metadata = request.metadata();
         let signatory = self.load_signatory(metadata).await?;
@@ -66,7 +59,13 @@ where
             converted_messages.push(msg.try_into()?);
         }
 
-        let result = match signatory.blind_sign(converted_messages).await {
+        let signed = if reserved {
+            signatory.blind_sign_reserved(converted_messages).await
+        } else {
+            signatory.blind_sign(converted_messages).await
+        };
+
+        let result = match signed {
             Ok(blind_signatures) => proto::BlindSignResponse {
                 sigs: Some(proto::BlindSignatures {
                     blind_signatures: blind_signatures
@@ -83,6 +82,29 @@ where
         };
 
         Ok(Response::new(result))
+    }
+}
+
+#[tonic::async_trait]
+impl<S, T> signatory_server::Signatory for CdkSignatoryServer<S, T>
+where
+    S: Signatory + Send + Sync + 'static,
+    T: SignatoryLoader<S> + 'static,
+{
+    #[tracing::instrument(skip_all)]
+    async fn blind_sign(
+        &self,
+        request: Request<proto::BlindedMessages>,
+    ) -> Result<Response<proto::BlindSignResponse>, Status> {
+        self.sign(request, false).await
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn blind_sign_reserved(
+        &self,
+        request: Request<proto::BlindedMessages>,
+    ) -> Result<Response<proto::BlindSignResponse>, Status> {
+        self.sign(request, true).await
     }
 
     #[tracing::instrument(skip_all)]
