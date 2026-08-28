@@ -175,7 +175,7 @@ mod tests {
     use cdk::nuts::{CurrencyUnit, MintInfo};
     use cdk::subscription::{Params, SubId};
     use cdk::ws::WsUnsubscribeRequest;
-    use cdk_signatory::db_signatory::DbSignatory;
+    use cdk_signatory::db_signatory::{DbSignatory, DEFAULT_RETIREMENT_GRACE};
     use cdk_signatory::signatory::{RotateKeyArguments, Signatory};
     use cdk_sqlite::mint::memory;
 
@@ -196,6 +196,7 @@ mod tests {
                 &seed,
                 supported_units.clone(),
                 HashMap::new(),
+                DEFAULT_RETIREMENT_GRACE,
             )
             .await
             .expect("signatory"),

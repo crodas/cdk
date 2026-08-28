@@ -21,7 +21,7 @@ use cdk_common::database::{Error, MintKeysDatabase};
 use cdk_common::nut02::KeySetVersion;
 use cdk_common::nuts::CurrencyUnit;
 use cdk_postgres::MintPgDatabase;
-use cdk_signatory::db_signatory::DbSignatory;
+use cdk_signatory::db_signatory::{DbSignatory, DEFAULT_RETIREMENT_GRACE};
 use cdk_signatory::signatory::{RotateKeyArguments, Signatory};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -54,14 +54,26 @@ async fn concurrent_rotations_across_pg_instances_do_not_collide() {
 
     let seed = b"test-seed-cross-instance-pg-rotations";
     let instance_a = Arc::new(
-        DbSignatory::new(store_a, seed, Default::default(), Default::default())
-            .await
-            .expect("DbSignatory::new a"),
+        DbSignatory::new(
+            store_a,
+            seed,
+            Default::default(),
+            Default::default(),
+            DEFAULT_RETIREMENT_GRACE,
+        )
+        .await
+        .expect("DbSignatory::new a"),
     );
     let instance_b = Arc::new(
-        DbSignatory::new(store_b, seed, Default::default(), Default::default())
-            .await
-            .expect("DbSignatory::new b"),
+        DbSignatory::new(
+            store_b,
+            seed,
+            Default::default(),
+            Default::default(),
+            DEFAULT_RETIREMENT_GRACE,
+        )
+        .await
+        .expect("DbSignatory::new b"),
     );
 
     const ROTATIONS: usize = 8;

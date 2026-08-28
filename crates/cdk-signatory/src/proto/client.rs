@@ -246,32 +246,6 @@ impl Signatory for SignatoryRpcClient {
     }
 
     #[tracing::instrument(skip_all)]
-    async fn blind_sign_reserved(
-        &self,
-        request: Vec<BlindedMessage>,
-    ) -> Result<Vec<BlindSignature>, Error> {
-        let req = super::BlindedMessages {
-            blinded_messages: request
-                .into_iter()
-                .map(|blind_message| blind_message.into())
-                .collect(),
-        };
-
-        self.client
-            .clone()
-            .blind_sign_reserved(tonic::Request::new(req))
-            .await
-            .map(|response| {
-                handle_error!(response, sigs)
-                    .blind_signatures
-                    .into_iter()
-                    .map(|blinded_signature| blinded_signature.try_into())
-                    .collect()
-            })
-            .map_err(|e| Error::Custom(e.to_string()))?
-    }
-
-    #[tracing::instrument(skip_all)]
     async fn verify_proofs(&self, proofs: Vec<Proof>) -> Result<(), Error> {
         let req: super::Proofs = proofs.into();
         self.client

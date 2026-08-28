@@ -48,7 +48,6 @@ where
     async fn sign(
         &self,
         request: Request<proto::BlindedMessages>,
-        reserved: bool,
     ) -> Result<Response<proto::BlindSignResponse>, Status> {
         let metadata = request.metadata();
         let signatory = self.load_signatory(metadata).await?;
@@ -59,13 +58,7 @@ where
             converted_messages.push(msg.try_into()?);
         }
 
-        let signed = if reserved {
-            signatory.blind_sign_reserved(converted_messages).await
-        } else {
-            signatory.blind_sign(converted_messages).await
-        };
-
-        let result = match signed {
+        let result = match signatory.blind_sign(converted_messages).await {
             Ok(blind_signatures) => proto::BlindSignResponse {
                 sigs: Some(proto::BlindSignatures {
                     blind_signatures: blind_signatures
@@ -96,15 +89,7 @@ where
         &self,
         request: Request<proto::BlindedMessages>,
     ) -> Result<Response<proto::BlindSignResponse>, Status> {
-        self.sign(request, false).await
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn blind_sign_reserved(
-        &self,
-        request: Request<proto::BlindedMessages>,
-    ) -> Result<Response<proto::BlindSignResponse>, Status> {
-        self.sign(request, true).await
+        self.sign(request).await
     }
 
     #[tracing::instrument(skip_all)]

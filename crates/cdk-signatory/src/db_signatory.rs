@@ -20,6 +20,7 @@ use cdk_common::database::MintKeyDatabaseTransaction;
 use cdk_common::dhke::{sign_message, verify_message};
 use cdk_common::mint::MintKeySetInfo;
 use cdk_common::nuts::{BlindSignature, BlindedMessage, CurrencyUnit, Id, MintKeySet, Proof};
+use cdk_common::util::unix_time;
 use cdk_common::{database, Error, PublicKey};
 use tokio::sync::{watch, Mutex};
 use tracing::instrument;
@@ -28,6 +29,16 @@ use crate::common::{
     check_unit_string_collision, create_new_keyset, derivation_path_from_unit, init_keysets,
 };
 use crate::signatory::{RotateKeyArguments, Signatory, SignatoryKeySet, SignatoryKeysets};
+
+/// Default window in which a retired keyset still signs outputs the mint
+/// accepted while it was active.
+///
+/// Sized against the worst-case time a payment can stay in flight, not the melt
+/// quote TTL: a melt's NUT-08 change outputs are validated at accept time but
+/// signed only after settlement, and a stuck Lightning HTLC is bounded by the
+/// CLTV delta, so it can hang for days. The window only ever authorizes signing
+/// outputs the mint already committed to, so erring long is the safe direction.
+pub const DEFAULT_RETIREMENT_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Immutable in-memory view of the keysets, swapped atomically on every change.
 ///
@@ -40,10 +51,46 @@ struct KeysetSnapshot {
     by_id: HashMap<Id, (MintKeySetInfo, MintKeySet)>,
     /// Active keyset id per unit.
     active_by_unit: HashMap<CurrencyUnit, Id>,
+    /// Wall-clock time each retired keyset stopped being active, taken from the
+    /// `valid_from` of the keyset that replaced it. Absent for active keysets,
+    /// and for a retired keyset with no successor, which is denied grace.
+    retired_at: HashMap<Id, u64>,
     /// Storage keyset epoch this snapshot was built from; `None` before the
     /// first load. The refresh compares it against the storage token to decide
     /// whether a reload is needed.
     epoch: Option<u64>,
+}
+
+/// Wall-clock time each retired keyset stopped being active.
+///
+/// A keyset is retired exactly when its successor in the same unit is created,
+/// so the successor's `valid_from` is the retirement instant. That makes the
+/// timestamp derivable from state the signatory already holds: durable across
+/// restarts and identical across instances, with nothing to persist and nothing
+/// the mint has to send.
+///
+/// Succession is ordered by `derivation_path_index`, which the database
+/// allocates monotonically per unit, because `valid_from` has one-second
+/// resolution and two rotations inside the same second would otherwise look
+/// simultaneous and leave the earlier keyset with no successor. The index is
+/// `None` only for keysets not created by a rotation, so `valid_from` breaks
+/// ties. The newest keyset of a unit has no successor and no entry.
+fn derive_retirement_times(by_id: &HashMap<Id, (MintKeySetInfo, MintKeySet)>) -> HashMap<Id, u64> {
+    let mut by_unit: HashMap<&CurrencyUnit, Vec<&MintKeySetInfo>> = HashMap::new();
+    for (info, _) in by_id.values() {
+        by_unit.entry(&info.unit).or_default().push(info);
+    }
+
+    let mut retired_at = HashMap::new();
+    for infos in by_unit.values_mut() {
+        infos.sort_unstable_by_key(|info| (info.derivation_path_index, info.valid_from));
+        for pair in infos.windows(2) {
+            if !pair[0].active {
+                retired_at.insert(pair[0].id, pair[1].valid_from);
+            }
+        }
+    }
+    retired_at
 }
 
 /// In-memory Signatory
@@ -75,6 +122,9 @@ pub struct DbSignatory {
     /// Latest keyset snapshot, published on every reload (initial load and each
     /// rotation).
     keyset_updates: watch::Sender<SignatoryKeysets>,
+    /// How long a retired keyset keeps signing outputs the mint accepted while
+    /// it was still active. See [`DEFAULT_RETIREMENT_GRACE`].
+    retirement_grace: Duration,
 }
 
 impl DbSignatory {
@@ -92,6 +142,7 @@ impl DbSignatory {
         seed: &[u8],
         supported_units: HashMap<CurrencyUnit, (u64, Vec<u64>)>,
         custom_paths: HashMap<CurrencyUnit, DerivationPath>,
+        retirement_grace: Duration,
     ) -> Result<Self, Error> {
         let secp_ctx = Secp256k1::new();
         let xpriv = Xpriv::new_master(bitcoin::Network::Bitcoin, seed).expect("RNG busted");
@@ -112,6 +163,7 @@ impl DbSignatory {
             secp_ctx,
             xpriv,
             keyset_updates,
+            retirement_grace,
         };
 
         signatory.boot_load().await?;
@@ -271,9 +323,12 @@ impl DbSignatory {
             by_id.insert(id, (info, keyset));
         }
 
+        let retired_at = derive_retirement_times(&by_id);
+
         let snapshot = Arc::new(KeysetSnapshot {
             by_id,
             active_by_unit,
+            retired_at,
             epoch: Some(epoch),
         });
 
@@ -321,14 +376,25 @@ impl DbSignatory {
         )
     }
 
-    /// Shared signing body. `require_active` is false only for outputs the mint
-    /// already accepted on a then-active keyset, so a later rotation cannot
-    /// strand them.
-    fn sign(
-        &self,
-        blinded_messages: Vec<BlindedMessage>,
-        require_active: bool,
-    ) -> Result<Vec<BlindSignature>, Error> {
+    /// Whether a retired keyset is still inside its signing grace window.
+    ///
+    /// Rotation retires a keyset for new issuance, but the mint may already have
+    /// accepted outputs against it that it cannot sign until later: a melt's
+    /// NUT-08 change is validated while the keyset is active and signed only
+    /// once the payment settles. Refusing those would strand a melt whose quote
+    /// is already paid and whose proofs are already spent, with every retry and
+    /// every recovery pass failing the same way.
+    ///
+    /// A keyset with no derived retirement time gets no grace.
+    fn within_retirement_grace(&self, keysets: &KeysetSnapshot, id: &Id) -> bool {
+        keysets
+            .retired_at
+            .get(id)
+            .and_then(|retired_at| retired_at.checked_add(self.retirement_grace.as_secs()))
+            .is_some_and(|deadline| unix_time() < deadline)
+    }
+
+    fn sign(&self, blinded_messages: Vec<BlindedMessage>) -> Result<Vec<BlindSignature>, Error> {
         let keysets = self.keysets.load();
 
         blinded_messages
@@ -342,7 +408,7 @@ impl DbSignatory {
                 } = blinded_message;
 
                 let (info, key) = keysets.by_id.get(&keyset_id).ok_or(Error::UnknownKeySet)?;
-                if require_active && !info.active {
+                if !info.active && !self.within_retirement_grace(&keysets, &keyset_id) {
                     return Err(Error::InactiveKeyset);
                 }
                 if info.is_expired() {
@@ -391,15 +457,7 @@ impl Signatory for DbSignatory {
         &self,
         blinded_messages: Vec<BlindedMessage>,
     ) -> Result<Vec<BlindSignature>, Error> {
-        self.sign(blinded_messages, true)
-    }
-
-    #[instrument(skip_all)]
-    async fn blind_sign_reserved(
-        &self,
-        blinded_messages: Vec<BlindedMessage>,
-    ) -> Result<Vec<BlindSignature>, Error> {
-        self.sign(blinded_messages, false)
+        self.sign(blinded_messages)
     }
 
     #[tracing::instrument(skip_all)]
@@ -543,6 +601,7 @@ mod test {
             b"test-seed-for-version",
             Default::default(),
             Default::default(),
+            DEFAULT_RETIREMENT_GRACE,
         )
         .await
         .expect("DbSignatory::new");
@@ -607,14 +666,24 @@ mod test {
                 .expect("in-memory db"),
         );
         let seed = b"test-seed-cross-instance-reload";
-        let instance_a =
-            DbSignatory::new(store.clone(), seed, Default::default(), Default::default())
-                .await
-                .expect("DbSignatory::new a");
-        let instance_b =
-            DbSignatory::new(store.clone(), seed, Default::default(), Default::default())
-                .await
-                .expect("DbSignatory::new b");
+        let instance_a = DbSignatory::new(
+            store.clone(),
+            seed,
+            Default::default(),
+            Default::default(),
+            DEFAULT_RETIREMENT_GRACE,
+        )
+        .await
+        .expect("DbSignatory::new a");
+        let instance_b = DbSignatory::new(
+            store.clone(),
+            seed,
+            Default::default(),
+            Default::default(),
+            DEFAULT_RETIREMENT_GRACE,
+        )
+        .await
+        .expect("DbSignatory::new b");
 
         let rotate = |unit| RotateKeyArguments {
             unit,
@@ -664,14 +733,24 @@ mod test {
                 .expect("in-memory db"),
         );
         let seed = b"test-seed-empty-amount-peer-denoms";
-        let instance_a =
-            DbSignatory::new(store.clone(), seed, Default::default(), Default::default())
-                .await
-                .expect("DbSignatory::new a");
-        let instance_b =
-            DbSignatory::new(store.clone(), seed, Default::default(), Default::default())
-                .await
-                .expect("DbSignatory::new b");
+        let instance_a = DbSignatory::new(
+            store.clone(),
+            seed,
+            Default::default(),
+            Default::default(),
+            DEFAULT_RETIREMENT_GRACE,
+        )
+        .await
+        .expect("DbSignatory::new a");
+        let instance_b = DbSignatory::new(
+            store.clone(),
+            seed,
+            Default::default(),
+            Default::default(),
+            DEFAULT_RETIREMENT_GRACE,
+        )
+        .await
+        .expect("DbSignatory::new b");
 
         let rotate = |amounts: Vec<u64>| RotateKeyArguments {
             unit: CurrencyUnit::Sat,
@@ -719,6 +798,7 @@ mod test {
             b"test-seed-for-unit-tests",
             Default::default(),
             Default::default(),
+            DEFAULT_RETIREMENT_GRACE,
         )
         .await
         .expect("DbSignatory::new");
@@ -761,6 +841,7 @@ mod test {
             b"test-seed-snapshot-final-expiry",
             Default::default(),
             Default::default(),
+            DEFAULT_RETIREMENT_GRACE,
         )
         .await
         .expect("DbSignatory::new");
@@ -803,103 +884,200 @@ mod test {
         );
     }
 
-    #[tokio::test]
-    async fn blind_sign_reserved_accepts_rotated_keyset() {
+    async fn signatory_with_grace(grace: Duration) -> DbSignatory {
         let store = Arc::new(
             cdk_sqlite::mint::memory::empty()
                 .await
                 .expect("in-memory db"),
         );
-        let signatory = DbSignatory::new(
+        DbSignatory::new(
             store,
             b"test-seed-for-unit-tests",
             Default::default(),
             Default::default(),
+            grace,
         )
         .await
-        .expect("DbSignatory::new");
+        .expect("DbSignatory::new")
+    }
 
-        let rotate = |final_expiry| RotateKeyArguments {
+    fn rotation(final_expiry: Option<u64>) -> RotateKeyArguments {
+        RotateKeyArguments {
             unit: CurrencyUnit::Sat,
             amounts: vec![1, 2, 4, 8],
             input_fee_ppk: 0,
             keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
             final_expiry,
-        };
+        }
+    }
 
-        let reserved = signatory
-            .rotate_keyset(rotate(None))
+    /// A melt validates its NUT-08 change outputs while the keyset is active but
+    /// signs them only after the payment settles. Refusing a keyset retired in
+    /// between would strand a melt whose quote is already paid.
+    #[tokio::test]
+    async fn blind_sign_accepts_keyset_retired_within_grace() {
+        let signatory = signatory_with_grace(DEFAULT_RETIREMENT_GRACE).await;
+
+        let retired = signatory
+            .rotate_keyset(rotation(None))
             .await
             .expect("rotate_keyset");
         signatory
-            .rotate_keyset(rotate(None))
+            .rotate_keyset(rotation(None))
             .await
             .expect("rotate_keyset again");
 
-        let msg = || {
-            BlindedMessage::new(
-                Amount::from(1),
-                reserved.id,
-                SecretKey::generate().public_key(),
-            )
-        };
-
         assert!(
-            matches!(
-                signatory.blind_sign(vec![msg()]).await,
-                Err(Error::InactiveKeyset)
-            ),
-            "plain signing must still refuse a retired keyset"
+            !signatory
+                .keysets
+                .load()
+                .by_id
+                .get(&retired.id)
+                .expect("retired keyset must still be known")
+                .0
+                .active,
+            "rotation should have retired the first keyset"
         );
-
-        let sigs = signatory
-            .blind_sign_reserved(vec![msg()])
-            .await
-            .expect("reserved signing must tolerate a retired keyset");
-        assert_eq!(sigs.len(), 1);
-        assert_eq!(sigs[0].keyset_id, reserved.id);
-    }
-
-    #[tokio::test]
-    async fn blind_sign_reserved_rejects_expired_keyset() {
-        let store = Arc::new(
-            cdk_sqlite::mint::memory::empty()
-                .await
-                .expect("in-memory db"),
-        );
-        let signatory = DbSignatory::new(
-            store,
-            b"test-seed-for-unit-tests",
-            Default::default(),
-            Default::default(),
-        )
-        .await
-        .expect("DbSignatory::new");
-
-        let expired_keyset = signatory
-            .rotate_keyset(RotateKeyArguments {
-                unit: CurrencyUnit::Sat,
-                amounts: vec![1, 2, 4, 8],
-                input_fee_ppk: 0,
-                keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
-                final_expiry: Some(unix_time() - 1),
-            })
-            .await
-            .expect("rotate_keyset");
 
         let msg = BlindedMessage::new(
             Amount::from(1),
-            expired_keyset.id,
+            retired.id,
             SecretKey::generate().public_key(),
         );
+        let sigs = signatory
+            .blind_sign(vec![msg])
+            .await
+            .expect("a keyset retired within the grace window must still sign");
 
-        let result = signatory.blind_sign_reserved(vec![msg]).await;
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].keyset_id, retired.id);
+    }
+
+    /// The grace window is bounded: past it a retired keyset stops signing, so
+    /// the permissive path cannot be used to issue on arbitrarily old keysets.
+    #[tokio::test]
+    async fn blind_sign_rejects_keyset_retired_past_grace() {
+        let signatory = signatory_with_grace(Duration::ZERO).await;
+
+        let retired = signatory
+            .rotate_keyset(rotation(None))
+            .await
+            .expect("rotate_keyset");
+        signatory
+            .rotate_keyset(rotation(None))
+            .await
+            .expect("rotate_keyset again");
+
+        let msg = BlindedMessage::new(
+            Amount::from(1),
+            retired.id,
+            SecretKey::generate().public_key(),
+        );
+        let result = signatory.blind_sign(vec![msg]).await;
+
+        assert!(
+            matches!(result, Err(Error::InactiveKeyset)),
+            "expected InactiveKeyset error, got: {:?}",
+            result
+        );
+    }
+
+    /// `valid_from` has one-second resolution, so back-to-back rotations share a
+    /// timestamp. Succession must still resolve, or the middle keyset would be
+    /// left with no retirement time and no grace.
+    #[tokio::test]
+    async fn retirement_time_resolves_for_rotations_within_one_second() {
+        let signatory = signatory_with_grace(DEFAULT_RETIREMENT_GRACE).await;
+
+        let first = signatory
+            .rotate_keyset(rotation(None))
+            .await
+            .expect("rotate_keyset");
+        let second = signatory
+            .rotate_keyset(rotation(None))
+            .await
+            .expect("rotate_keyset again");
+        signatory
+            .rotate_keyset(rotation(None))
+            .await
+            .expect("rotate_keyset a third time");
+
+        let keysets = signatory.keysets.load();
+        assert!(
+            keysets.retired_at.contains_key(&first.id),
+            "the first keyset must have a retirement time"
+        );
+        assert!(
+            keysets.retired_at.contains_key(&second.id),
+            "the second keyset must have a retirement time"
+        );
+
+        for retired in [first.id, second.id] {
+            let msg =
+                BlindedMessage::new(Amount::from(1), retired, SecretKey::generate().public_key());
+            let sigs = signatory
+                .blind_sign(vec![msg])
+                .await
+                .expect("both retired keysets must still sign within grace");
+            assert_eq!(sigs[0].keyset_id, retired);
+        }
+    }
+
+    /// Expiry is a hard stop that the grace window does not relax.
+    #[tokio::test]
+    async fn blind_sign_rejects_expired_keyset_within_grace() {
+        let signatory = signatory_with_grace(DEFAULT_RETIREMENT_GRACE).await;
+
+        let expired = signatory
+            .rotate_keyset(rotation(Some(unix_time() - 1)))
+            .await
+            .expect("rotate_keyset");
+        signatory
+            .rotate_keyset(rotation(None))
+            .await
+            .expect("rotate_keyset again");
+
+        let msg = BlindedMessage::new(
+            Amount::from(1),
+            expired.id,
+            SecretKey::generate().public_key(),
+        );
+        let result = signatory.blind_sign(vec![msg]).await;
 
         assert!(
             matches!(result, Err(Error::ExpiredKeyset)),
             "expected ExpiredKeyset error, got: {:?}",
             result
         );
+    }
+
+    /// The active keyset has no successor, so it has no derived retirement time
+    /// and must be signed on its own merit rather than through the grace path.
+    #[tokio::test]
+    async fn blind_sign_accepts_active_keyset_without_retirement_time() {
+        let signatory = signatory_with_grace(Duration::ZERO).await;
+
+        let active = signatory
+            .rotate_keyset(rotation(None))
+            .await
+            .expect("rotate_keyset");
+
+        assert!(
+            !signatory.keysets.load().retired_at.contains_key(&active.id),
+            "an active keyset must not have a retirement time"
+        );
+
+        let msg = BlindedMessage::new(
+            Amount::from(1),
+            active.id,
+            SecretKey::generate().public_key(),
+        );
+        let sigs = signatory
+            .blind_sign(vec![msg])
+            .await
+            .expect("the active keyset must sign regardless of grace");
+
+        assert_eq!(sigs[0].keyset_id, active.id);
     }
 
     #[tokio::test]
@@ -914,6 +1092,7 @@ mod test {
             b"test-seed-for-subscribe",
             Default::default(),
             Default::default(),
+            DEFAULT_RETIREMENT_GRACE,
         )
         .await
         .expect("DbSignatory::new");
@@ -962,14 +1141,26 @@ mod test {
 
         let seed = b"test-seed-for-multi-instance";
         let instance_a = Arc::new(
-            DbSignatory::new(store.clone(), seed, Default::default(), Default::default())
-                .await
-                .expect("DbSignatory::new a"),
+            DbSignatory::new(
+                store.clone(),
+                seed,
+                Default::default(),
+                Default::default(),
+                DEFAULT_RETIREMENT_GRACE,
+            )
+            .await
+            .expect("DbSignatory::new a"),
         );
         let instance_b = Arc::new(
-            DbSignatory::new(store.clone(), seed, Default::default(), Default::default())
-                .await
-                .expect("DbSignatory::new b"),
+            DbSignatory::new(
+                store.clone(),
+                seed,
+                Default::default(),
+                Default::default(),
+                DEFAULT_RETIREMENT_GRACE,
+            )
+            .await
+            .expect("DbSignatory::new b"),
         );
 
         // Only B reloads from the database; A drives the rotation. A short
@@ -1021,6 +1212,7 @@ mod test {
                 b"test-seed-concurrent-rotations",
                 Default::default(),
                 Default::default(),
+                DEFAULT_RETIREMENT_GRACE,
             )
             .await
             .expect("DbSignatory::new"),
@@ -1095,14 +1287,26 @@ mod test {
 
         let seed = b"test-seed-cross-instance-rotations";
         let instance_a = Arc::new(
-            DbSignatory::new(store_a, seed, Default::default(), Default::default())
-                .await
-                .expect("DbSignatory::new a"),
+            DbSignatory::new(
+                store_a,
+                seed,
+                Default::default(),
+                Default::default(),
+                DEFAULT_RETIREMENT_GRACE,
+            )
+            .await
+            .expect("DbSignatory::new a"),
         );
         let instance_b = Arc::new(
-            DbSignatory::new(store_b, seed, Default::default(), Default::default())
-                .await
-                .expect("DbSignatory::new b"),
+            DbSignatory::new(
+                store_b,
+                seed,
+                Default::default(),
+                Default::default(),
+                DEFAULT_RETIREMENT_GRACE,
+            )
+            .await
+            .expect("DbSignatory::new b"),
         );
 
         // Alternate rotations between the two instances so no single rotation_lock
@@ -1168,9 +1372,15 @@ mod test {
             HashMap::from([(CurrencyUnit::Sat, (0u64, vec![1, 2, 4, 8]))]);
 
         let seeder = Arc::new(
-            DbSignatory::new(store.clone(), seed, supported.clone(), Default::default())
-                .await
-                .expect("DbSignatory::new seeder"),
+            DbSignatory::new(
+                store.clone(),
+                seed,
+                supported.clone(),
+                Default::default(),
+                DEFAULT_RETIREMENT_GRACE,
+            )
+            .await
+            .expect("DbSignatory::new seeder"),
         );
         // Establish an initial active keyset so later rotations advance the index.
         seeder
@@ -1204,9 +1414,15 @@ mod test {
                 let store = store.clone();
                 let supported = supported.clone();
                 tokio::spawn(async move {
-                    DbSignatory::new(store, seed, supported, Default::default())
-                        .await
-                        .expect("DbSignatory::new boot")
+                    DbSignatory::new(
+                        store,
+                        seed,
+                        supported,
+                        Default::default(),
+                        DEFAULT_RETIREMENT_GRACE,
+                    )
+                    .await
+                    .expect("DbSignatory::new boot")
                 })
             };
             rotate.await.expect("join rotate");

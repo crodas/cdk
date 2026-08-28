@@ -1329,35 +1329,6 @@ impl Mint {
         result
     }
 
-    /// Blind sign outputs the mint accepted on a keyset that has since rotated.
-    ///
-    /// Only for outputs already validated as active and persisted by an earlier
-    /// step, such as NUT-08 melt change. Expired keysets are still rejected.
-    #[tracing::instrument(skip_all)]
-    pub async fn blind_sign_reserved(
-        &self,
-        blinded_message: Vec<BlindedMessage>,
-    ) -> Result<Vec<BlindSignature>, Error> {
-        #[cfg(test)]
-        {
-            if crate::test_helpers::mint::should_fail_in_test() {
-                return Err(Error::SignatureMissingOrInvalid);
-            }
-        }
-
-        #[cfg(feature = "prometheus")]
-        let metrics = MintMetricGuard::new("blind_sign_reserved");
-
-        let result = self.signatory.blind_sign_reserved(blinded_message).await;
-
-        #[cfg(feature = "prometheus")]
-        {
-            metrics.record(result.is_ok());
-        }
-
-        result
-    }
-
     /// Verify [`Proof`] meets conditions and is signed
     #[tracing::instrument(skip_all)]
     pub async fn verify_proofs(&self, proofs: Proofs) -> Result<(), Error> {
@@ -1537,7 +1508,7 @@ mod tests {
     use cdk_common::payment::{MakePaymentResponse, PaymentIdentifier};
     use cdk_common::PaymentMethod;
     use cdk_fake_wallet::{create_fake_invoice, FakeInvoiceDescription};
-    use cdk_signatory::db_signatory::DbSignatory;
+    use cdk_signatory::db_signatory::{DbSignatory, DEFAULT_RETIREMENT_GRACE};
     use cdk_signatory::signatory::{RotateKeyArguments, SignatoryKeysets};
     use cdk_sqlite::mint::memory::new_with_state;
     use tokio::sync::watch;
@@ -1592,13 +1563,6 @@ mod tests {
             Err(Error::Custom("unsupported in mock".to_string()))
         }
 
-        async fn blind_sign_reserved(
-            &self,
-            _blinded_messages: Vec<BlindedMessage>,
-        ) -> Result<Vec<BlindSignature>, Error> {
-            Err(Error::Custom("unsupported in mock".to_string()))
-        }
-
         async fn verify_proofs(&self, _proofs: Vec<cdk_common::Proof>) -> Result<(), Error> {
             Err(Error::Custom("unsupported in mock".to_string()))
         }
@@ -1630,6 +1594,7 @@ mod tests {
             b"mock-signatory-seed",
             Default::default(),
             Default::default(),
+            DEFAULT_RETIREMENT_GRACE,
         )
         .await
         .expect("DbSignatory::new");
@@ -2006,13 +1971,6 @@ mod tests {
             self.inner.blind_sign(blinded_messages).await
         }
 
-        async fn blind_sign_reserved(
-            &self,
-            blinded_messages: Vec<BlindedMessage>,
-        ) -> Result<Vec<BlindSignature>, Error> {
-            self.inner.blind_sign_reserved(blinded_messages).await
-        }
-
         async fn verify_proofs(&self, proofs: Vec<cdk_common::Proof>) -> Result<(), Error> {
             self.inner.verify_proofs(proofs).await
         }
@@ -2065,6 +2023,7 @@ mod tests {
                 b"gated-signatory-seed",
                 supported_units.clone(),
                 Default::default(),
+                DEFAULT_RETIREMENT_GRACE,
             )
             .await
             .expect("DbSignatory::new"),
@@ -2163,6 +2122,7 @@ mod tests {
                 config.seed,
                 config.supported_units.clone(),
                 HashMap::new(),
+                DEFAULT_RETIREMENT_GRACE,
             )
             .await
             .expect("Failed to create signatory"),

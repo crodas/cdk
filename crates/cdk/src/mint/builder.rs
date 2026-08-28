@@ -11,6 +11,7 @@ use cdk_common::nut04::MintMethodOptions;
 use cdk_common::nut05::MeltMethodOptions;
 use cdk_common::payment::DynMintPayment;
 use cdk_common::{nut21, nut22};
+use cdk_signatory::db_signatory::DEFAULT_RETIREMENT_GRACE;
 use cdk_signatory::signatory::{RotateKeyArguments, Signatory};
 
 use super::nut17::SupportedMethods;
@@ -80,6 +81,9 @@ pub struct MintBuilder {
     /// deployment that owns its database; set an interval only to run several
     /// mints/signatories against one shared database.
     keyset_refresh_interval: Option<std::time::Duration>,
+    /// How long the built signatory keeps signing on a keyset it has retired.
+    /// Defaults to [`DEFAULT_RETIREMENT_GRACE`].
+    retirement_grace: std::time::Duration,
 }
 
 impl std::fmt::Debug for MintBuilder {
@@ -124,6 +128,7 @@ impl MintBuilder {
             max_outputs: 1000,
             max_batch_size: None,
             keyset_refresh_interval: None,
+            retirement_grace: DEFAULT_RETIREMENT_GRACE,
         }
     }
 
@@ -140,6 +145,15 @@ impl MintBuilder {
     /// rotations without a restart. A few seconds is a reasonable cadence.
     pub fn with_keyset_refresh_interval(mut self, interval: Option<std::time::Duration>) -> Self {
         self.keyset_refresh_interval = interval;
+        self
+    }
+
+    /// Set how long the built signatory keeps signing outputs the mint accepted
+    /// on a keyset it has since retired. Must exceed the longest a payment can
+    /// stay in flight, since a melt's change outputs are validated at accept
+    /// time but signed only once the payment settles.
+    pub fn with_retirement_grace(mut self, grace: std::time::Duration) -> Self {
+        self.retirement_grace = grace;
         self
     }
 
@@ -752,6 +766,7 @@ impl MintBuilder {
                 seed,
                 self.supported_units.clone(),
                 self.custom_paths.clone(),
+                self.retirement_grace,
             )
             .await?,
         );

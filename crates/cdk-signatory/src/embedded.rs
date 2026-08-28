@@ -15,12 +15,6 @@ enum Request {
             oneshot::Sender<Result<Vec<BlindSignature>, Error>>,
         ),
     ),
-    BlindSignReserved(
-        (
-            Vec<BlindedMessage>,
-            oneshot::Sender<Result<Vec<BlindSignature>, Error>>,
-        ),
-    ),
     VerifyProof((Vec<Proof>, oneshot::Sender<Result<(), Error>>)),
     Keysets(oneshot::Sender<Result<SignatoryKeysets, Error>>),
     SubscribeKeysets(oneshot::Sender<Result<watch::Receiver<SignatoryKeysets>, Error>>),
@@ -77,14 +71,6 @@ impl Service {
                         tracing::error!("Error sending blind-sign response: receiver dropped");
                     }
                 }
-                Request::BlindSignReserved((blinded_message, response)) => {
-                    let output = handler.blind_sign_reserved(blinded_message).await;
-                    if response.send(output).is_err() {
-                        tracing::error!(
-                            "Error sending reserved blind-sign response: receiver dropped"
-                        );
-                    }
-                }
                 Request::VerifyProof((proof, response)) => {
                     let output = handler.verify_proofs(proof).await;
                     if response.send(output).is_err() {
@@ -130,20 +116,6 @@ impl Signatory for Service {
         let (tx, rx) = oneshot::channel();
         self.pipeline
             .send(Request::BlindSign((blinded_messages, tx)))
-            .await
-            .map_err(|e| Error::SendError(e.to_string()))?;
-
-        rx.await.map_err(|e| Error::RecvError(e.to_string()))?
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn blind_sign_reserved(
-        &self,
-        blinded_messages: Vec<BlindedMessage>,
-    ) -> Result<Vec<BlindSignature>, Error> {
-        let (tx, rx) = oneshot::channel();
-        self.pipeline
-            .send(Request::BlindSignReserved((blinded_messages, tx)))
             .await
             .map_err(|e| Error::SendError(e.to_string()))?;
 

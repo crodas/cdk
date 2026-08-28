@@ -564,16 +564,16 @@ async fn test_msat_total_spent_rounds_up_when_recording_sat_melt() {
 
 /// Change splitting must follow the denomination schedule of the keyset the
 /// outputs actually name. Falling back to a synthetic powers-of-two schedule
-/// after a rotation would pick amounts the reserved keyset has no keys for.
+/// after a rotation would pick amounts the retired keyset has no keys for.
 #[tokio::test]
-async fn test_change_split_uses_reserved_keyset_schedule_after_rotation() {
+async fn test_change_split_uses_retired_keyset_schedule_after_rotation() {
     use cdk_common::nuts::BlindedMessage;
     use cdk_common::SecretKey;
 
     use crate::mint::melt::shared::get_keyset_fee_and_amounts;
 
     let mint = create_test_mint().await.unwrap();
-    let reserved = mint
+    let retired = mint
         .rotate_keyset(CurrencyUnit::Sat, vec![1, 3, 9, 27], 100, true, None)
         .await
         .unwrap();
@@ -589,7 +589,7 @@ async fn test_change_split_uses_reserved_keyset_schedule_after_rotation() {
 
     let outputs = vec![BlindedMessage::new(
         Amount::from(1),
-        reserved.id,
+        retired.id,
         SecretKey::generate().public_key(),
     )];
 
@@ -613,7 +613,7 @@ async fn test_paid_melt_change_survives_keyset_rotation() {
     let (change_outputs, _premint) = create_test_blinded_messages(&mint, Amount::from(1_000))
         .await
         .unwrap();
-    let reserved_keyset_id = change_outputs[0].keyset_id;
+    let retired_keyset_id = change_outputs[0].keyset_id;
     let melt_request = MeltRequest::new(quote.id.clone(), proofs, Some(change_outputs));
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
@@ -643,10 +643,10 @@ async fn test_paid_melt_change_survives_keyset_rotation() {
     .unwrap();
     assert!(
         !mint
-            .get_keyset_info(&reserved_keyset_id)
-            .expect("reserved keyset must still exist")
+            .get_keyset_info(&retired_keyset_id)
+            .expect("retired keyset must still exist")
             .active,
-        "rotation should have retired the reserved keyset"
+        "rotation should have retired the keyset"
     );
 
     let change = finalize_melt_quote(
@@ -663,7 +663,7 @@ async fn test_paid_melt_change_survives_keyset_rotation() {
     .expect("a paid melt must remain finalizable after its change keyset rotates")
     .expect("change was requested and is owed");
 
-    assert!(change.iter().all(|sig| sig.keyset_id == reserved_keyset_id));
+    assert!(change.iter().all(|sig| sig.keyset_id == retired_keyset_id));
     let change_amount =
         Amount::try_sum(change.iter().map(|sig| sig.amount)).expect("change cannot overflow");
     assert_eq!(change_amount, Amount::from(1_000));

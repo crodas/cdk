@@ -2826,15 +2826,20 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn validated_remote_signatory_identity_is_checked_at_mint_build_boundary() {
-        use cdk_signatory::db_signatory::DbSignatory;
+        use cdk_signatory::db_signatory::{DbSignatory, DEFAULT_RETIREMENT_GRACE};
         use cdk_signatory::signatory::Signatory;
         use cdk_sqlite::mint::memory;
 
         let expected_store = Arc::new(memory::empty().await.expect("expected signatory database"));
-        let expected_signatory =
-            DbSignatory::new(expected_store, &[7; 32], HashMap::new(), Default::default())
-                .await
-                .expect("expected signatory");
+        let expected_signatory = DbSignatory::new(
+            expected_store,
+            &[7; 32],
+            HashMap::new(),
+            Default::default(),
+            DEFAULT_RETIREMENT_GRACE,
+        )
+        .await
+        .expect("expected signatory");
         let expected_pubkey = expected_signatory
             .keysets()
             .await
@@ -2843,9 +2848,15 @@ mod tests {
 
         let actual_store = Arc::new(memory::empty().await.expect("actual signatory database"));
         let actual_signatory: DynSignatory = Arc::new(
-            DbSignatory::new(actual_store, &[9; 32], HashMap::new(), Default::default())
-                .await
-                .expect("actual signatory"),
+            DbSignatory::new(
+                actual_store,
+                &[9; 32],
+                HashMap::new(),
+                Default::default(),
+                DEFAULT_RETIREMENT_GRACE,
+            )
+            .await
+            .expect("actual signatory"),
         );
         let actual_pubkey = actual_signatory
             .keysets()

@@ -449,10 +449,10 @@ async fn begin_melt_change_without_signatures(
 /// transaction. [`MeltChangeResult::AlreadyCompleted`] indicates that another
 /// finalizer completed cleanup after this finalizer released its initial locks.
 ///
-/// Signing goes through [`Mint::blind_sign_reserved`] because the payment has
-/// already settled by this point: the outputs were validated against an active
-/// keyset at setup, and a rotation in between must not leave a paid melt
-/// permanently unfinalizable.
+/// Signing happens after the payment has already settled. The outputs were
+/// validated against an active keyset at setup, so a rotation in between must
+/// not leave a paid melt permanently unfinalizable; the signatory keeps signing
+/// a freshly retired keyset for its configured grace window.
 ///
 /// # Errors
 ///
@@ -517,9 +517,7 @@ pub(super) async fn process_melt_change(
     }
 
     // External call: sign change outputs (no DB transaction held)
-    let change_sigs = mint
-        .blind_sign_reserved(blinded_messages_to_sign.clone())
-        .await?;
+    let change_sigs = mint.blind_sign(blinded_messages_to_sign.clone()).await?;
 
     // Open a transaction with quote, melt-request, and change-output locks
     // acquired in the same order as finalization and rollback.

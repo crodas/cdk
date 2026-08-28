@@ -4,9 +4,6 @@ package signatory;
 
 service Signatory {
   rpc BlindSign(BlindedMessages) returns (BlindSignResponse);
-  // signs messages whose keyset may have been rotated out of active service
-  // since the mint accepted them; expired keysets are still rejected
-  rpc BlindSignReserved(BlindedMessages) returns (BlindSignResponse);
   rpc VerifyProofs(Proofs) returns (BooleanResponse);
   // returns all the keysets for the mint
   rpc Keysets(EmptyRequest) returns (KeysResponse);

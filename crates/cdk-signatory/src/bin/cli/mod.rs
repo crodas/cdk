@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
+use cdk_signatory::db_signatory::DEFAULT_RETIREMENT_GRACE;
 use clap::Parser;
 #[cfg(feature = "sqlite")]
 use {
@@ -100,6 +101,13 @@ struct Cli {
     /// another's rotations without a restart.
     #[arg(long, default_value = "0")]
     keyset_refresh_interval_ms: u64,
+    /// How long, in seconds, a retired keyset keeps signing outputs the mint
+    /// accepted while it was still active. Must exceed the longest a payment
+    /// can stay in flight: a melt's change outputs are validated at accept time
+    /// but signed only after settlement, and refusing them strands a melt whose
+    /// quote is already paid.
+    #[arg(long, default_value_t = DEFAULT_RETIREMENT_GRACE.as_secs())]
+    retirement_grace_secs: u64,
 }
 
 /// Main function for the signatory standalone binary
@@ -196,8 +204,14 @@ pub async fn cli_main() -> Result<()> {
     let seed = mnemonic.to_seed_normalized("");
 
     let signatory = Arc::new(
-        db_signatory::DbSignatory::new(localstore, &seed, supported_units, Default::default())
-            .await?,
+        db_signatory::DbSignatory::new(
+            localstore,
+            &seed,
+            supported_units,
+            Default::default(),
+            Duration::from_secs(args.retirement_grace_secs),
+        )
+        .await?,
     );
 
     // Off by default. When enabled, periodically reload keysets from the shared
