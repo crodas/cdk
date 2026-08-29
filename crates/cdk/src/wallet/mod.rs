@@ -1,5 +1,6 @@
 #![doc = include_str!("./README.md")]
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::str::FromStr;
@@ -22,7 +23,6 @@ use tracing::instrument;
 use zeroize::Zeroize;
 
 use crate::amount::SplitTarget;
-use crate::dhke::construct_proofs;
 use crate::error::Error;
 use crate::fees::calculate_fee;
 use crate::mint_url::MintUrl;
@@ -32,6 +32,7 @@ use crate::nuts::{
     nut10, CurrencyUnit, Id, Keys, MintInfo, MintQuoteState, PreMintSecrets, Proofs,
     RestoreRequest, SpendingConditions, State,
 };
+use crate::wallet::blind_signature::construct_proofs_per_keyset;
 use crate::wallet::mint_metadata_cache::MintMetadataCache;
 use crate::wallet::p2pk::{P2PK_ACCOUNT, P2PK_PURPOSE};
 use crate::{Amount, OidcClient};
@@ -684,6 +685,12 @@ impl Wallet {
     /// Scans each keyset in batches of `opts.batch_size` blinded messages
     /// and stops after `opts.max_gap` consecutive empty batches. Lowering
     /// `batch_size` trades scan latency for a gentler request pattern.
+    ///
+    /// A recovered signature can name a keyset other than the one being
+    /// scanned, so each is unblinded against the keyset that signed it. The
+    /// mint indexes signatures by blinded secret alone, so change it
+    /// substituted onto another keyset surfaces here under the counters of the
+    /// keyset the outputs were derived from.
     #[instrument(skip(self))]
     pub async fn restore_with_opts(&self, opts: NUT13Options) -> Result<Restored, Error> {
         let opts = NUT13Options::new(opts.batch_size, opts.max_gap)?;
@@ -705,7 +712,8 @@ impl Wallet {
         let mut restored_result = Restored::default();
 
         for keyset in keysets {
-            let keys = self.keyset(keyset.id).await?.keys;
+            let mut keys_by_keyset: HashMap<Id, Keys> = HashMap::new();
+            keys_by_keyset.insert(keyset.id, self.keyset(keyset.id).await?.keys);
             let mut empty_batch: u32 = 0;
             let mut start_counter: u32 = 0;
             // Track the highest counter value that had a signature
@@ -775,9 +783,15 @@ impl Wallet {
                     )));
                 }
 
+                for (_, _, sig) in &matched_secrets {
+                    if let Entry::Vacant(entry) = keys_by_keyset.entry(sig.keyset_id) {
+                        entry.insert(self.keyset(sig.keyset_id).await?.keys);
+                    }
+                }
+
                 // Extract signatures, rs, and secrets in matching order
                 // Each tuple (idx, premint, signature) ensures correct pairing
-                let proofs = construct_proofs(
+                let proofs = construct_proofs_per_keyset(
                     matched_secrets
                         .iter()
                         .map(|(_, _, sig)| sig.clone())
@@ -790,7 +804,7 @@ impl Wallet {
                         .iter()
                         .map(|(_, p, _)| p.secret.clone())
                         .collect(),
-                    &keys,
+                    &keys_by_keyset,
                 )?;
 
                 tracing::debug!("Restored {} proofs", proofs.len());

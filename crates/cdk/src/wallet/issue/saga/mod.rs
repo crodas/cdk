@@ -50,7 +50,7 @@ use crate::nuts::nut00::ProofsMethods;
 use crate::nuts::{MintRequest, PreMintSecrets, Proofs, SpendingConditions, State};
 use crate::util::unix_time;
 use crate::wallet::blind_signature::{
-    validate_mint_response_signatures, SignatureAmountValidation,
+    validate_mint_response_signatures, SignatureAmountValidation, SignatureKeysetValidation,
 };
 use crate::wallet::saga::{
     add_compensation, clear_compensations, execute_compensations, new_compensations, Compensations,
@@ -1002,6 +1002,8 @@ impl<'a> MintSaga<'a, Prepared> {
                 &mint_res.signatures,
                 premint_secrets.secrets.iter().map(|p| &p.blinded_message),
                 SignatureAmountValidation::Exact,
+                SignatureKeysetValidation::Exact,
+                Default::default(),
             )
             .await?;
 

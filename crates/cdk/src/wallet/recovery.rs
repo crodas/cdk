@@ -21,10 +21,10 @@ use cdk_common::wallet::{ProofInfo, WalletSagaState};
 use cdk_common::BlindedMessage;
 use tracing::instrument;
 
-use crate::dhke::construct_proofs;
 use crate::nuts::{CheckStateRequest, PreMintSecrets, Proofs, RestoreRequest, State, SwapRequest};
 use crate::wallet::blind_signature::{
-    validate_mint_response_signatures, SignatureAmountValidation,
+    construct_proofs_per_keyset, validate_mint_response_signatures, SignatureAmountValidation,
+    SignatureKeysetValidation,
 };
 use crate::{Error, Wallet};
 
@@ -271,23 +271,21 @@ impl RecoveryHelpers for Wallet {
         let premint_secrets =
             PreMintSecrets::restore_batch(keyset_id, &self.seed, counter_start, counter_end)?;
 
-        // Load keyset keys
-        let keys = self.keyset(keyset_id).await?.keys;
-
-        validate_mint_response_signatures(
+        let keys_by_keyset = validate_mint_response_signatures(
             self,
             &swap_response.signatures,
             blinded_messages.iter(),
             SignatureAmountValidation::Exact,
+            SignatureKeysetValidation::Exact,
+            Default::default(),
         )
         .await?;
 
-        // Construct proofs
-        let proofs = construct_proofs(
+        let proofs = construct_proofs_per_keyset(
             swap_response.signatures,
             premint_secrets.rs(),
             premint_secrets.secrets(),
-            &keys,
+            &keys_by_keyset,
         )?;
 
         // Convert to ProofInfo
@@ -521,25 +519,23 @@ impl Wallet {
             );
         }
 
-        // Load keyset keys for proof construction
-        let keys = self.keyset(keyset_id).await?.keys;
-
-        validate_mint_response_signatures(
+        let keys_by_keyset = validate_mint_response_signatures(
             self,
             &restore_response.signatures,
             matched
                 .iter()
                 .map(|(_, requested_output)| *requested_output),
             SignatureAmountValidation::AllowZeroAmountPlaceholder,
+            SignatureKeysetValidation::AllowSubstitution,
+            Default::default(),
         )
         .await?;
 
-        // Construct proofs from signatures
-        let proofs = construct_proofs(
+        let proofs = construct_proofs_per_keyset(
             restore_response.signatures,
             matched.iter().map(|(p, _)| p.r.clone()).collect(),
             matched.iter().map(|(p, _)| p.secret.clone()).collect(),
-            &keys,
+            &keys_by_keyset,
         )?;
 
         tracing::info!(

@@ -50,6 +50,12 @@ where
 {
     type Err = Error;
 
+    /// `keyset_id` is rewritten on the update path: a row reserved by
+    /// `add_blinded_messages` carries the keyset the client asked for, but melt
+    /// change can end up signed under a different one when the original keyset
+    /// is no longer signable. The row must name the keyset that actually
+    /// produced `C`, or the proof is unspendable and `keyset_amounts` disagrees
+    /// with it.
     async fn add_blind_signatures(
         &mut self,
         blinded_messages: &[PublicKey],
@@ -150,11 +156,10 @@ where
                     // Blind message exists: check if c is NULL
                     match c {
                         Column::Null => {
-                            // Blind message with no c: Update with missing columns c, dleq_e, dleq_s
                             query(
                                 r#"
                                 UPDATE blind_signature
-                                SET c = :c, dleq_e = :dleq_e, dleq_s = :dleq_s, signed_time = :signed_time, amount = :amount
+                                SET c = :c, dleq_e = :dleq_e, dleq_s = :dleq_s, signed_time = :signed_time, amount = :amount, keyset_id = :keyset_id
                                 WHERE blinded_message = :blinded_message
                                 "#,
                             )?
@@ -170,6 +175,7 @@ where
                             .bind("blinded_message", message.to_bytes().to_vec())
                             .bind("signed_time", current_time as i64)
                             .bind("amount", u64::from(signature.amount) as i64)
+                            .bind("keyset_id", signature.keyset_id.to_string())
                             .execute(&self.inner)
                             .await?;
 

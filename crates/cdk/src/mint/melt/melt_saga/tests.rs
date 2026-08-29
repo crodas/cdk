@@ -9,6 +9,7 @@
 //! - Failure handling
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use cdk_common::melt::MeltQuoteRequest;
 use cdk_common::mint::{
@@ -29,7 +30,9 @@ use crate::mint::melt::melt_saga::{MeltSaga, PaymentOutcome};
 use crate::mint::melt::shared::{
     finalize_melt_quote, process_melt_change, rollback_melt_quote, MeltChangeResult,
 };
-use crate::test_helpers::mint::{create_test_mint, mint_test_proofs};
+use crate::test_helpers::mint::{
+    create_test_mint, create_test_mint_with_retirement_grace, mint_test_proofs,
+};
 
 // ============================================================================
 // Basic State Transition Tests
@@ -567,10 +570,7 @@ async fn test_msat_total_spent_rounds_up_when_recording_sat_melt() {
 /// after a rotation would pick amounts the retired keyset has no keys for.
 #[tokio::test]
 async fn test_change_split_uses_retired_keyset_schedule_after_rotation() {
-    use cdk_common::nuts::BlindedMessage;
-    use cdk_common::SecretKey;
-
-    use crate::mint::melt::shared::get_keyset_fee_and_amounts;
+    use crate::mint::melt::change_keyset::reserved_change_keyset;
 
     let mint = create_test_mint().await.unwrap();
     let retired = mint
@@ -587,16 +587,12 @@ async fn test_change_split_uses_retired_keyset_schedule_after_rotation() {
     .await
     .unwrap();
 
-    let outputs = vec![BlindedMessage::new(
-        Amount::from(1),
-        retired.id,
-        SecretKey::generate().public_key(),
-    )];
+    let keyset = reserved_change_keyset(&mint.keysets, retired.id)
+        .expect("the retired keyset is still known to the mint");
 
-    let fee_and_amounts = get_keyset_fee_and_amounts(&mint.keysets, &outputs);
-
-    assert_eq!(fee_and_amounts.fee(), 100);
-    assert_eq!(fee_and_amounts.amounts(), &[1, 3, 9, 27]);
+    assert_eq!(keyset.id, retired.id);
+    assert_eq!(keyset.fee_and_amounts.fee(), 100);
+    assert_eq!(keyset.fee_and_amounts.amounts(), &[1, 3, 9, 27]);
 }
 
 /// A melt whose change outputs were accepted on a then-active keyset must stay
@@ -667,6 +663,169 @@ async fn test_paid_melt_change_survives_keyset_rotation() {
     let change_amount =
         Amount::try_sum(change.iter().map(|sig| sig.amount)).expect("change cannot overflow");
     assert_eq!(change_amount, Amount::from(1_000));
+}
+
+/// Drives a melt to the point where its change is about to be signed, then hands
+/// back the pieces the caller needs to rotate keysets and finalize.
+async fn melt_ready_for_change(
+    mint: &crate::mint::Mint,
+    change_amount: Amount,
+) -> (MeltQuote, uuid::Uuid, cdk_common::nuts::Id) {
+    use crate::test_helpers::mint::create_test_blinded_messages;
+
+    let proofs = mint_test_proofs(mint, Amount::from(10_000)).await.unwrap();
+    let quote = create_test_melt_quote(mint, Amount::from(9_000)).await;
+    let (change_outputs, _premint) = create_test_blinded_messages(mint, change_amount)
+        .await
+        .unwrap();
+    let reserved_keyset_id = change_outputs[0].keyset_id;
+    let melt_request = MeltRequest::new(quote.id.clone(), proofs, Some(change_outputs));
+
+    let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
+    let saga = MeltSaga::new(
+        std::sync::Arc::new(mint.clone()),
+        mint.localstore(),
+        mint.pubsub_manager(),
+    );
+    let setup_saga = saga
+        .setup_melt(
+            &melt_request,
+            verification,
+            PaymentMethod::Known(KnownMethod::Bolt11),
+        )
+        .await
+        .unwrap();
+
+    (quote, setup_saga.operation_id, reserved_keyset_id)
+}
+
+async fn finalize_paid_melt(
+    mint: &crate::mint::Mint,
+    quote: &MeltQuote,
+    operation_id: uuid::Uuid,
+) -> Option<Vec<cdk_common::nuts::BlindSignature>> {
+    finalize_melt_quote(
+        mint,
+        &mint.localstore(),
+        &mint.pubsub_manager(),
+        quote,
+        Amount::new(9_000, CurrencyUnit::Sat),
+        Some("rotation_preimage".to_string()),
+        &PaymentIdentifier::CustomId("rotation_lookup".to_string()),
+        Some(operation_id),
+    )
+    .await
+    .expect("a paid melt must always finalize")
+}
+
+/// Once the reserved keyset is past its grace it cannot sign at all, but the
+/// payment has already settled. The blinded secret does not commit to a keyset,
+/// so the change is signed under the active keyset instead of being lost.
+#[tokio::test]
+async fn test_paid_melt_change_moves_to_active_keyset_past_grace() {
+    let mint = create_test_mint_with_retirement_grace(Duration::ZERO)
+        .await
+        .unwrap();
+    let (quote, operation_id, reserved_keyset_id) =
+        melt_ready_for_change(&mint, Amount::from(1_000)).await;
+
+    let active = mint
+        .rotate_keyset(
+            CurrencyUnit::Sat,
+            (0..32).map(|i| 2u64.pow(i)).collect(),
+            0,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(active.id, reserved_keyset_id);
+
+    let change = finalize_paid_melt(&mint, &quote, operation_id)
+        .await
+        .expect("change was requested and is owed");
+
+    assert!(
+        change.iter().all(|sig| sig.keyset_id == active.id),
+        "change must be signed under the keyset that could actually sign it"
+    );
+    let change_amount =
+        Amount::try_sum(change.iter().map(|sig| sig.amount)).expect("change cannot overflow");
+    assert_eq!(change_amount, Amount::from(1_000));
+
+    let persisted = mint
+        .localstore()
+        .get_blind_signatures_for_quote(&quote.id)
+        .await
+        .unwrap();
+    assert!(
+        persisted.iter().all(|sig| sig.keyset_id == active.id),
+        "the stored row must name the keyset that produced C, not the reserved one"
+    );
+}
+
+/// A substituted keyset brings its own denominations. Change it cannot express
+/// exactly is rounded down to the part it can, because returning most of the
+/// change beats returning none on a melt that has already been paid.
+#[tokio::test]
+async fn test_paid_melt_change_rounds_down_to_substitute_denominations() {
+    let mint = create_test_mint_with_retirement_grace(Duration::ZERO)
+        .await
+        .unwrap();
+    let (quote, operation_id, _reserved) = melt_ready_for_change(&mint, Amount::from(1_000)).await;
+
+    let active = mint
+        .rotate_keyset(
+            CurrencyUnit::Sat,
+            vec![3, 9, 27, 81, 243, 729],
+            0,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let change = finalize_paid_melt(&mint, &quote, operation_id)
+        .await
+        .expect("the expressible part of the change is still owed");
+
+    assert!(change.iter().all(|sig| sig.keyset_id == active.id));
+    assert!(
+        change
+            .iter()
+            .all(|sig| [3, 9, 27, 81, 243, 729].contains(&u64::from(sig.amount))),
+        "every amount must be a denomination the signing keyset actually has"
+    );
+    let change_amount =
+        Amount::try_sum(change.iter().map(|sig| sig.amount)).expect("change cannot overflow");
+    assert_eq!(change_amount, Amount::from(999));
+}
+
+/// When no keyset can sign the change the melt must still finalize. Forfeiting
+/// the change is bad, but stranding a quote whose proofs are already spent and
+/// whose payment already settled is worse, and no retry would ever clear it.
+#[tokio::test]
+async fn test_paid_melt_finalizes_without_change_when_nothing_can_sign() {
+    let mint = create_test_mint_with_retirement_grace(Duration::ZERO)
+        .await
+        .unwrap();
+    let (quote, operation_id, _reserved) = melt_ready_for_change(&mint, Amount::from(1_000)).await;
+
+    mint.rotate_keyset(CurrencyUnit::Sat, vec![1_000_000], 0, true, None)
+        .await
+        .unwrap();
+
+    let change = finalize_paid_melt(&mint, &quote, operation_id).await;
+    assert!(change.is_none(), "no denomination can express the change");
+
+    let finalized = mint
+        .localstore()
+        .get_melt_quote(&quote.id)
+        .await
+        .unwrap()
+        .expect("quote must still exist");
+    assert_eq!(finalized.state, MeltQuoteState::Paid);
+    assert_saga_not_exists(&mint, &operation_id).await;
 }
 
 #[tokio::test]

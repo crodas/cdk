@@ -16,6 +16,7 @@ use cdk_common::{
     Amount, MintQuoteBolt11Request, MintQuoteBolt11Response, MintQuoteState, MintRequest,
 };
 use cdk_fake_wallet::FakeWallet;
+use cdk_signatory::db_signatory::DEFAULT_RETIREMENT_GRACE;
 use tokio::time::sleep;
 
 use crate::mint::{Mint, MintBuilder, MintMeltLimits};
@@ -74,6 +75,18 @@ pub(crate) fn should_fail_for(operation: &str) -> bool {
 /// }
 /// ```
 pub async fn create_test_mint() -> Result<Mint, Error> {
+    create_test_mint_with_retirement_grace(DEFAULT_RETIREMENT_GRACE).await
+}
+
+/// Creates a test mint whose signatory stops signing a retired keyset after
+/// `retirement_grace`.
+///
+/// Pass [`Duration::ZERO`] to make a rotation retire a keyset for signing
+/// immediately, which is how tests reach the paths that run once the reserved
+/// change keyset can no longer sign.
+pub async fn create_test_mint_with_retirement_grace(
+    retirement_grace: Duration,
+) -> Result<Mint, Error> {
     let db = Arc::new(cdk_sqlite::mint::memory::empty().await?);
 
     let mut mint_builder = MintBuilder::new(db.clone());
@@ -103,6 +116,7 @@ pub async fn create_test_mint() -> Result<Mint, Error> {
     let mnemonic = Mnemonic::generate(12).map_err(|e| Error::Custom(e.to_string()))?;
 
     mint_builder = mint_builder
+        .with_retirement_grace(retirement_grace)
         .with_name("test mint".to_string())
         .with_description("test mint for unit tests".to_string())
         .with_urls(vec!["https://test-mint".to_string()]);

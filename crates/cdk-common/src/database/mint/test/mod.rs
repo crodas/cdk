@@ -378,6 +378,7 @@ macro_rules! mint_db_test {
             get_mint_quote_by_request_lookup_id,
             delete_blinded_messages,
             add_and_get_blind_signatures,
+            add_blind_signature_rewrites_reserved_keyset,
             get_blind_signatures_for_keyset,
             get_blind_signatures_for_quote,
             get_total_issued,

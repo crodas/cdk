@@ -3,10 +3,12 @@
 use std::cmp::Reverse;
 use std::str::FromStr;
 
+use cashu::nut00::KnownMethod;
 use cashu::{Amount, BlindSignature, Id, SecretKey};
 
 use crate::database::mint::{Database, Error, KeysDatabase, QuoteId};
 use crate::database::MintSignaturesDatabase;
+use crate::mint::Operation;
 
 /// Test adding and retrieving blind signatures
 pub async fn add_and_get_blind_signatures<DB>(db: DB)
@@ -282,4 +284,76 @@ where
         .await;
     assert!(result.is_err());
     tx.rollback().await.unwrap();
+}
+
+/// A reserved row must adopt the keyset that actually signed it.
+///
+/// Melt change outputs are reserved while their keyset is active but signed
+/// only after the payment settles, so the signing keyset can differ from the
+/// one the row was reserved under.
+pub async fn add_blind_signature_rewrites_reserved_keyset<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error> + MintSignaturesDatabase<Err = Error>,
+{
+    let reserved_keyset = Id::from_str("001711afb1de20cb").unwrap();
+    let signing_keyset = Id::from_str("00ad268c4d1f5826").unwrap();
+
+    let blinded_message = cashu::BlindedMessage {
+        blinded_secret: SecretKey::generate().public_key(),
+        keyset_id: reserved_keyset,
+        amount: Amount::ZERO,
+        witness: None,
+    };
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_blinded_messages(
+        None,
+        std::slice::from_ref(&blinded_message),
+        &Operation::new_melt(
+            Amount::ZERO,
+            Amount::ZERO,
+            cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        ),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let signature = BlindSignature {
+        amount: Amount::from(64u64),
+        keyset_id: signing_keyset,
+        c: SecretKey::generate().public_key(),
+        dleq: None,
+    };
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_blind_signatures(
+        &[blinded_message.blinded_secret],
+        std::slice::from_ref(&signature),
+        None,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let retrieved = db
+        .get_blind_signatures(&[blinded_message.blinded_secret])
+        .await
+        .unwrap();
+    let retrieved = retrieved[0].as_ref().expect("signature was stored");
+    assert_eq!(
+        retrieved.keyset_id, signing_keyset,
+        "stored row must name the keyset that produced C, not the reserved one"
+    );
+    assert_eq!(retrieved.amount, signature.amount);
+
+    let by_keyset = db
+        .get_blind_signatures_for_keyset(&signing_keyset)
+        .await
+        .unwrap();
+    assert_eq!(by_keyset.len(), 1);
+
+    let issued = db.get_total_issued().await.unwrap();
+    assert_eq!(issued.get(&signing_keyset), Some(&Amount::from(64u64)));
+    assert_eq!(issued.get(&reserved_keyset), None);
 }

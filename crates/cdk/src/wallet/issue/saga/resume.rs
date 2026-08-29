@@ -23,7 +23,7 @@ use crate::dhke::{construct_proofs, hash_to_curve};
 use crate::nuts::{MintRequest, PreMintSecrets, State};
 use crate::util::unix_time;
 use crate::wallet::blind_signature::{
-    validate_mint_response_signatures, SignatureAmountValidation,
+    validate_mint_response_signatures, SignatureAmountValidation, SignatureKeysetValidation,
 };
 use crate::wallet::issue::saga::compensation::ReleaseMintQuote;
 use crate::wallet::issue::saga::state::PreparedMintRequest;
@@ -506,6 +506,8 @@ impl Wallet {
                 &mint_response.signatures,
                 blinded_messages.iter(),
                 SignatureAmountValidation::Exact,
+                SignatureKeysetValidation::Exact,
+                Default::default(),
             )
             .await?;
 
@@ -636,6 +638,8 @@ impl Wallet {
             &mint_response.signatures,
             blinded_messages.iter(),
             SignatureAmountValidation::Exact,
+            SignatureKeysetValidation::Exact,
+            Default::default(),
         )
         .await?;
 

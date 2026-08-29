@@ -42,7 +42,7 @@ use crate::dhke::construct_proofs;
 use crate::nuts::nut00::ProofsMethods;
 use crate::nuts::{nut10, Proofs, SpendingConditions, State};
 use crate::wallet::blind_signature::{
-    validate_mint_response_signatures, SignatureAmountValidation,
+    validate_mint_response_signatures, SignatureAmountValidation, SignatureKeysetValidation,
 };
 use crate::wallet::saga::{
     add_compensation, clear_compensations, execute_compensations, new_compensations, Compensations,
@@ -254,6 +254,8 @@ impl<'a> SwapSaga<'a, Prepared> {
             &swap_response.signatures,
             self.state_data.pre_swap.swap_request.outputs().iter(),
             SignatureAmountValidation::Exact,
+            SignatureKeysetValidation::Exact,
+            Default::default(),
         )
         .await?;
 

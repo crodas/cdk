@@ -33,6 +33,7 @@ use crate::types::PaymentProcessorKey;
 use crate::util::unix_time;
 use crate::{ensure_cdk, Amount, Error};
 
+mod change_keyset;
 pub(crate) mod melt_saga;
 pub(crate) mod shared;
 
