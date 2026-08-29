@@ -84,6 +84,12 @@ pub(crate) struct MeltSaga<'a, S> {
 
 /// Shared helper function to perform the actual melt finalization.
 /// Used by `execute_async` and `PaymentPending::finalize`.
+///
+/// Change is unblinded against `premint_secrets.keyset_id`, the keyset the blank
+/// outputs were created under, rather than whichever keyset is active by the
+/// time the payment settles. The mint signs change on the original keyset even
+/// after rotating away from it, so resolving keys from the active keyset would
+/// unblind with the wrong key and produce well-formed but unspendable proofs.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_melt_common<'a>(
     wallet: &'a Wallet,
@@ -98,14 +104,13 @@ async fn finalize_melt_common<'a>(
     metadata: HashMap<String, String>,
     keyset_policy: KeysetLoadPolicy,
 ) -> Result<MeltSaga<'a, Finalized>, Error> {
-    let active_keyset_id = wallet.active_keyset_with_policy(keyset_policy).await?.id;
-    let active_keys = wallet
-        .keyset_with_policy(active_keyset_id, keyset_policy)
-        .await?
-        .keys;
-
     let change_proofs = match change {
         Some(change) => {
+            let blank_output_keys = wallet
+                .keyset_with_policy(premint_secrets.keyset_id, keyset_policy)
+                .await?
+                .keys;
+
             let num_change_proof = change.len();
 
             let num_change_proof = match (
@@ -133,7 +138,7 @@ async fn finalize_melt_common<'a>(
                 change,
                 premint_secrets.rs()[..num_change_proof].to_vec(),
                 premint_secrets.secrets()[..num_change_proof].to_vec(),
-                &active_keys,
+                &blank_output_keys,
             )?)
         }
         None => None,
@@ -1339,13 +1344,13 @@ impl<'a> MeltSaga<'a, Finalized> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
     use cdk_common::amount::{FeeAndAmounts, SplitTarget};
     use cdk_common::nut00::KnownMethod;
     use cdk_common::nuts::nut30::MeltQuoteOnchainFeeOption;
-    use cdk_common::nuts::{CurrencyUnit, State};
+    use cdk_common::nuts::{CurrencyUnit, Id, KeySet, Keys, SecretKey, State};
     use cdk_common::wallet::{KeysetLoadPolicy, OperationData, TransactionStatus};
     use cdk_common::{MeltQuoteOnchainResponse, MeltQuoteResponse, MeltQuoteState, PaymentMethod};
     use uuid::Uuid;
@@ -1780,6 +1785,98 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(Error::AmountOverflow)));
+    }
+
+    /// Build a keyset whose secret keys the test knows, so a change signature can
+    /// be produced and the resulting proof checked cryptographically.
+    fn test_keyset_with_keys(seed: u8) -> (KeySet, BTreeMap<Amount, SecretKey>) {
+        let mut signing_keys = BTreeMap::new();
+        let mut public_keys = BTreeMap::new();
+        for power in 0..8u8 {
+            let amount = Amount::from(1u64 << power);
+            let secret_key =
+                SecretKey::from_slice(&[seed + power + 1; 32]).expect("test key is a valid secret");
+            public_keys.insert(amount, secret_key.public_key());
+            signing_keys.insert(amount, secret_key);
+        }
+        let keys = Keys::new(public_keys);
+
+        (
+            KeySet {
+                id: Id::v1_from_keys(&keys),
+                unit: CurrencyUnit::Sat,
+                active: Some(false),
+                keys,
+                input_fee_ppk: 0,
+                final_expiry: None,
+            },
+            signing_keys,
+        )
+    }
+
+    /// The mint keeps signing melt change on the keyset the blank outputs were
+    /// created under, even after rotating away from it. Unblinding must use that
+    /// keyset's keys rather than whichever keyset is active at finalization, or
+    /// the change comes out well-formed but unspendable, with no error raised.
+    #[tokio::test]
+    async fn test_finalize_melt_unblinds_change_with_the_blank_output_keyset() {
+        let db = create_test_db().await;
+        let mock_client = Arc::new(MockMintConnector::new());
+
+        let (retired_keyset, retired_signing_keys) = test_keyset_with_keys(0);
+        let (mut rotated_keyset, _) = test_keyset_with_keys(64);
+        rotated_keyset.active = Some(true);
+        let retired_keyset_id = retired_keyset.id;
+        assert_ne!(
+            retired_keyset_id, rotated_keyset.id,
+            "the two keysets must differ for this test to mean anything"
+        );
+        *mock_client.keysets.lock().unwrap() = vec![retired_keyset, rotated_keyset];
+
+        let wallet = create_test_wallet_with_mock(db, mock_client).await;
+
+        let quote = test_melt_quote();
+        let final_proofs = vec![test_proof_info(retired_keyset_id, 1008, test_mint_url()).proof];
+        let premint_secrets = PreMintSecrets::blank(retired_keyset_id, Amount::from(8))
+            .expect("blank premint secrets");
+
+        let change_amount = Amount::from(8);
+        let signing_key = retired_signing_keys
+            .get(&change_amount)
+            .expect("signing key for the change amount");
+        let change = vec![BlindSignature {
+            amount: change_amount,
+            keyset_id: retired_keyset_id,
+            c: crate::dhke::sign_message(
+                signing_key,
+                &premint_secrets.blinded_messages()[0].blinded_secret,
+            )
+            .expect("sign the blank output"),
+            dleq: None,
+        }];
+
+        let finalized = finalize_melt_common(
+            &wallet,
+            new_compensations(),
+            Uuid::new_v4(),
+            &quote,
+            &final_proofs,
+            &premint_secrets,
+            MeltQuoteState::Paid,
+            None,
+            Some(change),
+            HashMap::new(),
+            Default::default(),
+        )
+        .await
+        .expect("finalize");
+
+        let change_proofs = finalized.into_change().expect("change proofs");
+        let proof = &change_proofs[0];
+
+        assert_eq!(proof.keyset_id, retired_keyset_id);
+        crate::dhke::verify_message(signing_key, proof.c, proof.secret.as_bytes())
+            .expect("change proof must verify against the keyset that signed it");
     }
 
     #[tokio::test]
