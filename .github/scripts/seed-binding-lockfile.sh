@@ -5,6 +5,10 @@
 # commit instead of re-resolving. Fails if any dependency the binding resolves
 # to was not pinned by the workspace lock.
 #
+# The reference is the tree that published the cdk-ffi the binding pins, which
+# is an earlier tag whenever a release pins an older cdk-ffi than its own tag.
+# Pass that checkout's manifest as the second argument.
+#
 # Usage: seed-binding-lockfile.sh <downstream-rust-dir> [root-manifest]
 #   run from the monorepo checkout root.
 
@@ -47,10 +51,12 @@ resolved_versions "${BINDING_DIR}/Cargo.toml" > "${workdir}/binding.txt"
 drift="$(comm -13 "${workdir}/workspace.txt" "${workdir}/binding.txt")"
 
 if [[ -n "${drift}" ]]; then
-  echo "::error::binding dependencies drifted from the workspace Cargo.lock"
+  echo "::error::binding dependencies drifted from ${ROOT_LOCK}"
   echo "${drift}" | sed 's/^/  /'
   echo
   echo "Re-run with the workspace lock updated, or pin the offending crate."
+  echo "A binding whose dependencies moved ahead of the pinned cdk-ffi needs a"
+  echo "matching cdk-ffi released first."
   exit 1
 fi
 

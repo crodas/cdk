@@ -50,8 +50,8 @@ fi
 
 BINDING_LOCK="${workdir}/downstream/rust/Cargo.lock"
 if [[ ! -f "${BINDING_LOCK}" ]]; then
-  # Go builds cdk-ffi from the monorepo, so the workspace lock hash checked
-  # above is the whole guarantee. Nothing further to compare.
+  # Releases cut before a language started seeding its lockfile have none, and
+  # the workspace lock hash checked above is then the whole guarantee.
   echo "${LANGUAGE}: no downstream lockfile; verified against the workspace lock."
   exit 0
 fi
@@ -62,14 +62,29 @@ lock_versions() {
     | sort -u
 }
 
-lock_versions Cargo.lock > "${workdir}/workspace.txt"
+# Releases that pin an older cdk-ffi than their own tag were seeded from that
+# cdk-ffi's tag, so that is what the binding lock has to be compared against.
+LOCK_REF="$(jq -r '.lockfiles.binding_cargo_lock_source_ref // empty' "${MANIFEST}")"
+REFERENCE_LOCK="${workdir}/reference.lock"
+if [[ -n "${LOCK_REF}" && "${LOCK_REF}" != "${HEAD_COMMIT}" ]]; then
+  if ! git fetch --quiet --depth 1 origin "${LOCK_REF}"; then
+    echo "::error::cannot fetch ${LOCK_REF}, the ref the binding lockfile was seeded from"
+    exit 1
+  fi
+  git show FETCH_HEAD:Cargo.lock > "${REFERENCE_LOCK}"
+else
+  LOCK_REF="${CLAIMED_COMMIT}"
+  cp Cargo.lock "${REFERENCE_LOCK}"
+fi
+
+lock_versions "${REFERENCE_LOCK}" > "${workdir}/workspace.txt"
 lock_versions "${BINDING_LOCK}" > "${workdir}/binding.txt"
 
 drift="$(comm -13 "${workdir}/workspace.txt" "${workdir}/binding.txt")"
 if [[ -n "${drift}" ]]; then
-  echo "::error::${REPO}@${TAG} used dependencies the workspace lock did not pin"
+  echo "::error::${REPO}@${TAG} used dependencies the lockfile at ${LOCK_REF} did not pin"
   echo "${drift}" | sed 's/^/  /'
   exit 1
 fi
 
-echo "${LANGUAGE} ${TAG}: all $(wc -l < "${workdir}/binding.txt" | tr -d ' ') dependencies match the workspace lock at ${CLAIMED_COMMIT}."
+echo "${LANGUAGE} ${TAG}: all $(wc -l < "${workdir}/binding.txt" | tr -d ' ') dependencies match the lockfile at ${LOCK_REF}."
