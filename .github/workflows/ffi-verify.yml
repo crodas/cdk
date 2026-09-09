@@ -32,9 +32,11 @@ jobs:
     steps:
       - name: Skip unselected languages
         id: gate
+        env:
+          SELECTED: ${{ inputs.language || 'all' }}
+          LANGUAGE: ${{ matrix.language }}
         run: |
-          SELECTED="${{ inputs.language || 'all' }}"
-          if [[ "${SELECTED}" == "all" || "${SELECTED}" == "${{ matrix.language }}" ]]; then
+          if [[ "${SELECTED}" == "all" || "${SELECTED}" == "${LANGUAGE}" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -47,19 +49,28 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The tag and the manifest come from a downstream repo and are the very
+      # things being audited, so they reach bash only as environment values and
+      # only after matching a strict shape.
       - name: Resolve the release and its source commit
         if: steps.gate.outputs.run == 'true'
         id: resolve
         env:
           GH_TOKEN: ${{ secrets.FFI_DEPLOY_KEY }}
+          LANGUAGE: ${{ matrix.language }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          REPO="cashubtc/cdk-${{ matrix.language }}"
-          TAG="${{ inputs.release_tag }}"
+          REPO="cashubtc/cdk-${LANGUAGE}"
+          TAG="${RELEASE_TAG}"
           if [[ -z "${TAG}" ]]; then
             TAG=$(gh release view --repo "${REPO}" --json tagName -q .tagName)
             echo "No tag given; using latest release ${TAG} of ${REPO}"
           fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if [[ ! "${TAG}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::${REPO} release tag is not a version tag; refusing to use it"
+            exit 1
+          fi
+          printf 'tag=%s\n' "${TAG}" >> "$GITHUB_OUTPUT"
 
           MANIFEST=$(gh release download "${TAG}" --repo "${REPO}" \
             --pattern build-manifest.json --output - 2>/dev/null || true)
@@ -69,15 +80,25 @@ jobs:
             exit 0
           fi
           echo "${MANIFEST}" | jq .
-          echo "commit=$(echo "${MANIFEST}" | jq -r .source.commit)" >> "$GITHUB_OUTPUT"
+          COMMIT=$(echo "${MANIFEST}" | jq -r .source.commit)
+          if [[ ! "${COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
+            && [[ ! "${COMMIT}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::${REPO}@${TAG} records a source commit that is neither a full sha nor a version tag"
+            exit 1
+          fi
+          printf 'commit=%s\n' "${COMMIT}" >> "$GITHUB_OUTPUT"
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
       - name: Check out the source commit the release claims
         if: steps.gate.outputs.run == 'true' && steps.resolve.outputs.skip == 'false'
-        run: git checkout --detach "${{ steps.resolve.outputs.commit }}"
+        env:
+          COMMIT: ${{ steps.resolve.outputs.commit }}
+        run: git checkout --detach "${COMMIT}"
 
       - name: Verify the dependency graph
         if: steps.gate.outputs.run == 'true' && steps.resolve.outputs.skip == 'false'
+        env:
+          LANGUAGE: ${{ matrix.language }}
+          TAG: ${{ steps.resolve.outputs.tag }}
         run: |
-          ./.github/scripts/verify-binding-lockfile.sh \
-            "${{ matrix.language }}" "${{ steps.resolve.outputs.tag }}"
+          ./.github/scripts/verify-binding-lockfile.sh "${LANGUAGE}" "${TAG}"

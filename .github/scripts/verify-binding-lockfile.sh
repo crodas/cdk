@@ -22,8 +22,8 @@ REPO="cashubtc/cdk-${LANGUAGE}"
 workdir="$(mktemp -d)"
 trap 'rm -rf "${workdir}"' EXIT
 
-git clone --quiet --depth 1 --branch "${TAG}" \
-  "https://github.com/${REPO}.git" "${workdir}/downstream"
+git clone --quiet --depth 1 --branch="${TAG}" \
+  -- "https://github.com/${REPO}.git" "${workdir}/downstream"
 
 MANIFEST="${workdir}/downstream/build-manifest.json"
 if [[ ! -f "${MANIFEST}" ]]; then
