@@ -23,6 +23,18 @@ sha256() {
   fi
 }
 
+# The manifest is the provenance record, so it pins an immutable commit even
+# though CDK_REF is a tag name for stable releases.
+SOURCE_COMMIT="$(git rev-parse --verify --quiet "${CDK_REF:-HEAD}^{commit}")" || {
+  echo "cannot resolve source ref '${CDK_REF:-HEAD}' to a commit" >&2
+  exit 1
+}
+HEAD_COMMIT="$(git rev-parse HEAD)"
+if [[ "${SOURCE_COMMIT}" != "${HEAD_COMMIT}" ]]; then
+  echo "source ref '${CDK_REF:-HEAD}' is ${SOURCE_COMMIT}, but this checkout is ${HEAD_COMMIT}" >&2
+  exit 1
+fi
+
 RUST_CHANNEL="$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)"
 WORKSPACE_LOCK="$(sha256 Cargo.lock)"
 BINDING_LOCK="$(sha256 "${DOWNSTREAM_DIR}/rust/Cargo.lock")"
@@ -34,7 +46,7 @@ jq -n \
   --arg language "${LANGUAGE}" \
   --arg tag "${TAG:-}" \
   --arg repo "${GITHUB_REPOSITORY:-cashubtc/cdk}" \
-  --arg commit "${CDK_REF:-}" \
+  --arg commit "${SOURCE_COMMIT}" \
   --arg rust_channel "${RUST_CHANNEL}" \
   --arg workspace_lock "${WORKSPACE_LOCK}" \
   --arg binding_lock "${BINDING_LOCK}" \

@@ -81,9 +81,8 @@ jobs:
           fi
           echo "${MANIFEST}" | jq .
           COMMIT=$(echo "${MANIFEST}" | jq -r .source.commit)
-          if [[ ! "${COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
-            && [[ ! "${COMMIT}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::${REPO}@${TAG} records a source commit that is neither a full sha nor a version tag"
+          if [[ ! "${COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::${REPO}@${TAG} records a source commit that is not a full sha"
             exit 1
           fi
           printf 'commit=%s\n' "${COMMIT}" >> "$GITHUB_OUTPUT"
