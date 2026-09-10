@@ -213,6 +213,14 @@ or git source), and fails the release if the binding resolved anything the
 workspace lock did not pin. The resulting `rust/Cargo.lock` is committed to the
 release branch, and every build leg then compiles with `--locked`.
 
+`.github/scripts/compare-lockfiles.sh` holds the comparison both the release and
+the after-the-fact check run. Third-party crates must match the workspace lock
+on source and checksum as well as version, so a substituted registry or a
+rewritten checksum counts as drift. Crates from this workspace are matched on
+version, since they legitimately move from a path dependency to a registry or
+git one downstream, but their downstream source must be crates.io or this
+repository at the release's source commit.
+
 Go is the exception: `go-publish.yml` builds `cdk-ffi` straight from the
 monorepo checkout, so it uses the workspace lock directly.
 
@@ -240,8 +248,9 @@ just ffi-verify-lock-all v0.18.0
 ```
 
 This confirms the release's dependency graph is a subset of what the workspace
-lock pinned at the commit it claims to come from. The
-`FFI - Verify Published Bindings` workflow runs the same check weekly.
+lock pinned at the commit it claims to come from, matching source and checksum
+and not only version. The `FFI - Verify Published Bindings` workflow runs the
+same check weekly.
 
 Release artifacts also carry GitHub build provenance attestations, which bind a
 downstream asset to a workflow run and commit in this repository:

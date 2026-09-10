@@ -10,6 +10,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 BINDING_DIR="${1:?usage: seed-binding-lockfile.sh <downstream-rust-dir> [root-manifest]}"
 ROOT_MANIFEST="${2:-Cargo.toml}"
 ROOT_LOCK="$(dirname "${ROOT_MANIFEST}")/Cargo.lock"
@@ -27,31 +29,10 @@ cp "${ROOT_LOCK}" "${BINDING_DIR}/Cargo.lock"
 # re-resolve to latest and would silently undo the seeding.
 ( cd "${BINDING_DIR}" && cargo fetch )
 
-# The wrapper crate and cdk-ffi itself are excluded: their source and version
-# legitimately differ downstream, especially for nightlies.
-resolved_versions() {
-  cargo metadata --format-version 1 --locked --manifest-path "$1" \
-    | jq -r '.packages[] | select(.name | startswith("cdk-ffi") | not)
-             | "\(.name) \(.version)"' \
-    | sort -u
-}
+cargo metadata --format-version 1 --locked --manifest-path "${BINDING_DIR}/Cargo.toml" > /dev/null
 
-workdir="$(mktemp -d)"
-trap 'rm -rf "${workdir}"' EXIT
-
-resolved_versions "${ROOT_MANIFEST}" > "${workdir}/workspace.txt"
-resolved_versions "${BINDING_DIR}/Cargo.toml" > "${workdir}/binding.txt"
-
-# Anything the binding resolves that the workspace did not pin is drift. The
-# reverse is expected: the workspace has members the binding never pulls in.
-drift="$(comm -13 "${workdir}/workspace.txt" "${workdir}/binding.txt")"
-
-if [[ -n "${drift}" ]]; then
-  echo "::error::binding dependencies drifted from the workspace Cargo.lock"
-  echo "${drift}" | sed 's/^/  /'
+if ! "${SCRIPT_DIR}/compare-lockfiles.sh" "${ROOT_LOCK}" "${BINDING_DIR}" "$(git rev-parse HEAD)"; then
   echo
   echo "Re-run with the workspace lock updated, or pin the offending crate."
   exit 1
 fi
-
-echo "Dependency graph matches the workspace lockfile ($(wc -l < "${workdir}/binding.txt") packages)."

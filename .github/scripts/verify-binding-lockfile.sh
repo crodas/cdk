@@ -10,6 +10,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 LANGUAGE="${1:?usage: verify-binding-lockfile.sh <language> <release-tag>}"
 TAG="${2:?missing release tag}"
 
@@ -56,20 +58,5 @@ if [[ ! -f "${BINDING_LOCK}" ]]; then
   exit 0
 fi
 
-lock_versions() {
-  awk -F'"' '/^name = /{n=$2} /^version = /{print n" "$2}' "$1" \
-    | grep -v '^cdk-ffi' \
-    | sort -u
-}
-
-lock_versions Cargo.lock > "${workdir}/workspace.txt"
-lock_versions "${BINDING_LOCK}" > "${workdir}/binding.txt"
-
-drift="$(comm -13 "${workdir}/workspace.txt" "${workdir}/binding.txt")"
-if [[ -n "${drift}" ]]; then
-  echo "::error::${REPO}@${TAG} used dependencies the workspace lock did not pin"
-  echo "${drift}" | sed 's/^/  /'
-  exit 1
-fi
-
-echo "${LANGUAGE} ${TAG}: all $(wc -l < "${workdir}/binding.txt" | tr -d ' ') dependencies match the workspace lock at ${CLAIMED_COMMIT}."
+"${SCRIPT_DIR}/compare-lockfiles.sh" Cargo.lock "${workdir}/downstream/rust" "${CLAIMED_COMMIT}"
+echo "${LANGUAGE} ${TAG}: verified against the workspace lock at ${CLAIMED_COMMIT}."
