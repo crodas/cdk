@@ -253,9 +253,8 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
     ) -> Result<Option<Vec<KeySetInfo>>, database::Error> {
         let read_txn = self.db.begin_read().map_err(Into::<Error>::into)?;
         let mints = MintIndex::read(&read_txn.open_table(MINTS_TABLE).map_err(Error::from)?)?;
-        let mint_id = match mints.id(&mint_url) {
-            Ok(mint_id) => mint_id,
-            Err(_) => return Ok(None),
+        let Some(mint_id) = mints.live_id(&mint_url) else {
+            return Ok(None);
         };
         let table = read_txn
             .open_multimap_table(MINT_KEYSETS_TABLE)
@@ -633,6 +632,9 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
 
     #[instrument(skip(self))]
     /// Records reference the mint by its id, so only the mint itself moves.
+    /// Rejects a `new_mint_url` another mint already holds, removed or not.
+    /// The URL is data here rather than the table key, so nothing enforces that
+    /// on its own; the SQL backends get it from `UNIQUE (mint_url)`.
     async fn update_mint_url(
         &self,
         old_mint_url: MintUrl,
@@ -643,15 +645,25 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
         {
             let mut table = write_txn.open_table(MINTS_TABLE).map_err(Error::from)?;
 
-            let stored = table
-                .iter()
-                .map_err(Error::from)?
-                .flatten()
-                .find_map(|(id, mint)| {
-                    let mint: StoredMint = serde_json::from_str(mint.value()).ok()?;
-                    (mint.mint_url == old_mint_url && mint.removed_at.is_none())
-                        .then(|| (id.value(), mint))
-                });
+            let mut stored = None;
+            let mut taken = false;
+
+            for entry in table.iter().map_err(Error::from)? {
+                let (id, mint) = entry.map_err(Error::from)?;
+                let Ok(mint) = serde_json::from_str::<StoredMint>(mint.value()) else {
+                    continue;
+                };
+
+                if mint.mint_url == old_mint_url && mint.removed_at.is_none() {
+                    stored = Some((id.value(), mint));
+                } else if mint.mint_url == new_mint_url {
+                    taken = true;
+                }
+            }
+
+            if taken {
+                return Err(Error::Duplicate.into());
+            }
 
             let Some((mint_id, mut mint)) = stored else {
                 return Err(database::Error::UnknownMint(old_mint_url.to_string()));

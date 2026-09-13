@@ -493,6 +493,71 @@ where
     ));
 }
 
+/// Test that a mint cannot be moved onto a URL another mint already holds.
+///
+/// The SQL backends get this from `UNIQUE (mint_url)`; redb has to check for
+/// itself, because there the URL is a field rather than the table key.
+pub async fn update_mint_url_to_taken_url<DB>(db: DB)
+where
+    DB: Database<crate::database::Error>,
+{
+    let first = test_mint_url();
+    let second = test_mint_url_2();
+
+    db.add_mint(first.clone(), None).await.unwrap();
+    db.add_mint(second.clone(), None).await.unwrap();
+
+    assert!(db
+        .update_mint_url(first.clone(), second.clone())
+        .await
+        .is_err());
+
+    let mints = db.get_mints().await.unwrap();
+    assert!(mints.contains_key(&first));
+    assert!(mints.contains_key(&second));
+
+    db.update_mint_url(first.clone(), first.clone())
+        .await
+        .unwrap();
+
+    db.remove_mint(second.clone()).await.unwrap();
+    assert!(db.update_mint_url(first, second).await.is_err());
+}
+
+/// Test that a write for a removed mint's URL lands on that mint
+///
+/// Rather than creating a second mint at the same URL. The row stays hidden
+/// until the mint is added back, which is when the write becomes visible.
+pub async fn write_for_removed_mint_reuses_it<DB>(db: DB)
+where
+    DB: Database<crate::database::Error>,
+{
+    let mint_url = test_mint_url();
+    let keyset_id = test_keyset_id();
+
+    db.add_mint(mint_url.clone(), None).await.unwrap();
+    db.remove_mint(mint_url.clone()).await.unwrap();
+
+    let proof_info = test_proof_info(keyset_id, 100, mint_url.clone());
+    db.update_proofs(vec![proof_info.clone()], vec![])
+        .await
+        .unwrap();
+
+    assert!(!db.get_mints().await.unwrap().contains_key(&mint_url));
+    assert_eq!(db.get_balance(None, None, None).await.unwrap(), 0);
+
+    db.add_mint(mint_url.clone(), None).await.unwrap();
+
+    let mints = db.get_mints().await.unwrap();
+    assert_eq!(mints.len(), 1);
+    assert!(mints.contains_key(&mint_url));
+    assert_eq!(db.get_balance(None, None, None).await.unwrap(), 100);
+    assert_eq!(
+        db.get_proofs_by_ys(vec![proof_info.y]).await.unwrap().len(),
+        1
+    );
+}
+
 /// Test that writing a row for an unknown mint stores the mint
 ///
 /// A wallet is built synchronously and can be handed an empty database, so it
@@ -2057,6 +2122,8 @@ macro_rules! wallet_db_test {
             remove_mint,
             update_mint_url,
             update_mint_url_unknown_mint,
+            update_mint_url_to_taken_url,
+            write_for_removed_mint_reuses_it,
             write_creates_unknown_mint,
             write_for_known_mint_keeps_info,
             add_and_get_keysets,

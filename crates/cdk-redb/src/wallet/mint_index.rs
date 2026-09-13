@@ -4,7 +4,7 @@
 //! (NUT-06 `urls`) is still the same mint. Records therefore carry an internal
 //! mint id in place of `mint_url`, and moving a mint rewrites only its own row.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use cdk_common::mint_url::MintUrl;
@@ -39,13 +39,15 @@ pub struct StoredMint {
 
 /// Both directions of the mint id to URL mapping, read once per operation.
 ///
-/// Removed mints are in neither direction, so their records cannot be decoded
-/// and never reach a caller.
+/// The two directions deliberately disagree about a removed mint. It still owns
+/// its URL, so `by_url` keeps it and a write lands on its row instead of
+/// creating a second mint at the same URL, matching the `ON CONFLICT(mint_url)`
+/// upsert the SQL backends do. It is not in `by_id`, so its records have no URL
+/// to decode to and never reach a caller.
 #[derive(Debug, Default)]
 pub struct MintIndex {
     by_id: HashMap<u64, MintUrl>,
     by_url: HashMap<MintUrl, u64>,
-    removed: HashSet<u64>,
 }
 
 impl MintIndex {
@@ -60,12 +62,10 @@ impl MintIndex {
             let (id, mint) = entry?;
             let mint: StoredMint = serde_json::from_str(mint.value())?;
 
-            if mint.removed_at.is_some() {
-                index.removed.insert(id.value());
-                continue;
+            if mint.removed_at.is_none() {
+                index.by_id.insert(id.value(), mint.mint_url.clone());
             }
 
-            index.by_id.insert(id.value(), mint.mint_url.clone());
             index.by_url.insert(mint.mint_url, id.value());
         }
 
@@ -111,12 +111,22 @@ impl MintIndex {
         Ok(index)
     }
 
-    /// Id a mint is stored under.
+    /// Id a record for this URL belongs to, a removed mint included.
+    ///
+    /// This is the write-side lookup. Reads want [`MintIndex::live_id`].
     pub fn id(&self, mint_url: &MintUrl) -> Result<u64, Error> {
         self.by_url
             .get(mint_url)
             .copied()
             .ok_or_else(|| Error::UnknownMint(mint_url.to_string()))
+    }
+
+    /// Id of the mint reachable at this URL, or `None` once it is removed.
+    pub fn live_id(&self, mint_url: &MintUrl) -> Option<u64> {
+        self.by_url
+            .get(mint_url)
+            .copied()
+            .filter(|mint_id| self.by_id.contains_key(mint_id))
     }
 
     /// URL a mint is currently reached at.
@@ -163,7 +173,7 @@ impl MintIndex {
             .and_then(Value::as_u64);
 
         match mint_id {
-            Some(mint_id) if self.removed.contains(&mint_id) => Ok(None),
+            Some(mint_id) if !self.by_id.contains_key(&mint_id) => Ok(None),
             _ => self.decode(stored).map(Some),
         }
     }
