@@ -100,7 +100,8 @@ const REBUILD_MINT_AND_KEYSET: &[&str] = &[
     icon_url TEXT,
     mint_time INTEGER,
     urls TEXT,
-    tos_url TEXT
+    tos_url TEXT,
+    removed_at INTEGER
 )",
     "INSERT INTO mint_new (
     mint_url, name, pubkey, version, description, description_long,
@@ -142,6 +143,7 @@ const REKEY_MINT: &[&str] = &[
     "ALTER TABLE mint ADD PRIMARY KEY (id)",
     "ALTER TABLE mint ALTER COLUMN mint_url SET NOT NULL",
     "ALTER TABLE mint ADD CONSTRAINT mint_mint_url_key UNIQUE (mint_url)",
+    "ALTER TABLE mint ADD COLUMN removed_at BIGINT",
 ];
 
 /// Rows could reference a mint URL that was never added to `mint`. Give those a mint row so nothing

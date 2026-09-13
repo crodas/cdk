@@ -20,7 +20,7 @@ use cdk_common::nuts::{
 };
 use cdk_common::redact::url_for_logs;
 use cdk_common::secret::Secret;
-use cdk_common::util::hex;
+use cdk_common::util::{hex, unix_time};
 use cdk_common::wallet::{
     self, MintQuote, Transaction, TransactionDirection, TransactionId, TransactionStatus,
     WalletSaga,
@@ -1029,7 +1029,7 @@ impl KVStoreDatabase for SupabaseWalletDatabase {
 impl Database<DatabaseError> for SupabaseWalletDatabase {
     async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, DatabaseError> {
         let path = format!(
-            "rest/v1/mint?mint_url=eq.{}",
+            "rest/v1/mint?removed_at=is.null&mint_url=eq.{}",
             url_encode(&mint_url.to_string())
         );
         let (status, text) = self.get_request(&path).await?;
@@ -1054,7 +1054,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
     }
 
     async fn get_mints(&self) -> Result<HashMap<MintUrl, Option<MintInfo>>, DatabaseError> {
-        let (status, text) = self.get_request("rest/v1/mint").await?;
+        let (status, text) = self.get_request("rest/v1/mint?removed_at=is.null").await?;
 
         if !status.is_success() {
             return Err(DatabaseError::Internal(format!(
@@ -1081,7 +1081,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         mint_url: MintUrl,
     ) -> Result<Option<Vec<KeySetInfo>>, DatabaseError> {
         let path = format!(
-            "rest/v1/keyset?select=*,mint!inner(mint_id)&mint.mint_url=eq.{}",
+            "rest/v1/keyset?select=*,mint!inner(mint_id)&mint.removed_at=is.null&mint.mint_url=eq.{}",
             url_encode(&mint_url.to_string())
         );
         let (status, text) = self.get_request(&path).await?;
@@ -1189,7 +1189,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
     ) -> Result<Option<wallet::MeltQuote>, DatabaseError> {
         let path = format!(
             "rest/v1/melt_quote?{}&id=eq.{}",
-            SELECT_WITH_MINT,
+            SELECT_WITH_OPTIONAL_MINT,
             url_encode(quote_id)
         );
         let (status, text) = self.get_request(&path).await?;
@@ -1202,7 +1202,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         }
 
         if let Some(items) = Self::parse_response::<MeltQuoteTable>(&text)? {
-            if let Some(item) = items.into_iter().next() {
+            if let Some(item) = items.into_iter().find(|item| !item.mint_removed()) {
                 return Ok(Some(item.try_into()?));
             }
         }
@@ -1210,7 +1210,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
     }
 
     async fn get_melt_quotes(&self) -> Result<Vec<wallet::MeltQuote>, DatabaseError> {
-        let path = format!("rest/v1/melt_quote?{}", SELECT_WITH_MINT);
+        let path = format!("rest/v1/melt_quote?{}", SELECT_WITH_OPTIONAL_MINT);
         let (status, text) = self.get_request(&path).await?;
 
         if !status.is_success() {
@@ -1221,7 +1221,11 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         }
 
         if let Some(quotes) = Self::parse_response::<MeltQuoteTable>(&text)? {
-            quotes.into_iter().map(|q| q.try_into()).collect()
+            quotes
+                .into_iter()
+                .filter(|q| !q.mint_removed())
+                .map(|q| q.try_into())
+                .collect()
         } else {
             Ok(Vec::new())
         }
@@ -1254,7 +1258,9 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         spending_conditions: Option<Vec<SpendingConditions>>,
     ) -> Result<Vec<ProofInfo>, DatabaseError> {
         let mut query = match &mint_url {
-            Some(_) => String::from("rest/v1/proof?select=*,mint!inner(mint_url)"),
+            Some(_) => {
+                String::from("rest/v1/proof?select=*,mint!inner(mint_url)&mint.removed_at=is.null")
+            }
             None => format!("rest/v1/proof?{}", SELECT_WITH_MINT),
         };
         if let Some(url) = mint_url {
@@ -1385,7 +1391,9 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         unit: Option<CurrencyUnit>,
     ) -> Result<Vec<Transaction>, DatabaseError> {
         let mut query = match &mint_url {
-            Some(_) => String::from("rest/v1/transactions?select=*,mint!inner(mint_url)"),
+            Some(_) => String::from(
+                "rest/v1/transactions?select=*,mint!inner(mint_url)&mint.removed_at=is.null",
+            ),
             None => format!("rest/v1/transactions?{}", SELECT_WITH_MINT),
         };
         if let Some(url) = mint_url {
@@ -1578,7 +1586,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         new_mint_url: MintUrl,
     ) -> Result<(), DatabaseError> {
         let path = format!(
-            "rest/v1/mint?mint_url=eq.{}",
+            "rest/v1/mint?removed_at=is.null&mint_url=eq.{}",
             url_encode(&old_mint_url.to_string())
         );
         let update_body = serde_json::json!({ "mint_url": new_mint_url.to_string() });
@@ -1717,12 +1725,32 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         Ok(())
     }
 
+    /// Stamps `removed_at` and clears the mint info, keeping the row, its id and
+    /// its URL. Deleting the row would cascade into every proof, destroying
+    /// spendable e-cash; hiding it leaves the secrets recoverable, and
+    /// [`Database::add_mint`] on the same URL brings the mint back whole.
     async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), DatabaseError> {
         let path = format!(
-            "rest/v1/mint?mint_url=eq.{}",
+            "rest/v1/mint?removed_at=is.null&mint_url=eq.{}",
             url_encode(&mint_url.to_string())
         );
-        let (status, response_text) = self.delete_request(&path).await?;
+        let update_body = serde_json::json!({
+            "removed_at": unix_time() as i64,
+            "name": null,
+            "pubkey": null,
+            "version": null,
+            "description": null,
+            "description_long": null,
+            "contact": null,
+            "nuts": null,
+            "icon_url": null,
+            "urls": null,
+            "motd": null,
+            "mint_time": null,
+            "tos_url": null,
+        });
+
+        let (status, response_text) = self.patch_request(&path, &update_body).await?;
 
         if !status.is_success() {
             return Err(DatabaseError::Internal(format!(
@@ -2570,10 +2598,21 @@ struct MintIdRow {
 #[derive(Debug, Serialize, Deserialize)]
 struct MintRef {
     mint_url: String,
+    /// Only selected where the embed is a left join and the filter therefore has
+    /// to happen after the response is parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    removed_at: Option<i64>,
 }
 
-/// PostgREST select that pulls a row's mint URL in with the row.
-const SELECT_WITH_MINT: &str = "select=*,mint(mint_url)";
+/// PostgREST select that pulls a row's mint URL in with the row, dropping rows
+/// whose mint was removed. A removed mint keeps its row, so the inner join alone
+/// would still match it.
+const SELECT_WITH_MINT: &str = "select=*,mint!inner(mint_url)&mint.removed_at=is.null";
+
+/// As above, for a row whose mint reference is optional: `!inner` would also
+/// drop a row that never had a mint, so the removed one is filtered out of the
+/// parsed response instead.
+const SELECT_WITH_OPTIONAL_MINT: &str = "select=*,mint(mint_url,removed_at)";
 
 /// Upsert body that carries only the URL, so a write that has to create the
 /// mint does not blank the metadata of one that already exists.
@@ -2589,6 +2628,11 @@ struct MintTable {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mint_id: Option<i64>,
     mint_url: String,
+    /// Always serialized as `null` unless read back, so the upsert in
+    /// [`Database::add_mint`] brings a removed mint back with everything it
+    /// still holds.
+    #[serde(default)]
+    removed_at: Option<i64>,
     name: Option<String>,
     pubkey: Option<String>,
     version: Option<String>,
@@ -2611,6 +2655,7 @@ impl MintTable {
         Ok(Self {
             mint_id: None,
             mint_url: mint_url.to_string(),
+            removed_at: None,
             name: info.name,
             pubkey: info.pubkey.map(|p| hex::encode(p.to_bytes())),
             version: info
@@ -2891,6 +2936,18 @@ struct MeltQuoteTable {
     /// Extra fields from other applications (captured during deserialization, ignored during serialization)
     #[serde(default, skip_serializing, flatten)]
     _extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl MeltQuoteTable {
+    /// Whether the quote belongs to a mint that was removed.
+    ///
+    /// The embed is a left join, because a melt quote may have no mint at all,
+    /// so this cannot be a PostgREST filter.
+    fn mint_removed(&self) -> bool {
+        self.mint
+            .as_ref()
+            .is_some_and(|mint| mint.removed_at.is_some())
+    }
 }
 
 impl TryInto<wallet::MeltQuote> for MeltQuoteTable {
@@ -3436,6 +3493,7 @@ mod tests {
 
         table.mint = Some(MintRef {
             mint_url: mint_url.to_string(),
+            removed_at: None,
         });
 
         let round_trip: MintQuote = table.try_into().expect("table row converts to quote");

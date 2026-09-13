@@ -4,7 +4,7 @@
 //! (NUT-06 `urls`) is still the same mint. Records therefore carry an internal
 //! mint id in place of `mint_url`, and moving a mint rewrites only its own row.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use cdk_common::mint_url::MintUrl;
@@ -29,13 +29,23 @@ pub struct StoredMint {
     pub mint_url: MintUrl,
     /// Last known mint info
     pub mint_info: Option<MintInfo>,
+    /// When the mint was removed, if it was.
+    ///
+    /// A removed mint keeps its row and its id so the records attached to it
+    /// survive; it is hidden from every read instead.
+    #[serde(default)]
+    pub removed_at: Option<u64>,
 }
 
 /// Both directions of the mint id to URL mapping, read once per operation.
+///
+/// Removed mints are in neither direction, so their records cannot be decoded
+/// and never reach a caller.
 #[derive(Debug, Default)]
 pub struct MintIndex {
     by_id: HashMap<u64, MintUrl>,
     by_url: HashMap<MintUrl, u64>,
+    removed: HashSet<u64>,
 }
 
 impl MintIndex {
@@ -49,6 +59,11 @@ impl MintIndex {
         for entry in table.iter()? {
             let (id, mint) = entry?;
             let mint: StoredMint = serde_json::from_str(mint.value())?;
+
+            if mint.removed_at.is_some() {
+                index.removed.insert(id.value());
+                continue;
+            }
 
             index.by_id.insert(id.value(), mint.mint_url.clone());
             index.by_url.insert(mint.mint_url, id.value());
@@ -64,6 +79,10 @@ impl MintIndex {
     /// store creates the mint on demand instead. A created mint holds only its
     /// URL, leaving metadata to [`super::WalletRedbDatabase::add_mint`], which
     /// would otherwise overwrite what is already there.
+    ///
+    /// New ids come from the table, not from `by_id`, which holds no removed
+    /// mint: handing a removed mint's id out again would give the new mint every
+    /// record the removed one left behind.
     pub fn read_ensuring<'a, I>(txn: &WriteTransaction, mint_urls: I) -> Result<Self, Error>
     where
         I: IntoIterator<Item = &'a MintUrl>,
@@ -76,10 +95,11 @@ impl MintIndex {
                 continue;
             }
 
-            let mint_id = index.by_id.keys().copied().max().unwrap_or_default() + 1;
+            let mint_id = table.last()?.map(|(id, _)| id.value()).unwrap_or_default() + 1;
             let mint = StoredMint {
                 mint_url: mint_url.clone(),
                 mint_info: None,
+                removed_at: None,
             };
 
             table.insert(mint_id, serde_json::to_string(&mint)?.as_str())?;
@@ -125,6 +145,27 @@ impl MintIndex {
         object.insert(MINT_ID.to_owned(), mint_id);
 
         Ok(serde_json::to_string(&value)?)
+    }
+
+    /// Deserialize a record, or `None` if the mint it belongs to was removed.
+    ///
+    /// Separate from [`MintIndex::decode`] so a removed mint stays
+    /// distinguishable from a record that cannot be read at all.
+    pub fn decode_visible<T>(&self, stored: &str) -> Result<Option<T>, Error>
+    where
+        T: DeserializeOwned,
+    {
+        let value: Value = serde_json::from_str(stored)?;
+        let mint_id = value
+            .as_object()
+            .ok_or(Error::MintReference)?
+            .get(MINT_ID)
+            .and_then(Value::as_u64);
+
+        match mint_id {
+            Some(mint_id) if self.removed.contains(&mint_id) => Ok(None),
+            _ => self.decode(stored).map(Some),
+        }
     }
 
     /// Deserialize a record, putting the mint's current URL back in place of

@@ -19,10 +19,7 @@ use cdk_common::{
     database, Amount, CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintInfo, PaymentMethod,
     PublicKey, SpendingConditions, State,
 };
-use redb::{
-    Database, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable, ReadableTable,
-    TableDefinition,
-};
+use redb::{Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::instrument;
 
 use crate::error::Error;
@@ -214,117 +211,6 @@ impl WalletRedbDatabase {
     }
 }
 
-/// Delete every row attached to a mint.
-///
-/// Rows reference the mint by an id that disappears with the mint row, so they
-/// go with it rather than being left dangling.
-fn remove_mint_rows(
-    write_txn: &redb::WriteTransaction,
-    mints: &MintIndex,
-    mint_id: u64,
-) -> Result<(), Error> {
-    let mint_url = mints.url(mint_id)?.clone();
-
-    {
-        let mut keyset_ids = write_txn.open_multimap_table(MINT_KEYSETS_TABLE)?;
-        let mut keysets = write_txn.open_table(KEYSETS_TABLE)?;
-
-        let ids = keyset_ids
-            .get(mint_id)?
-            .flatten()
-            .map(|id| id.value().to_vec())
-            .collect::<Vec<_>>();
-
-        for id in ids {
-            keysets.remove(id.as_slice())?;
-        }
-
-        keyset_ids.remove_all(mint_id)?;
-    }
-
-    {
-        let mut proofs = write_txn.open_table(PROOFS_TABLE)?;
-        let ys = proofs
-            .iter()?
-            .flatten()
-            .filter_map(|(y, proof)| {
-                let proof: ProofInfo = mints.decode(proof.value()).ok()?;
-                (proof.mint_url == mint_url).then(|| y.value().to_vec())
-            })
-            .collect::<Vec<_>>();
-
-        for y in ys {
-            proofs.remove(y.as_slice())?;
-        }
-    }
-
-    {
-        let mut quotes = write_txn.open_table(MINT_QUOTES_TABLE)?;
-        let ids = quotes
-            .iter()?
-            .flatten()
-            .filter_map(|(id, quote)| {
-                let quote: MintQuote = mints.decode(quote.value()).ok()?;
-                (quote.mint_url == mint_url).then(|| id.value().to_owned())
-            })
-            .collect::<Vec<_>>();
-
-        for id in ids {
-            quotes.remove(id.as_str())?;
-        }
-    }
-
-    {
-        let mut quotes = write_txn.open_table(MELT_QUOTES_TABLE)?;
-        let ids = quotes
-            .iter()?
-            .flatten()
-            .filter_map(|(id, quote)| {
-                let quote: wallet::MeltQuote = mints.decode(quote.value()).ok()?;
-                (quote.mint_url.as_ref() == Some(&mint_url)).then(|| id.value().to_owned())
-            })
-            .collect::<Vec<_>>();
-
-        for id in ids {
-            quotes.remove(id.as_str())?;
-        }
-    }
-
-    {
-        let mut transactions = write_txn.open_table(TRANSACTIONS_TABLE)?;
-        let ids = transactions
-            .iter()?
-            .flatten()
-            .filter_map(|(id, transaction)| {
-                let transaction: Transaction = mints.decode(transaction.value()).ok()?;
-                (transaction.mint_url == mint_url).then(|| id.value().to_vec())
-            })
-            .collect::<Vec<_>>();
-
-        for id in ids {
-            transactions.remove(id.as_slice())?;
-        }
-    }
-
-    {
-        let mut sagas = write_txn.open_table(SAGAS_TABLE)?;
-        let ids = sagas
-            .iter()?
-            .flatten()
-            .filter_map(|(id, saga)| {
-                let saga: wallet::WalletSaga = mints.decode(saga.value()).ok()?;
-                (saga.mint_url == mint_url).then(|| id.value().to_owned())
-            })
-            .collect::<Vec<_>>();
-
-        for id in ids {
-            sagas.remove(id.as_str())?;
-        }
-    }
-
-    Ok(())
-}
-
 #[async_trait]
 impl WalletDatabase<database::Error> for WalletRedbDatabase {
     #[instrument(skip(self))]
@@ -336,7 +222,7 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             let (_, mint) = entry.map_err(Error::from)?;
             let mint: StoredMint = serde_json::from_str(mint.value()).map_err(Error::from)?;
 
-            if mint.mint_url == mint_url {
+            if mint.mint_url == mint_url && mint.removed_at.is_none() {
                 return Ok(mint.mint_info);
             }
         }
@@ -353,6 +239,7 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             .map_err(Error::from)?
             .flatten()
             .filter_map(|(_, mint)| serde_json::from_str::<StoredMint>(mint.value()).ok())
+            .filter(|mint| mint.removed_at.is_none())
             .map(|mint| (mint.mint_url, mint.mint_info))
             .collect();
 
@@ -433,7 +320,7 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             .map_err(Error::from)?;
 
         if let Some(quote) = table.get(quote_id).map_err(Error::from)? {
-            return Ok(Some(mints.decode(quote.value())?));
+            return Ok(mints.decode_visible(quote.value())?);
         }
 
         Ok(None)
@@ -486,7 +373,7 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             .map_err(Error::from)?;
 
         if let Some(quote) = table.get(quote_id).map_err(Error::from)? {
-            return Ok(Some(mints.decode(quote.value())?));
+            return Ok(mints.decode_visible(quote.value())?);
         }
 
         Ok(None)
@@ -574,7 +461,9 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
 
         for y in ys {
             if let Some(proof) = table.get(y.to_bytes().as_slice()).map_err(Error::from)? {
-                proofs.push(mints.decode::<ProofInfo>(proof.value())?);
+                if let Some(proof) = mints.decode_visible::<ProofInfo>(proof.value())? {
+                    proofs.push(proof);
+                }
             }
         }
 
@@ -605,7 +494,7 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             .map_err(Error::from)?;
 
         if let Some(transaction) = table.get(transaction_id.as_slice()).map_err(Error::from)? {
-            return Ok(Some(mints.decode(transaction.value())?));
+            return Ok(mints.decode_visible(transaction.value())?);
         }
 
         Ok(None)
@@ -760,7 +649,8 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
                 .flatten()
                 .find_map(|(id, mint)| {
                     let mint: StoredMint = serde_json::from_str(mint.value()).ok()?;
-                    (mint.mint_url == old_mint_url).then(|| (id.value(), mint))
+                    (mint.mint_url == old_mint_url && mint.removed_at.is_none())
+                        .then(|| (id.value(), mint))
                 });
 
             let Some((mint_id, mut mint)) = stored else {
@@ -868,6 +758,7 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             let mint = StoredMint {
                 mint_url,
                 mint_info,
+                removed_at: None,
             };
 
             table
@@ -882,21 +773,40 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
     }
 
     #[instrument(skip(self))]
-    /// Rows reference the mint id, which disappears with the mint, so they go
-    /// with it rather than being left dangling.
+    /// Stamps `removed_at` and clears the mint info, keeping the row, its id and
+    /// its URL. Dropping the row would take every proof with it, destroying
+    /// spendable e-cash; hiding it leaves the secrets recoverable, and
+    /// [`WalletDatabase::add_mint`] on the same URL brings the mint back whole.
     async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), database::Error> {
         let write_txn = self.db.begin_write().map_err(Error::from)?;
         {
-            let mints = MintIndex::read(&write_txn.open_table(MINTS_TABLE).map_err(Error::from)?)?;
-            let mint_id = match mints.id(&mint_url) {
-                Ok(mint_id) => mint_id,
-                Err(_) => return Ok(()),
+            let mut table = write_txn.open_table(MINTS_TABLE).map_err(Error::from)?;
+
+            let stored = table
+                .iter()
+                .map_err(Error::from)?
+                .flatten()
+                .find_map(|(id, mint)| {
+                    let mint: StoredMint = serde_json::from_str(mint.value()).ok()?;
+                    (mint.mint_url == mint_url && mint.removed_at.is_none()).then_some(id.value())
+                });
+
+            let Some(mint_id) = stored else {
+                return Ok(());
             };
 
-            remove_mint_rows(&write_txn, &mints, mint_id)?;
+            let mint = StoredMint {
+                mint_url,
+                mint_info: None,
+                removed_at: Some(unix_time()),
+            };
 
-            let mut table = write_txn.open_table(MINTS_TABLE).map_err(Error::from)?;
-            table.remove(mint_id).map_err(Error::from)?;
+            table
+                .insert(
+                    mint_id,
+                    serde_json::to_string(&mint).map_err(Error::from)?.as_str(),
+                )
+                .map_err(Error::from)?;
         }
         write_txn.commit().map_err(Error::from)?;
         Ok(())
@@ -1194,8 +1104,9 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
         let result = table
             .get(id_str.as_str())
             .map_err(Error::from)?
-            .map(|saga| mints.decode(saga.value()))
-            .transpose()?;
+            .map(|saga| mints.decode_visible(saga.value()))
+            .transpose()?
+            .flatten();
 
         Ok(result)
     }

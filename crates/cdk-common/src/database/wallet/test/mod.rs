@@ -223,21 +223,171 @@ where
     assert!(mints.contains_key(&mint_url));
 }
 
-/// Test removing a mint
+/// Test that removing a mint hides it without destroying what it holds.
+///
+/// Three phases: everything attached to the mint disappears from every read;
+/// a mint created afterwards gets an identity of its own rather than inheriting
+/// the removed mint's records (it is created by a write, which is the path that
+/// allocates a mint id); and adding the URL back returns the mint with all of
+/// it, which is what proves nothing was deleted.
 pub async fn remove_mint<DB>(db: DB)
 where
     DB: Database<crate::database::Error>,
 {
     let mint_url = test_mint_url();
+    let keyset_id = test_keyset_id();
 
-    // Add mint
     db.add_mint(mint_url.clone(), None).await.unwrap();
+    db.add_mint_keysets(
+        mint_url.clone(),
+        vec![test_keyset_info(keyset_id, &mint_url)],
+    )
+    .await
+    .unwrap();
 
-    // Remove mint
+    let proof_info = test_proof_info(keyset_id, 100, mint_url.clone());
+    db.update_proofs(vec![proof_info.clone()], vec![])
+        .await
+        .unwrap();
+
+    let mint_quote = test_mint_quote(mint_url.clone());
+    db.add_mint_quote(mint_quote.clone()).await.unwrap();
+
+    let mut melt_quote = test_melt_quote();
+    melt_quote.mint_url = Some(mint_url.clone());
+    db.add_melt_quote(melt_quote.clone()).await.unwrap();
+
+    let transaction = test_transaction(mint_url.clone(), TransactionDirection::Incoming);
+    let transaction_id = transaction.id();
+    db.add_transaction(transaction).await.unwrap();
+
+    let saga = test_wallet_saga(mint_url.clone());
+    db.add_saga(saga.clone()).await.unwrap();
+
     db.remove_mint(mint_url.clone()).await.unwrap();
 
-    let result = db.get_mint(mint_url).await.unwrap();
-    assert!(result.is_none());
+    assert!(db.get_mint(mint_url.clone()).await.unwrap().is_none());
+    assert!(!db.get_mints().await.unwrap().contains_key(&mint_url));
+    assert!(db
+        .get_mint_keysets(mint_url.clone())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .get_proofs(None, None, None, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .get_proofs(Some(mint_url.clone()), None, None, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .get_proofs_by_ys(vec![proof_info.y])
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(db.get_balance(None, None, None).await.unwrap(), 0);
+    assert_eq!(
+        db.get_balance(Some(mint_url.clone()), None, None)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(db.get_mint_quote(&mint_quote.id).await.unwrap().is_none());
+    assert!(db.get_mint_quotes().await.unwrap().is_empty());
+    assert!(db.get_melt_quote(&melt_quote.id).await.unwrap().is_none());
+    assert!(db.get_melt_quotes().await.unwrap().is_empty());
+    assert!(db.get_transaction(transaction_id).await.unwrap().is_none());
+    assert!(db
+        .list_transactions(None, None, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db.get_saga(&saga.id).await.unwrap().is_none());
+    assert!(db.get_incomplete_sagas().await.unwrap().is_empty());
+
+    db.remove_mint(mint_url.clone()).await.unwrap();
+
+    let other_url = test_mint_url_2();
+    db.add_mint_keysets(
+        other_url.clone(),
+        vec![test_keyset_info(test_keyset_id_2(), &other_url)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.get_mint_keysets(other_url.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(db
+        .get_proofs(Some(other_url.clone()), None, None, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.get_balance(Some(other_url.clone()), None, None)
+            .await
+            .unwrap(),
+        0
+    );
+
+    db.add_mint(mint_url.clone(), None).await.unwrap();
+
+    assert!(db.get_mints().await.unwrap().contains_key(&mint_url));
+    assert_eq!(
+        db.get_mint_keysets(mint_url.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.get_proofs(Some(mint_url.clone()), None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.get_proofs_by_ys(vec![proof_info.y]).await.unwrap().len(),
+        1
+    );
+    assert_eq!(db.get_balance(None, None, None).await.unwrap(), 100);
+    assert_eq!(
+        db.get_mint_quote(&mint_quote.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .mint_url,
+        mint_url
+    );
+    assert_eq!(
+        db.get_melt_quote(&melt_quote.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .mint_url,
+        Some(mint_url.clone())
+    );
+    assert_eq!(
+        db.get_transaction(transaction_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .mint_url,
+        mint_url
+    );
+    assert_eq!(
+        db.get_saga(&saga.id).await.unwrap().unwrap().mint_url,
+        mint_url
+    );
 }
 
 /// Test that moving a mint carries every row attached to it

@@ -219,6 +219,7 @@ where
               FROM
                   melt_quote q
               LEFT JOIN mint m ON m.id = q.mint_id
+              WHERE q.mint_id IS NULL OR m.removed_at IS NULL
               "#,
         )?
         .fetch_all(&*conn)
@@ -252,7 +253,7 @@ where
                 tos_url
             FROM
                 mint
-            WHERE mint_url = :mint_url
+            WHERE mint_url = :mint_url AND removed_at IS NULL
             "#,
         )?
         .bind("mint_url", mint_url.to_string())
@@ -287,6 +288,7 @@ where
                     mint_url
                 FROM
                     mint
+                WHERE removed_at IS NULL
                 "#,
         )?
         .fetch_all(&*conn)
@@ -324,7 +326,7 @@ where
                 final_expiry
             FROM
                 keyset
-            WHERE mint_id = (SELECT id FROM mint WHERE mint_url = :mint_url)
+            WHERE mint_id = (SELECT id FROM mint WHERE mint_url = :mint_url AND removed_at IS NULL)
             "#,
         )?
         .bind("mint_url", mint_url.to_string())
@@ -397,7 +399,7 @@ where
                 q.version
             FROM
                 mint_quote q
-            JOIN mint m ON m.id = q.mint_id
+            JOIN mint m ON m.id = q.mint_id AND m.removed_at IS NULL
             WHERE
                 q.id = :id
             "#,
@@ -436,7 +438,7 @@ where
                 q.version
             FROM
                 mint_quote q
-            JOIN mint m ON m.id = q.mint_id
+            JOIN mint m ON m.id = q.mint_id AND m.removed_at IS NULL
             "#,
         )?
         .fetch_all(&*conn)
@@ -473,7 +475,7 @@ where
                 q.version
             FROM
                 mint_quote q
-            JOIN mint m ON m.id = q.mint_id
+            JOIN mint m ON m.id = q.mint_id AND m.removed_at IS NULL
             WHERE
                 q.amount_issued = 0
                 OR
@@ -519,6 +521,7 @@ where
             LEFT JOIN mint m ON m.id = q.mint_id
             WHERE
                 q.id=:id
+                AND (q.mint_id IS NULL OR m.removed_at IS NULL)
             "#,
         )?
         .bind("id", quote_id.to_owned())
@@ -587,7 +590,7 @@ where
                 p.derivation_index,
                 p.p2pk_e
             FROM proof p
-            JOIN mint m ON m.id = p.mint_id
+            JOIN mint m ON m.id = p.mint_id AND m.removed_at IS NULL
             "#,
         )?
         .fetch_all(&*conn)
@@ -636,7 +639,7 @@ where
                 p.derivation_index,
                 p.p2pk_e
             FROM proof p
-            JOIN mint m ON m.id = p.mint_id
+            JOIN mint m ON m.id = p.mint_id AND m.removed_at IS NULL
             WHERE p.y IN (:ys)
         "#,
         )?
@@ -648,6 +651,8 @@ where
         .collect::<Vec<_>>())
     }
 
+    /// The only proof read with no join to `mint`, so it carries the
+    /// removed-mint exclusion itself.
     async fn get_balance(
         &self,
         mint_url: Option<MintUrl>,
@@ -661,7 +666,7 @@ where
             .map_err(|e| Error::Database(Box::new(e)))?;
 
         let mut query_str = "SELECT COALESCE(SUM(amount), 0) as total FROM proof".to_string();
-        let mut where_clauses = Vec::new();
+        let mut where_clauses = vec!["mint_id IN (SELECT id FROM mint WHERE removed_at IS NULL)"];
         let states = states
             .unwrap_or_default()
             .into_iter()
@@ -669,7 +674,9 @@ where
             .collect::<Vec<_>>();
 
         if mint_url.is_some() {
-            where_clauses.push("mint_id = (SELECT id FROM mint WHERE mint_url = :mint_url)");
+            where_clauses.push(
+                "mint_id = (SELECT id FROM mint WHERE mint_url = :mint_url AND removed_at IS NULL)",
+            );
         }
         if unit.is_some() {
             where_clauses.push("unit = :unit");
@@ -746,7 +753,7 @@ where
                 t.status
             FROM
                 transactions t
-            JOIN mint m ON m.id = t.mint_id
+            JOIN mint m ON m.id = t.mint_id AND m.removed_at IS NULL
             WHERE
                 t.id = :id
             "#,
@@ -791,7 +798,7 @@ where
                 t.status
             FROM
                 transactions t
-            JOIN mint m ON m.id = t.mint_id
+            JOIN mint m ON m.id = t.mint_id AND m.removed_at IS NULL
             "#,
         )?
         .fetch_all(&*conn)
@@ -1040,7 +1047,7 @@ where
             r#"
             UPDATE mint
             SET mint_url = :new_mint_url
-            WHERE mint_url = :old_mint_url
+            WHERE mint_url = :old_mint_url AND removed_at IS NULL
             "#,
         )?
         .bind("new_mint_url", new_mint_url.to_string())
@@ -1207,7 +1214,8 @@ where
        urls = excluded.urls,
        motd = excluded.motd,
        mint_time = excluded.mint_time,
-       tos_url = excluded.tos_url
+       tos_url = excluded.tos_url,
+       removed_at = NULL
    ;
            "#,
         )?
@@ -1231,8 +1239,10 @@ where
     }
 
     #[instrument(skip(self))]
-    /// Rows reference the mint id, which disappears with the mint row, so they
-    /// go with it rather than being left dangling.
+    /// Stamps `removed_at` and clears the mint info, keeping the row, its id and
+    /// its URL. Deleting the row would take every proof with it, destroying
+    /// spendable e-cash; hiding it leaves the secrets recoverable, and
+    /// [`WalletDatabase::add_mint`] on the same URL brings the mint back whole.
     async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), database::Error> {
         let conn = self
             .pool
@@ -1240,33 +1250,29 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        let tx = ConnectionWithTransaction::new(conn).await?;
-
-        for table in [
-            "keyset",
-            "proof",
-            "mint_quote",
-            "melt_quote",
-            "transactions",
-            "wallet_sagas",
-        ] {
-            query(&format!(
-                r#"
-                DELETE FROM {table}
-                WHERE mint_id IN (SELECT id FROM mint WHERE mint_url = :mint_url)
-            "#
-            ))?
-            .bind("mint_url", mint_url.to_string())
-            .execute(&tx)
-            .await?;
-        }
-
-        query(r#"DELETE FROM mint WHERE mint_url=:mint_url"#)?
-            .bind("mint_url", mint_url.to_string())
-            .execute(&tx)
-            .await?;
-
-        tx.commit().await?;
+        query(
+            r#"
+            UPDATE mint
+            SET removed_at = :removed_at,
+                name = NULL,
+                pubkey = NULL,
+                version = NULL,
+                description = NULL,
+                description_long = NULL,
+                contact = NULL,
+                nuts = NULL,
+                icon_url = NULL,
+                urls = NULL,
+                motd = NULL,
+                mint_time = NULL,
+                tos_url = NULL
+            WHERE mint_url = :mint_url AND removed_at IS NULL
+            "#,
+        )?
+        .bind("removed_at", unix_time() as i64)
+        .bind("mint_url", mint_url.to_string())
+        .execute(&*conn)
+        .await?;
 
         Ok(())
     }
@@ -1607,7 +1613,7 @@ where
             r#"
             SELECT s.id, s.kind, s.state, s.amount, m.mint_url, s.unit, s.quote_id, s.created_at, s.updated_at, s.data, s.version
             FROM wallet_sagas s
-            JOIN mint m ON m.id = s.mint_id
+            JOIN mint m ON m.id = s.mint_id AND m.removed_at IS NULL
             WHERE s.id = :id
             "#,
         )?
@@ -1705,7 +1711,7 @@ where
             r#"
             SELECT s.id, s.kind, s.state, s.amount, m.mint_url, s.unit, s.quote_id, s.created_at, s.updated_at, s.data, s.version
             FROM wallet_sagas s
-            JOIN mint m ON m.id = s.mint_id
+            JOIN mint m ON m.id = s.mint_id AND m.removed_at IS NULL
             ORDER BY s.created_at ASC
             "#,
         )?
@@ -1813,7 +1819,7 @@ where
                 p.derivation_index,
                 p.p2pk_e
             FROM proof p
-            JOIN mint m ON m.id = p.mint_id
+            JOIN mint m ON m.id = p.mint_id AND m.removed_at IS NULL
             WHERE p.used_by_operation = :operation_id
             "#,
         )?

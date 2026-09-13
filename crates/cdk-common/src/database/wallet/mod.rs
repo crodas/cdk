@@ -134,7 +134,17 @@ where
     /// Add Mint to storage
     async fn add_mint(&self, mint_url: MintUrl, mint_info: Option<MintInfo>) -> Result<(), Err>;
 
-    /// Remove Mint from storage
+    /// Stop tracking a mint, without destroying anything it holds.
+    ///
+    /// The mint and every row attached to it (keysets, proofs, mint and melt
+    /// quotes, transactions, sagas) disappear from every read, including
+    /// [`Database::get_mints`] and the balance. Nothing is deleted: proofs an
+    /// unspent token depends on would be gone for good, so they are hidden
+    /// rather than removed, and [`Database::add_mint`] with the same URL brings
+    /// the mint back with all of it.
+    ///
+    /// Removing an unknown or already-removed mint is not an error. Keysets and
+    /// keys stay reachable by keyset id, which carries no mint identity.
     async fn remove_mint(&self, mint_url: MintUrl) -> Result<(), Err>;
 
     /// Add mint keyset to storage

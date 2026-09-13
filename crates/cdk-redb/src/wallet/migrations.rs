@@ -337,6 +337,7 @@ pub(crate) fn migrate_06_to_07(db: Arc<Database>) -> Result<u32, Error> {
             let mint = StoredMint {
                 mint_url,
                 mint_info,
+                removed_at: None,
             };
 
             mints_by_id.insert(mint_id, serde_json::to_string(&mint)?.as_str())?;
