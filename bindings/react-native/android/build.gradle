@@ -1,4 +1,4 @@
-// The Rust libraries under src/main/jniLibs come from `cargo xtask android`.
+// The Rust libraries under src/main/jniLibs come from `just nitro-android`.
 buildscript {
   repositories {
     google()

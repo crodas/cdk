@@ -1,7 +1,7 @@
 # Builds the generated C++ and links the Rust static library.
 #
-# Both halves are generated: `cargo xtask bindings` writes cpp/generated, and
-# `cargo xtask android` writes the Rust libraries into src/main/jniLibs.
+# Both halves are generated: `just nitro-bindings` writes cpp/generated, and
+# `just nitro-android` writes the Rust libraries into src/main/jniLibs.
 cmake_minimum_required(VERSION 3.22.1)
 project(CashuNative)
 

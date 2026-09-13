@@ -71,21 +71,29 @@ under `test/` is for testing and benchmarking only.
 | `test/*.mjs` | no | Node tests, parity checks and the benchmark |
 | `nitro.json`, `package.json`, `CashuNative.podspec`, `android/**` | no | Packaging |
 
+Nothing marked generated is in git. `just nitro-bindings` writes all of it from
+the UniFFI metadata, so a fresh clone has only the hand-written files above
+until that runs. The npm tarball does carry it, put there by
+`just nitro-package`.
+
 ## Commands
 
 All of them run from the repository root.
 
 ```sh
-cargo xtask bindings      # regenerate everything from the Rust exports
-cargo xtask check-nitro   # type-check the adapters against Nitro and JSI
-cargo xtask test-nitro    # C++ harness over the generated bridge
-cargo xtask test-node     # Node harness plus cashu-ts parity
-cargo xtask bench-nitro   # cashu-ts versus Rust
-cargo xtask ios           # Rust for iOS, assembled into an XCFramework
-cargo xtask android       # Rust for every Android ABI, into jniLibs
+just nitro-bindings    # regenerate everything from the Rust exports
+just nitro-check       # type-check the adapters against Nitro and JSI
+just test-nitro        # C++ harness over the generated bridge
+just test-nitro-node   # Node harness plus cashu-ts parity
+just bench-nitro       # cashu-ts versus Rust
+just nitro-ios         # Rust for iOS, assembled into an XCFramework
+just nitro-android     # Rust for every Android ABI, into jniLibs
+just nitro-package     # everything the tarball needs, then npm pack
 ```
 
-`just nitro-bindings`, `just test-nitro` and friends wrap the same commands.
+The dev dependencies install themselves on first use: any recipe that needs
+nitrogen runs `npm ci` when `node_modules` is missing, so the lockfile decides
+which nitrogen version generates the output.
 
 Adding a native operation is one Rust function and one command:
 
@@ -97,7 +105,7 @@ pub fn another_expensive_operation(input: Vec<u8>) -> Vec<u8> {
 ```
 
 ```sh
-cargo xtask bindings
+just nitro-bindings
 ```
 
 The TypeScript spec, the nitrogen spec, the C++ bridge, the Nitro adapter and
@@ -105,14 +113,24 @@ the Node harness all pick it up.
 
 ## Requirements
 
-- Node 22 or newer for nitrogen. `cargo xtask bindings` finds an nvm install if
-  the default `node` is older.
+- Node 22 or newer for nitrogen. `just nitro-bindings` finds an nvm install if
+  the default `node` is older. Under `nix develop .#bindings` it comes from the
+  shell.
 - `cargo install cargo-ndk` and `ANDROID_NDK_HOME` for the Android build.
 - Xcode for the iOS build.
 
+## Publishing
+
+`just nitro-package` runs the whole pipeline, builds the TypeScript and packs
+the tarball, which is the only way the package gets the generated sources and
+the native libraries git does not carry. A `prepack` guard refuses to build a
+tarball that is missing any of them, so `npm publish` from a clean tree fails
+rather than shipping an empty package. It needs macOS, Xcode, `cargo-ndk` and
+`ANDROID_NDK_HOME`.
+
 ## Performance
 
-`cargo xtask bench-nitro` measures cashu-ts against the same operations in Rust,
+`just bench-nitro` measures cashu-ts against the same operations in Rust,
 in one Node process, on a release build. On an M-series laptop:
 
 | workload | outputs | cashu-ts | Rust | speedup |
@@ -140,11 +158,11 @@ included, is the same work the Nitro path does.
 
 ## Testing
 
-`cargo xtask test-nitro` runs the C++ harness: primitives, 64-bit amounts,
+`just test-nitro` runs the C++ harness: primitives, 64-bit amounts,
 byte buffers up to 4 MiB, records, optionals, enums, structured errors, and an
 object lifecycle check that creates and destroys twenty thousand handles.
 
-`cargo xtask test-node` adds the cashu-ts parity suite, which asserts that the
+`just test-nitro-node` adds the cashu-ts parity suite, which asserts that the
 native path produces byte-identical blinded messages, secrets and blinding
 factors for the same seed and counter. A wallet that swaps implementations must
 be able to restore what the other one created.

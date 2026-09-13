@@ -6,7 +6,6 @@ members = [
     "bindings/kotlin/rust",
     "bindings/go/rust",
     "tools/uniffi-bindgen-nitro",
-    "xtask",
 ]
 exclude = [
     "fuzz",

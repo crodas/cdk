@@ -11,7 +11,6 @@ build
 *.redb
 *.sqlite*
 config.toml
-!.cargo/config.toml
 .pre-commit-config.yaml
 result
 result-*
@@ -25,6 +24,14 @@ static-bin/
 logs/
 tor-data
 node_modules/
+bindings/react-native/src/generated/
+bindings/react-native/cpp/generated/
+bindings/react-native/nitrogen/generated/
+bindings/react-native/test/generated/
+bindings/react-native/ios/generated/
+bindings/react-native/android/src/main/jniLibs/
+bindings/react-native/lib/
+bindings/react-native/*.tgz
 
 # Mutation testing artifacts
 mutants.out/

@@ -1717,6 +1717,10 @@
                   pkgs.openssl
                   pkgs.jdk17
                   pkgs.go
+                  # nitrogen needs Node 22 or newer; cmake builds the Nitro C++
+                  # test harness.
+                  pkgs.nodejs_22
+                  pkgs.cmake
                 ];
                 nativeBuildInputs = [
                   pkgs.pkg-config

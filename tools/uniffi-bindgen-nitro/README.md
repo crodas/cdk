@@ -100,7 +100,7 @@ uniffi-bindgen-nitro hybrids \
   --cpp-out bindings/react-native/cpp/generated
 ```
 
-`cargo xtask bindings` runs all three steps.
+`just nitro-bindings` runs all three steps.
 
 ## Configuration
 
