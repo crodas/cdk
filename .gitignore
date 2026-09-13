@@ -11,6 +11,7 @@ build
 *.redb
 *.sqlite*
 config.toml
+!.cargo/config.toml
 .pre-commit-config.yaml
 result
 result-*
@@ -23,6 +24,7 @@ static-bin/
 **/.env
 logs/
 tor-data
+node_modules/
 
 # Mutation testing artifacts
 mutants.out/

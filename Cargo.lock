@@ -1176,6 +1176,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cashu-ffi"
+version = "0.18.0"
+dependencies = [
+ "bip39",
+ "bitcoin",
+ "cashu",
+ "thiserror 2.0.20",
+ "uniffi",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9170,6 +9181,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "uniffi-bindgen-nitro"
+version = "0.18.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "clap",
+ "thiserror 2.0.20",
+ "toml 0.9.12+spec-1.1.0",
+ "uniffi_bindgen",
+]
+
+[[package]]
 name = "uniffi-dart"
 version = "0.1.0+v0.30.0"
 source = "git+https://github.com/Uniffi-Dart/uniffi-dart?rev=e3ed67f780257a5a7fae23231e13d84f931208e0#e3ed67f780257a5a7fae23231e13d84f931208e0"
@@ -10136,6 +10159,14 @@ checksum = "9fb2bc2a902d992cd5f471ee3ab0ffd6603047a4207384562755b9d6de977518"
 dependencies = [
  "ring 0.16.20",
  "untrusted 0.7.1",
+]
+
+[[package]]
+name = "xtask"
+version = "0.18.0"
+dependencies = [
+ "clap",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

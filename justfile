@@ -1278,3 +1278,31 @@ test-swift:
   else
     DYLD_LIBRARY_PATH="$LIB_DIR" swift test
   fi
+
+# regenerate the React Native Nitro bindings from the UniFFI metadata
+nitro-bindings:
+  cargo xtask bindings
+
+# type-check the generated Nitro adapters against the Nitro and JSI headers
+nitro-check:
+  cargo xtask check-nitro
+
+# run the C++ harness over the generated UniFFI bridge
+test-nitro:
+  cargo xtask test-nitro
+
+# run the Node harness and cashu-ts parity tests
+test-nitro-node:
+  cargo xtask test-node
+
+# compare cashu-ts against the Rust implementation
+bench-nitro:
+  cargo xtask bench-nitro
+
+# build the Rust library for iOS and assemble the XCFramework
+nitro-ios:
+  cargo xtask ios
+
+# build the Rust library for every Android ABI
+nitro-android:
+  cargo xtask android
