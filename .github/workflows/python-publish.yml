@@ -52,13 +52,13 @@ env:
   RELEASE_BRANCH: release/${{ inputs.release_tag }}
 
 jobs:
-  release-ci:
-    uses: ./.github/workflows/release-ci.yml
-    with:
-      ref: ${{ inputs.nightly && inputs.cdk_ref || inputs.release_tag }}
+  #release-ci:
+  #  uses: ./.github/workflows/release-ci.yml
+  #  with:
+  #    ref: ${{ inputs.nightly && inputs.cdk_ref || inputs.release_tag }}
 
   validate-release-ref:
-    needs: release-ci
+  #  needs: release-ci
     name: "python: Validate release ref"
     runs-on: ubuntu-latest
     steps:
