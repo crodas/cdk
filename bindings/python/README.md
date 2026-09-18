@@ -23,19 +23,19 @@ there is no compiler and no build step at install time.
 
 ## Installation
 
-Wheels are published as assets on each
-[cdk-python release](https://github.com/cashubtc/cdk-python/releases). Download
-the wheel for your platform and install it:
+```bash
+pip install cdk-python
+```
+
+Wheels are also attached to each
+[cdk-python release](https://github.com/cashubtc/cdk-python/releases) if you
+would rather download one directly:
 
 ```bash
 pip install cdk_python-<version>-py3-none-<platform>.whl
 ```
 
-Each release also carries a `checksums.sha256` asset to verify the download
-against.
-
-> The `cdk-python` package on PyPI is not updated by this pipeline and currently
-> lags several releases behind. Use the release assets for a current build.
+Each release carries a `checksums.sha256` asset to verify the download against.
 
 ### Requirements
 
@@ -286,10 +286,18 @@ just binding-python
 just test-python
 ```
 
-`just binding-python` builds `cdk-ffi` in release mode, runs `uniffi-bindgen` to
-generate `src/cdk/cdk_ffi.py`, copies the native library in beside it, and
-produces a wheel in `dist/`. The generated module and the library are build
-artifacts and are not checked in.
+`just binding-python` builds the `cdk-ffi-python` crate in release mode, runs
+`uniffi-bindgen` to generate `src/cdk/cdk_ffi.py`, copies the native library in
+beside it, and produces a wheel in `dist/`. The generated module and the library
+are build artifacts and are not checked in.
+
+This repository can also build on its own, which is what the release workflow
+does: `rust/` is a standalone crate depending on a published `cdk-ffi`, so
+`cargo build --release` inside it needs no monorepo checkout.
+
+Note that `uniffi` names the library it loads after the `cdk-ffi` namespace
+rather than the wrapper crate, so the built `libcdk_ffi_python.*` is renamed to
+`libcdk_ffi.*` when it is copied into the package.
 
 ### Running Tests
 
@@ -328,10 +336,12 @@ See [`examples/README.md`](examples/README.md) for what each one covers.
 
 ```
 cdk-python/
+├── rust/                   # cdk-ffi-python, the crate this repo compiles
 ├── src/
 │   └── cdk/                # Python package (generated bindings + native lib)
 ├── tests/                  # pytest suite
 ├── examples/               # Runnable examples
+├── .github/workflows/      # Build and publish pipeline
 ├── pyproject.toml          # Package configuration
 ├── setup.py                # Platform wheel configuration
 ├── pytest.ini              # Test configuration

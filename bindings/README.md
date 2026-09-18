@@ -44,11 +44,6 @@ The core `cdk-ffi` crate (`crates/cdk-ffi/`) contains:
 Each language wrapper crate is a single `pub use cdk_ffi::*;` re-export with its
 own `uniffi.toml` controlling language-specific code generation.
 
-Python is the exception: it has no wrapper crate. The wrapper crates exist to
-host a language-specific `uniffi-bindgen` binary and per-language config, and
-UniFFI ships the Python backend in-tree, so `crates/cdk-ffi` already generates
-Python directly and `crates/cdk-ffi/uniffi.toml` already carries the config.
-
 ## Current targets
 
 | Language | Directory | Status | Build | Test |
@@ -80,15 +75,19 @@ Python directly and `crates/cdk-ffi/uniffi.toml` already carries the config.
 ### Python
 
 - **Distribution name:** `cdk-python` (import package: `cdk`)
-- **Rust crate:** none; generated straight from `crates/cdk-ffi`
+- **Rust crate:** `cdk-ffi-python`
 - **Binding generator:** uniffi-bindgen's in-tree Python backend
-- The generated `cdk_ffi.py` and the native library are packaged together
-  inside the `cdk` package, so the library resolves next to the module at import
-- Wheels are built for Linux (`manylinux_2_28`, x86_64 and aarch64), macOS
-  (arm64 and x86_64) and Windows (x86_64), and are published as release assets
-  on `cashubtc/cdk-python` rather than to PyPI
+- Unlike the other bindings, cdk-python **builds and publishes itself**. The
+  monorepo syncs `bindings/python/` (including `rust/` and the workflow under
+  `.github/`) and then fires a `repository_dispatch` of type `cdk-release`;
+  cdk-python compiles the wheels and uploads them
+- Wheels go to PyPI and are attached to the cdk-python GitHub release, for
+  Linux (`manylinux_2_28`, x86_64 and aarch64), macOS (arm64 and x86_64) and
+  Windows (x86_64)
 - Every wheel is tagged `py3-none-<platform>`: the library is loaded with
   `ctypes`, not linked against the CPython ABI
+- uniffi names the loaded library after the `cdk-ffi` namespace, so the built
+  `libcdk_ffi_python.*` is renamed to `libcdk_ffi.*` inside the package
 - Tests are pytest-based under `bindings/python/tests/`, porting the same
   scenarios the Dart, Go, Kotlin and Swift suites run; the mint-backed ones are
   skipped unless `CDK_PYTHON_TEST_MINT_URL` is set

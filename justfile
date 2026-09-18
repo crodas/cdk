@@ -1324,15 +1324,29 @@ binding-python:
   #!/usr/bin/env bash
   set -euo pipefail
   cd "{{justfile_directory()}}"
-  just ffi-generate python
 
   LIB_EXT=$(just _ffi-lib-ext)
   PKG_DIR=bindings/python/src/cdk
 
+  # Build through the wrapper crate, the same way cdk-python builds it from
+  # crates.io, so the local wheel and the published one come from one path.
+  echo "🐍 Building cdk-ffi-python..."
+  cargo build --release -p cdk-ffi-python
+
+  echo "🐍 Generating Python bindings..."
+  rm -rf target/bindings/python && mkdir -p target/bindings/python
+  cargo run --release -p cdk-ffi-python --bin uniffi-bindgen-python generate \
+    --library "target/release/libcdk_ffi_python.$LIB_EXT" \
+    --language python \
+    --out-dir target/bindings/python \
+    --no-format
+
   rm -rf bindings/python/dist bindings/python/build
-  find "$PKG_DIR" -name '*.so' -o -name '*.dylib' -o -name '*.dll' | xargs -r rm -f
+  find "$PKG_DIR" -type f \( -name '*.so' -o -name '*.dylib' -o -name '*.dll' \) -delete
   cp target/bindings/python/cdk_ffi.py "$PKG_DIR/"
-  cp "target/release/libcdk_ffi.$LIB_EXT" "$PKG_DIR/"
+  # uniffi names the loaded library after the cdk-ffi namespace, not the
+  # wrapper crate, so the built cdylib is renamed to match.
+  cp "target/release/libcdk_ffi_python.$LIB_EXT" "$PKG_DIR/libcdk_ffi.$LIB_EXT"
 
   # The nix ffi shell already provides build and wheel. Elsewhere the system
   # interpreter is often externally managed and refuses installs, so fall back

@@ -11,3 +11,8 @@ src/cdk/cdk_ffi.py
 src/cdk/*.so
 src/cdk/*.dylib
 src/cdk/*.dll
+rust/target/
+
+# Produced by the release workflow inside the repo checkout
+generated-bindings/
+wheelhouse/
