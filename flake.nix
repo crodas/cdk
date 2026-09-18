@@ -1729,10 +1729,19 @@
                     echo "FFI development shell"
                     echo "  just ffi-test        - Run Python FFI tests"
                     echo "  just ffi-dev-python  - Launch Python REPL with CDK FFI"
+                    echo "  just binding-python  - Build the Python wheel"
+                    echo "  just test-python     - Test the Python wheel"
                   '';
                 buildInputs = baseBuildInputs ++ [
                   stable_toolchain
-                  pkgs.python311
+                  (pkgs.python311.withPackages (ps: [
+                    ps.build
+                    ps.pip
+                    ps.pytest
+                    ps.pytest-asyncio
+                    ps.setuptools
+                    ps.wheel
+                  ]))
                 ];
                 inherit nativeBuildInputs;
               }

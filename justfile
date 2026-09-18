@@ -1318,3 +1318,110 @@ test-swift:
   else
     DYLD_LIBRARY_PATH="$LIB_DIR" swift test
   fi
+
+# Build the Python wheel for the host platform
+binding-python:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  just ffi-generate python
+
+  LIB_EXT=$(just _ffi-lib-ext)
+  PKG_DIR=bindings/python/src/cdk
+
+  rm -rf bindings/python/dist bindings/python/build
+  find "$PKG_DIR" -name '*.so' -o -name '*.dylib' -o -name '*.dll' | xargs -r rm -f
+  cp target/bindings/python/cdk_ffi.py "$PKG_DIR/"
+  cp "target/release/libcdk_ffi.$LIB_EXT" "$PKG_DIR/"
+
+  # The nix ffi shell already provides build and wheel. Elsewhere the system
+  # interpreter is often externally managed and refuses installs, so fall back
+  # to a throwaway venv rather than touching it.
+  if python3 -c 'import build, wheel' 2>/dev/null; then
+    PY=python3
+  else
+    BUILD_VENV="$PWD/target/python-build-venv"
+    if [[ ! -x "$BUILD_VENV/bin/python" ]]; then
+      python3 -m venv "$BUILD_VENV"
+      "$BUILD_VENV/bin/pip" install --quiet --upgrade pip "build" "wheel>=0.42"
+    fi
+    PY="$BUILD_VENV/bin/python"
+  fi
+
+  echo "🐍 Building wheel..."
+  cd bindings/python
+  "$PY" -m build --wheel
+
+  # The library is loaded with ctypes rather than linked as a CPython
+  # extension, so retag the wheel for any Python 3 the way CI does.
+  PLATFORM=$("$PY" -c 'import sysconfig; print(sysconfig.get_platform().replace("-", "_").replace(".", "_"))')
+  "$PY" -m wheel tags \
+    --python-tag py3 \
+    --abi-tag none \
+    --platform-tag "$PLATFORM" \
+    --remove \
+    dist/*.whl
+
+  echo "✅ Wheel built:"
+  ls -1 dist/*.whl
+
+# Run Python binding tests against the built wheel
+test-python: binding-python
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}/bindings/python"
+
+  VENV=$(mktemp -d)
+  trap 'rm -rf "$VENV"' EXIT
+  python3 -m venv "$VENV"
+
+  echo "🧪 Installing wheel into a clean venv..."
+  "$VENV/bin/pip" install --quiet --no-index dist/*.whl
+  "$VENV/bin/pip" install --quiet -r requirements-dev.txt
+
+  # Run from the venv so the tests import the installed package, never the
+  # source tree next to them.
+  echo "🧪 Running Python binding tests..."
+  PYTEST_ARGS=("$PWD/tests" "-c" "$PWD/pytest.ini" "--rootdir" "$PWD")
+  (cd "$VENV" && "$VENV/bin/python" -m pytest "${PYTEST_ARGS[@]}" -q)
+
+  just examples-python "$VENV/bin/python"
+  echo "✅ Python binding tests passed!"
+
+# Run the offline Python examples as a smoke check
+examples-python PYTHON="python3":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}/bindings/python"
+
+  if ! "{{PYTHON}}" -c "import cdk" 2>/dev/null; then
+    echo "❌ The cdk package is not installed for {{PYTHON}}."
+    echo "   Run 'just test-python', which builds the wheel and runs these in a venv,"
+    echo "   or install the wheel yourself: pip install bindings/python/dist/*.whl"
+    exit 1
+  fi
+
+  echo "🧪 Running offline Python examples..."
+  for example in examples/wallet_setup.py examples/token_inspect.py examples/transaction_history.py; do
+    echo "  → $example"
+    "{{PYTHON}}" "$example" > /dev/null
+  done
+  echo "✅ Offline examples ran successfully!"
+
+# Trigger Python Bindings release workflow
+ffi-release-python VERSION:
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  echo "🚀 Triggering Python bindings workflow..."
+  echo "   Version: {{VERSION}}"
+  echo "   Tag: v{{VERSION}}"
+
+  gh workflow run "FFI - Python Bindings" \
+    --repo cashubtc/cdk \
+    --ref "v{{VERSION}}" \
+    --field release_tag="v{{VERSION}}" \
+    --field cdk_version="{{VERSION}}" \
+    --field cdk_ref="v{{VERSION}}"
+
+  echo "✅ Python workflow triggered successfully!"

@@ -44,6 +44,11 @@ The core `cdk-ffi` crate (`crates/cdk-ffi/`) contains:
 Each language wrapper crate is a single `pub use cdk_ffi::*;` re-export with its
 own `uniffi.toml` controlling language-specific code generation.
 
+Python is the exception: it has no wrapper crate. The wrapper crates exist to
+host a language-specific `uniffi-bindgen` binary and per-language config, and
+UniFFI ships the Python backend in-tree, so `crates/cdk-ffi` already generates
+Python directly and `crates/cdk-ffi/uniffi.toml` already carries the config.
+
 ## Current targets
 
 | Language | Directory | Status | Build | Test |
@@ -52,6 +57,7 @@ own `uniffi.toml` controlling language-specific code generation.
 | **Swift** | `bindings/swift/` | Active | CI workflow | `just test-swift` |
 | **Kotlin** | `bindings/kotlin/` | Active | `just binding-kotlin` | `just test-kotlin` |
 | **Go** | `bindings/go/` | Active | `just binding-go` | `just test-go` |
+| **Python** | `bindings/python/` | Active | `just binding-python` | `just test-python` |
 
 ### Dart
 
@@ -71,16 +77,32 @@ own `uniffi.toml` controlling language-specific code generation.
 - `Package.swift` is generated during the CI publish workflow
 - Swift sources are generated into `bindings/swift/Sources/Cdk/`
 
+### Python
+
+- **Distribution name:** `cdk-python` (import package: `cdk`)
+- **Rust crate:** none; generated straight from `crates/cdk-ffi`
+- **Binding generator:** uniffi-bindgen's in-tree Python backend
+- The generated `cdk_ffi.py` and the native library are packaged together
+  inside the `cdk` package, so the library resolves next to the module at import
+- Wheels are built for Linux (`manylinux_2_28`, x86_64 and aarch64), macOS
+  (arm64 and x86_64) and Windows (x86_64), and are published as release assets
+  on `cashubtc/cdk-python` rather than to PyPI
+- Every wheel is tagged `py3-none-<platform>`: the library is loaded with
+  `ctypes`, not linked against the CPython ABI
+- Tests are pytest-based under `bindings/python/tests/`, porting the same
+  scenarios the Dart, Go, Kotlin and Swift suites run; the mint-backed ones are
+  skipped unless `CDK_PYTHON_TEST_MINT_URL` is set
+- Runnable examples live in `bindings/python/examples/`; `just examples-python`
+  runs the offline ones
+
 ## Planned targets
 
 | Language | Status | Notes |
 |----------|--------|-------|
-| **Python** | Configured | UniFFI config exists in `crates/cdk-ffi/uniffi.toml` |
 | **React Native** | Planned | — |
 
-Python already has UniFFI configuration in the core FFI crate. Adding a new
-language binding involves creating a `bindings/<lang>/` directory with a thin
-wrapper crate and the appropriate build tooling.
+Adding a new language binding involves creating a `bindings/<lang>/` directory
+with a thin wrapper crate and the appropriate build tooling.
 
 ## Building and testing
 
@@ -101,6 +123,11 @@ just test-kotlin     # Run tests
 # Go
 just binding-go      # Generate bindings
 just test-go         # Run tests
+
+# Python
+just binding-python  # Build the wheel
+just test-python     # Install it into a clean venv and run tests
+just examples-python # Run the offline examples
 ```
 
 ## Releasing
@@ -153,6 +180,7 @@ repository:
 - `cashubtc/cdk-go`
 - `cashubtc/cdk-kotlin`
 - `cashubtc/cdk-swift`
+- `cashubtc/cdk-python`
 
 Nightly tags include the UTC date and short source commit, for example
 `v0.18.0-nightly.20260801.g1a2b3c4`. The release notes link the full CDK source
@@ -180,20 +208,25 @@ just ffi-release-swift 0.17.0
 
 # Go (separate workflow)
 just ffi-release-go 0.17.0
+
+# Python
+just ffi-release-python 0.17.0
 ```
 
 ### Prerequisites
 
 - The version tag (e.g. `v0.17.0`) must exist on the remote
 - The tag must contain the dispatchable FFI workflows and their reusable workflows
-- Dart, Go, Kotlin, and Swift stable release workflows check out `refs/tags/<release_tag>`
-  and reject `cdk_ref` values that differ from `release_tag`
+- Dart, Go, Kotlin, Python, and Swift stable release workflows check out
+  `refs/tags/<release_tag>` and reject `cdk_ref` values that differ from
+  `release_tag`
 - The `FFI_DEPLOY_KEY` GitHub secret must have write access to `cdk-dart`,
-  `cdk-go`, `cdk-kotlin`, and `cdk-swift` repos
+  `cdk-go`, `cdk-kotlin`, `cdk-python`, and `cdk-swift` repos
 - Kotlin publishing requires the `SONATYPE_USERNAME`, `SONATYPE_PASSWORD`,
   `SIGNING_KEY`, and `SIGNING_PASSWORD` GitHub secrets
-- The `CDK_DART_REPO`, `CDK_GO_REPO`, `CDK_KOTLIN_REPO`, and `CDK_SWIFT_REPO` GitHub
-  Actions variables must point to the target binding repositories
+- The `CDK_DART_REPO`, `CDK_GO_REPO`, `CDK_KOTLIN_REPO`, `CDK_PYTHON_REPO`, and
+  `CDK_SWIFT_REPO` GitHub Actions variables must point to the target binding
+  repositories
 - `CACHIX_AUTH_TOKEN` is optional; when present, Kotlin release builds can use
   the authenticated Cachix cache
 - `gh` CLI must be authenticated for just commands
