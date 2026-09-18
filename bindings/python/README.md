@@ -335,8 +335,15 @@ cdk-python/
 ├── pyproject.toml          # Package configuration
 ├── setup.py                # Platform wheel configuration
 ├── pytest.ini              # Test configuration
-└── requirements-dev.txt    # Development dependencies
+├── requirements-dev.txt    # Development dependencies
+├── LICENSE.md              # Dual Apache-2.0 / MIT notice
+├── LICENSE-APACHE
+└── LICENSE-MIT
 ```
+
+This tree is generated from `bindings/python/` in the cdk monorepo on every
+release and replaces the repository contents wholesale, so edits made here are
+overwritten. `.github/` is the one directory left untouched.
 
 ## Documentation
 

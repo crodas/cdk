@@ -167,8 +167,7 @@ jobs:
 
       - name: Copy bindings/python to cdk-python
         run: |
-          rsync -av \
-            --exclude='.github' \
+          rsync -av --delete \
             --exclude='.git' \
             --exclude='dist' \
             --exclude='build' \
