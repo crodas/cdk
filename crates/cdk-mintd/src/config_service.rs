@@ -1878,6 +1878,7 @@ engine = "sqlite"
                     tls_mode: mode.map(str::to_owned),
                     ..Default::default()
                 }),
+                pubsub: Default::default(),
             };
             assert_eq!(
                 same_primary_database(&database(stored_mode), &database(bootstrap_mode)),

@@ -1002,7 +1002,6 @@ async fn setup_database(
     Option<PubSubBusPlan>,
 )> {
     tracing::info!("Using database engine: {:?}", settings.database.engine);
-    let pubsub = &settings.database.pubsub;
     match settings.database.engine {
         #[cfg(feature = "sqlite")]
         DatabaseEngine::Sqlite => {
@@ -1042,17 +1041,16 @@ async fn setup_database(
 
             // Postgres reaches peers, so instances sharing this database share
             // notifications unless the operator opted out.
-            let bus: Option<PubSubBusPlan> =
-                pubsub
-                    .cross_instance
-                    .then(|| PubSubBusPlan::PostgresListenNotify {
-                        config: PgConfig::new(
-                            pg_config.url.as_str(),
-                            pg_config.tls_mode.as_deref(),
-                            pg_config.max_connections,
-                            pg_config.connection_timeout_seconds,
-                        ),
-                    });
+            let bus: Option<PubSubBusPlan> = settings.database.pubsub.cross_instance.then(|| {
+                PubSubBusPlan::PostgresListenNotify {
+                    config: PgConfig::new(
+                        pg_config.url.as_str(),
+                        pg_config.tls_mode.as_deref(),
+                        pg_config.max_connections,
+                        pg_config.connection_timeout_seconds,
+                    ),
+                }
+            });
 
             let localstore: Arc<dyn MintDatabase<cdk_database::Error> + Send + Sync> =
                 pg_db.clone();
@@ -3525,7 +3523,7 @@ engine = "sqlite"
         std::env::set_var(env_vars::ENV_PUBSUB_CROSS_INSTANCE, "maybe");
         assert!(
             load_database_bootstrap_settings().is_err(),
-            "an unparseable value must be rejected, not defaulted"
+            "an unparsable value must be rejected, not defaulted"
         );
         std::env::remove_var(env_vars::ENV_PUBSUB_CROSS_INSTANCE);
 
