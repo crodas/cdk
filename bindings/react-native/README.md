@@ -10,6 +10,23 @@ It exists so [cashu-ts][cashu-ts] can hand its slowest work to Rust without
 changing its public API. `NativeOutputDataCreator` implements cashu-ts's
 `OutputDataCreator` interface, and a wallet opts in by passing it in.
 
+## Installing it
+
+The package deploys to its own repository, the way the Go binding does, so
+install it from a tag rather than npmjs:
+
+```sh
+npm install github:cashubtc/cashu-native#v0.18.0
+```
+
+A `postinstall` script fetches the iOS xcframework and the Android jniLibs from
+that release and checks them against the committed `checksums.sha256`. If you
+install with `--ignore-scripts`, run it yourself:
+
+```sh
+node node_modules/@cashu/cashu-native/scripts/fetch-binaries.mjs
+```
+
 ## Using it
 
 ```ts
@@ -101,12 +118,18 @@ globalThis.TextEncoder ??= TextEncoder;
 ## Working on it
 
 ```sh
-just binding-react-native     # regenerate everything from the Rust exports
-just test-react-native        # cargo tests, typecheck, and cashu-ts parity
-just bench-react-native       # native vs cashu-ts
-just binding-react-native-ios
-just binding-react-native-android
+just binding-react-native          # regenerate everything from the Rust exports
+just test-react-native             # cargo tests, typecheck, and cashu-ts parity
+just bench-react-native            # native vs cashu-ts
+just binding-react-native-ios      # xcframework
+just binding-react-native-android  # one .so per ABI, plus the alignment check
+just test-react-native-ios         # build the example for a simulator
+just test-react-native-android     # build the example for an emulator
 ```
+
+Android needs an NDK and `cargo-ndk`; `nix develop .#react-native-android`
+provides both. The Rust links as a shared library, so each ABI ships a ~2.5 MB
+`libcashu_ffi.so` rather than a ~48 MB static archive.
 
 The parity tests run the same generated bindings React Native gets, through
 ubrn's N-API flavour, so they execute under plain Node with no simulator. They
@@ -117,15 +140,16 @@ factors and secrets to cashu-ts's Noble-curves implementation.
 the speed of cashu-ts; a release build is an order of magnitude faster. The
 `just` recipes default to `--release` for this reason.
 
-Measured on an M-series laptop against cashu-ts 5.0.0-rc.10:
+Measured against cashu-ts 5.0.0-rc.10, a 500-counter NUT-09 restore:
 
-| Workload | cashu-ts | native | |
+| Runtime | cashu-ts | native | |
 |---|---|---|---|
-| NUT-09 restore, 500 counters | 772 ms | 68 ms | 11.3x |
-| Deterministic outputs for 1000 sat | 10.8 ms | 0.87 ms | 12.4x |
+| Node (M-series laptop) | 772 ms | 68 ms | 11.3x |
+| Hermes, iPhone 17 simulator | 7071 ms | 68 ms | 104x |
+| Hermes, Android emulator (API 36) | 8228 ms | 95 ms | 87x |
 
-On Hermes the gap is far wider, because only the JavaScript side slows down.
-The same restore on an iPhone 17 simulator: 7071 ms against 68 ms, **104x**.
+The gap is far wider on Hermes than under Node because only the JavaScript side
+slows down; the Rust costs the same everywhere.
 
 ### Developing against a local cashu-ts
 

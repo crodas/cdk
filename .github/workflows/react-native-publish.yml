@@ -1,0 +1,348 @@
+name: "FFI - React Native Bindings"
+
+permissions:
+  contents: read
+  actions: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to create for release (e.g. v0.17.0)"
+        required: true
+      cdk_version:
+        description: 'CDK dependency version (e.g. 0.17.0). Defaults to release_tag without the "v" prefix.'
+        required: false
+      cdk_ref:
+        description: "CDK git ref to publish from. Must match release_tag unless this is a nightly."
+        required: false
+      prerelease:
+        description: "Mark the GitHub release as a pre-release"
+        type: boolean
+        default: false
+      nightly:
+        description: "Build an immutable nightly prerelease from an exact CDK commit."
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        required: true
+      cdk_version:
+        type: string
+        required: false
+      cdk_ref:
+        type: string
+        required: false
+      prerelease:
+        type: boolean
+        required: false
+        default: false
+      nightly:
+        type: boolean
+        required: false
+        default: false
+
+env:
+  CARGO_TERM_COLOR: ${{ vars.CARGO_TERM_COLOR }}
+  TAG: ${{ inputs.release_tag }}
+  CDK_REF: ${{ inputs.cdk_ref || inputs.release_tag }}
+  CDK_CHECKOUT_REF: ${{ inputs.nightly && inputs.cdk_ref || format('refs/tags/{0}', inputs.release_tag) }}
+  RELEASE_BRANCH: release/${{ inputs.release_tag }}
+
+jobs:
+  release-ci:
+    uses: ./.github/workflows/release-ci.yml
+    with:
+      ref: ${{ inputs.nightly && inputs.cdk_ref || inputs.release_tag }}
+
+  validate-release-ref:
+    needs: release-ci
+    name: "react-native: Validate release ref"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release ref
+        shell: bash
+        run: |
+          if [[ "${{ inputs.nightly }}" == "true" ]]; then
+            if [[ "${{ inputs.prerelease }}" != "true" ]]; then
+              echo "::error::Nightly releases must be marked as prereleases"
+              exit 1
+            fi
+
+            if [[ ! "${CDK_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Nightly cdk_ref must be an exact 40-character commit SHA; got ${CDK_REF}"
+              exit 1
+            fi
+
+            if [[ ! "${TAG}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+-nightly[.][0-9]{8}[.]g[0-9a-f]{7}$ ]]; then
+              echo "::error::Nightly release_tag must look like v0.18.0-nightly.20260801.g1a2b3c4; got ${TAG}"
+              exit 1
+            fi
+          elif [[ "${CDK_REF}" != "${TAG}" ]]; then
+            echo "::error::cdk_ref must match release_tag (${TAG}); got ${CDK_REF}"
+            exit 1
+          fi
+
+          if [[ ! "${TAG}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release_tag must be a version tag such as v0.17.0; got ${TAG}"
+            exit 1
+          fi
+
+      - name: Verify release source exists
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          fetch-depth: 1
+          persist-credentials: false
+
+  rn-build-ios:
+    needs: validate-release-ref
+    name: "react-native: Build iOS"
+    runs-on: macos-14
+    steps:
+      - name: Checkout monorepo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - uses: extractions/setup-just@v3
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Build the xcframework
+        run: just binding-react-native-ios
+
+      - name: Package the xcframework
+        working-directory: bindings/react-native
+        run: zip -qry "${{ runner.temp }}/CashuFfi.xcframework.zip" CashuFfi.xcframework
+
+      # The generated tree is produced identically on both legs; iOS is the one
+      # that publishes it, because its bindgen runs against the device archive.
+      - name: Package the generated sources
+        working-directory: bindings/react-native
+        run: |
+          tar -czf "${{ runner.temp }}/generated.tar.gz" \
+            turbo src/generated cpp ios CashuNative.podspec
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rn-ios
+          path: |
+            ${{ runner.temp }}/CashuFfi.xcframework.zip
+            ${{ runner.temp }}/generated.tar.gz
+          if-no-files-found: error
+
+  rn-build-android:
+    needs: validate-release-ref
+    name: "react-native: Build Android"
+    runs-on: self-hosted
+    steps:
+      - name: Checkout monorepo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          persist-credentials: false
+
+      - uses: cachix/cachix-action@v17
+        with:
+          name: cashudevkit
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+        continue-on-error: true
+
+      # Also runs the 16 KB ELF page alignment check the Play Store requires.
+      - name: Build every Android ABI
+        run: nix develop --fallback -L .#react-native-android --command just binding-react-native-android
+
+      - name: Package the jniLibs
+        working-directory: bindings/react-native/android/src/main
+        run: zip -qry "${{ runner.temp }}/jniLibs.zip" jniLibs
+
+      - name: Package the Android project
+        working-directory: bindings/react-native
+        run: |
+          tar -czf "${{ runner.temp }}/android.tar.gz" \
+            --exclude='src/main/jniLibs' --exclude='.cxx' --exclude='build' android
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rn-android
+          path: |
+            ${{ runner.temp }}/jniLibs.zip
+            ${{ runner.temp }}/android.tar.gz
+          if-no-files-found: error
+
+  rn-publish:
+    needs: [rn-build-ios, rn-build-android]
+    name: "react-native: Publish to cashu-native"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout monorepo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          persist-credentials: false
+
+      - name: Resolve variables
+        run: |
+          CDK_VER="${{ inputs.cdk_version }}"
+          echo "CDK_VER=${CDK_VER:-${TAG#v}}" >> "$GITHUB_ENV"
+          echo "RELEASE_VER=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Clone cashu-native
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+
+          git -c "http.extraheader=$(auth_header)" \
+            clone https://github.com/${{ vars.CDK_REACT_NATIVE_REPO }}.git cashu-native
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: rn-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Copy the hand-written sources
+        run: |
+          rsync -av --delete \
+            --exclude='.git' \
+            --exclude='example' \
+            --exclude='test' \
+            --exclude='node_modules' \
+            --exclude='lib' \
+            --exclude='.fetch' \
+            --exclude='CashuFfi.xcframework' \
+            --exclude='android' \
+            bindings/react-native/ cashu-native/
+
+      - name: Unpack the generated sources
+        run: |
+          tar -xzf artifacts/generated.tar.gz -C cashu-native
+          tar -xzf artifacts/android.tar.gz -C cashu-native
+
+      - name: Stamp the version and the repository
+        run: |
+          cd cashu-native
+          REPO="${{ vars.CDK_REACT_NATIVE_REPO }}"
+          node - "$RELEASE_VER" "$REPO" <<'NODE'
+          const fs = require('node:fs');
+          const [version, repo] = process.argv.slice(2);
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          pkg.version = version;
+          pkg.repository = { type: 'git', url: `git+https://github.com/${repo}.git` };
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          NODE
+
+          # The generated podspec points its source at the monorepo and a tag
+          # that only ever exists in the binding repo.
+          sed -i \
+            -e "s|:git => \"https://github.com/cashubtc/cdk.git\"|:git => \"https://github.com/${REPO}.git\"|" \
+            -e "s|:tag => \"#{s.version}\"|:tag => \"v#{s.version}\"|" \
+            CashuNative.podspec
+
+      - name: Write the asset checksums
+        run: |
+          cp artifacts/CashuFfi.xcframework.zip artifacts/jniLibs.zip .
+          sha256sum CashuFfi.xcframework.zip jniLibs.zip > cashu-native/checksums.sha256
+          cat cashu-native/checksums.sha256
+
+      - name: Verify the published package can fetch its own binaries
+        working-directory: cashu-native
+        run: |
+          python3 -m http.server 8799 --directory .. > /dev/null 2>&1 &
+          until curl -sf http://localhost:8799/checksums.sha256 > /dev/null; do sleep 1; done
+          CASHU_NATIVE_BASE_URL=http://localhost:8799 node scripts/fetch-binaries.mjs
+          test -f CashuFfi.xcframework/Info.plist
+          test -f android/src/main/jniLibs/arm64-v8a/libcashu_ffi.so
+          rm -rf CashuFfi.xcframework android/src/main/jniLibs
+
+      - name: Commit to the release branch
+        working-directory: cashu-native
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git show-ref --verify --quiet "refs/remotes/origin/${RELEASE_BRANCH}"; then
+            git checkout -B "${RELEASE_BRANCH}" "origin/${RELEASE_BRANCH}"
+          else
+            git checkout -b "${RELEASE_BRANCH}"
+          fi
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "release: ${TAG} — bindings for CDK ${CDK_VER}"
+
+      - name: Push the release branch
+        working-directory: cashu-native
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+          git -c "http.extraheader=$(auth_header)" push origin "${RELEASE_BRANCH}"
+
+      - name: Create the release, with the native libraries attached
+        working-directory: cashu-native
+        env:
+          GH_TOKEN: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          COMMIT_SHA=$(git rev-parse HEAD)
+          RELEASE_OPTIONS=(--generate-notes)
+          if [[ "${{ inputs.nightly }}" == "true" ]]; then
+            # ffi-nightly.yml greps release bodies for this SHA to decide
+            # whether a nightly for this commit already exists.
+            RELEASE_OPTIONS+=(
+              --prerelease
+              --latest=false
+              --notes "Nightly bindings built from CDK commit ${CDK_REF}: https://github.com/${GITHUB_REPOSITORY}/commit/${CDK_REF}"
+            )
+          elif [[ "${{ inputs.prerelease }}" == "true" ]]; then
+            RELEASE_OPTIONS+=(--prerelease)
+          fi
+
+          gh release create "${TAG}" \
+            --repo ${{ vars.CDK_REACT_NATIVE_REPO }} \
+            --target "${COMMIT_SHA}" \
+            --title "Release ${TAG}" \
+            "${RELEASE_OPTIONS[@]}" \
+            ../CashuFfi.xcframework.zip \
+            ../jniLibs.zip
+
+      - name: Merge into the default branch
+        if: ${{ inputs.nightly != true }}
+        working-directory: cashu-native
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+          DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
+          git checkout "${DEFAULT_BRANCH}"
+          git merge "${RELEASE_BRANCH}" --squash
+          git commit -m "release: ${TAG}"
+          git -c "http.extraheader=$(auth_header)" push origin "${DEFAULT_BRANCH}"
+
+      - name: Clean up the release branch
+        working-directory: cashu-native
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+          git -c "http.extraheader=$(auth_header)" push origin --delete "${RELEASE_BRANCH}"

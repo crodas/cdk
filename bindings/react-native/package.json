@@ -59,12 +59,14 @@
     "cpp/",
     "android/",
     "ios/",
-    "CashuFfi.xcframework/",
+    "scripts/",
+    "checksums.sha256",
     "ubrn.config.yaml",
     "CashuNative.podspec",
     "gradle.properties"
   ],
   "scripts": {
+    "postinstall": "node scripts/fetch-binaries.mjs",
     "typecheck": "tsc --noEmit",
     "build": "tsc",
     "test": "tsx --test test/*.test.ts",

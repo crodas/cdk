@@ -830,7 +830,7 @@ release *ARGS:
     echo
   done
 
-  # Trigger all FFI binding releases (Dart, Kotlin, Swift, Go)
+  # Trigger all FFI binding releases (Dart, Kotlin, Swift, Go, React Native)
   echo "📦 Triggering all FFI binding releases for version $VERSION..."
   just ffi-release-all $VERSION
 
@@ -1133,7 +1133,7 @@ ffi-test-live-python:
   echo "🧪 Running live Python FFI tests..."
   python3 crates/cdk-ffi/tests/test_live_async_onchain_melt.py
 
-# Trigger all FFI binding releases (Dart, Kotlin, Swift, Go)
+# Trigger all FFI binding releases (Dart, Kotlin, Swift, Go, React Native)
 ffi-release-all VERSION:
   #!/usr/bin/env bash
   set -euo pipefail
@@ -1256,6 +1256,24 @@ ffi-release-go VERSION:
     --field cdk_ref="v{{VERSION}}"
 
   echo "✅ Go workflow triggered successfully!"
+
+# Trigger the React Native bindings release
+ffi-release-react-native VERSION:
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  echo "🚀 Triggering React Native bindings workflow..."
+  echo "   Version: {{VERSION}}"
+  echo "   Tag: v{{VERSION}}"
+
+  gh workflow run "FFI - React Native Bindings" \
+    --repo cashubtc/cdk \
+    --ref "v{{VERSION}}" \
+    --field release_tag="v{{VERSION}}" \
+    --field cdk_version="{{VERSION}}" \
+    --field cdk_ref="v{{VERSION}}"
+
+  echo "✅ React Native workflow triggered successfully!"
 
 # Generate Dart FFI bindings via nix
 binding-dart:

@@ -43,6 +43,8 @@ bindings/react-native/android/.cxx/
 bindings/react-native/android/build/
 bindings/react-native/CashuNative.podspec
 bindings/react-native/*.tgz
+# Written at publish time; its absence marks a source checkout.
+bindings/react-native/checksums.sha256
 bindings/react-native/*.xcframework/
 bindings/react-native/example/ios/Pods/
 bindings/react-native/example/ios/build/
