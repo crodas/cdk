@@ -7,7 +7,20 @@ if [[ $# -ne 1 ]]; then
 fi
 
 file="$1"
-objdump="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump"
+# The NDK ships one prebuilt toolchain per host; CI is linux-x86_64 but a
+# developer checking locally may be on macOS.
+prebuilt="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt"
+objdump=""
+for host in linux-x86_64 darwin-x86_64 darwin-arm64 windows-x86_64; do
+  if [[ -x "${prebuilt}/${host}/bin/llvm-objdump" ]]; then
+    objdump="${prebuilt}/${host}/bin/llvm-objdump"
+    break
+  fi
+done
+if [[ -z "$objdump" ]]; then
+  echo "no llvm-objdump under ${prebuilt}" >&2
+  exit 1
+fi
 
 load_segments="$("$objdump" -p "$file" | grep '^[[:space:]]*LOAD' || true)"
 if [[ -z "$load_segments" ]]; then

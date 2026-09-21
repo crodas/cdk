@@ -1391,13 +1391,35 @@ bench-react-native *ARGS="--release": _rn-install
 
 # Build the Rust library for iOS and assemble the xcframework
 binding-react-native-ios *ARGS="--release": _rn-install
-  cd "{{justfile_directory()}}/bindings/react-native" && \
-    ./node_modules/.bin/ubrn build ios --config ubrn.config.yaml --and-generate {{ARGS}}
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}/bindings/react-native"
+  # shellcheck disable=SC1091
+  source "{{justfile_directory()}}/bindings/react-native/scripts/mobile-profile.sh"
+  ./node_modules/.bin/ubrn build ios --config ubrn.config.yaml --and-generate {{ARGS}}
 
-# Build the Rust library for every Android ABI
+  # ubrn's -C strip=debuginfo does not reach the C that the cc crate compiles
+  # for secp256k1, so the archives still carry DWARF. -S keeps the symbol table
+  # the linker needs and drops the debug sections.
+  echo "==> stripping debug sections from the xcframework"
+  find CashuFfi.xcframework -name "*.a" -exec strip -S {} +
+
+# Build the Rust library for every Android ABI, as one .so per ABI
 binding-react-native-android *ARGS="--release": _rn-install
-  cd "{{justfile_directory()}}/bindings/react-native" && \
-    ./node_modules/.bin/ubrn build android --config ubrn.config.yaml --and-generate {{ARGS}}
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  # shellcheck disable=SC1091
+  source bindings/react-native/scripts/mobile-profile.sh
+  (cd bindings/react-native && \
+    ./node_modules/.bin/ubrn build android --config ubrn.config.yaml --and-generate {{ARGS}})
+
+  # Play Store requires 16 KB page alignment; ubrn passes the link arg, so this
+  # catches a regression in the toolchain rather than in our config.
+  echo "==> checking 16 KB ELF page alignment"
+  for so in bindings/react-native/android/src/main/jniLibs/*/libcashu_ffi.so; do
+    ./.github/scripts/check-android-elf-alignment.sh "$so"
+  done
 
 # Install the example app's npm dependencies and CocoaPods if they are missing
 _rn-example-install: _rn-install
@@ -1421,3 +1443,14 @@ test-react-native-ios SIM="iPhone 17": _rn-example-install
     -configuration Debug -sdk iphonesimulator \
     -destination "platform=iOS Simulator,name={{SIM}}" \
     -derivedDataPath build
+
+# Build the example app for Android; ABI defaults to the emulator's
+test-react-native-android ABI="x86_64": _rn-install
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  just binding-react-native-android
+
+  EX="bindings/react-native/example"
+  [ -d "$EX/node_modules" ] || (cd "$EX" && npm install)
+  cd "$EX/android" && ./gradlew assembleDebug

@@ -852,6 +852,8 @@ jobs:
         run: nix develop --fallback -L .#bindings --command just binding-react-native
       - name: Run the cashu-ts parity tests
         run: nix develop --fallback -L .#bindings --command just test-react-native
+      - name: Build the Android libraries and check ELF alignment
+        run: nix develop --fallback -L .#react-native-android --command just binding-react-native-android
 
   swift-binding-tests:
     if: github.event_name != 'pull_request'

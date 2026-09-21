@@ -1823,6 +1823,50 @@
                 AR_x86_64_linux_android = "${toolchainBin}/llvm-ar";
               };
 
+            # Shell for building the React Native bindings for Android.
+            # Same NDK composition as kotlin-build, plus the Node and cargo-ndk
+            # that `ubrn build android` shells out to.
+            react-native-android =
+              let
+                pkgsAndroid = import nixpkgs {
+                  inherit system;
+                  config = {
+                    android_sdk.accept_license = true;
+                    allowUnfree = true;
+                  };
+                };
+                androidComposition = pkgsAndroid.androidenv.composeAndroidPackages {
+                  platformVersions = [ "34" ];
+                  buildToolsVersions = [ "34.0.0" ];
+                  includeNDK = true;
+                  ndkVersions = [ "27.0.12077973" ];
+                  includeEmulator = false;
+                  includeSystemImages = false;
+                };
+                androidSdk = androidComposition.androidsdk;
+                ndkHome = "${androidSdk}/libexec/android-sdk/ndk/27.0.12077973";
+                buildToolchain = pkgs.rust-bin.stable."1.98.0".default.override {
+                  targets = [
+                    "aarch64-linux-android"
+                    "armv7-linux-androideabi"
+                    "i686-linux-android"
+                    "x86_64-linux-android"
+                  ];
+                };
+              in
+              pkgs.mkShell {
+                buildInputs = [
+                  buildToolchain
+                  pkgs.cargo-ndk
+                  pkgs.nodejs_22
+                  pkgs.jdk17
+                  pkgs.clang-tools
+                ];
+                ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
+                ANDROID_NDK_HOME = ndkHome;
+                JAVA_HOME = "${pkgs.jdk17}";
+              };
+
             # Shell for Kotlin publishing (JDK 17 + Android SDK for Gradle)
             kotlin-publish =
               let

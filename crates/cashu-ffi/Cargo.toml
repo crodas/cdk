@@ -20,14 +20,23 @@ thiserror = { workspace = true }
 zeroize = "1"
 # Pinned away from the workspace's 0.30: uniffi-bindgen-react-native needs 0.31,
 # and `bindings/dart/rust` pins a uniffi-dart build that only exists for 0.30.
-uniffi = { version = "=0.31.2", features = ["cli"] }
+uniffi = { version = "=0.31.2" }
 
 [dev-dependencies]
 bip39 = { workspace = true }
 
+[features]
+default = []
+# The stock UniFFI generators (Swift, Kotlin, Python) are driven by the
+# `uniffi-bindgen` binary, which needs uniffi's `cli` feature. That feature
+# links the whole code generator into the library too: measured at 7.2 MB per
+# iOS slice. React Native does not use it, so it is off by default.
+cli = ["uniffi/cli"]
+
 [[bin]]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
 
 [lints]
 workspace = true

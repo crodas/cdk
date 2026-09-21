@@ -30,7 +30,9 @@ android:
   apiLevel: 24
   jniLibs: src/main/jniLibs
   packageName: org.cashudevkit.crypto
-  useSharedLibrary: false
+  # Shared, not static: a static archive is ~48 MB per ABI against ~2 MB for
+  # the .so, and cdk-kotlin already ships .so files in jniLibs.
+  useSharedLibrary: true
 
 ios:
   directory: ./ios

@@ -61,7 +61,8 @@
     "ios/",
     "CashuFfi.xcframework/",
     "ubrn.config.yaml",
-    "CashuNative.podspec"
+    "CashuNative.podspec",
+    "gradle.properties"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
