@@ -10,13 +10,15 @@ bindings:
   cpp: cpp/generated
   ts: src/generated
 
-# The generated entrypoint and its codegen spec sit at the package root; `src/`
-# holds only hand-written code. The entrypoint is what installs the Rust crate
-# into Hermes, so everything hand-written imports through it.
+# The generated entrypoint and its codegen spec get their own directory, so
+# React Native's codegen can scan it without walking node_modules or the
+# example app, and so `src/` holds only hand-written code. The entrypoint is
+# what installs the Rust crate into Hermes; everything hand-written imports
+# through it.
 turboModule:
   cpp: cpp
-  ts: .
-  entrypoint: index.ts
+  ts: turbo
+  entrypoint: turbo/index.ts
 
 android:
   directory: ./android

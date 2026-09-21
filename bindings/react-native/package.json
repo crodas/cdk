@@ -2,18 +2,20 @@
   "name": "@cashu/cashu-native",
   "version": "0.18.0",
   "description": "Native cashu crypto for React Native, generated from the CDK Rust crates",
-  "main": "lib/index.js",
-  "module": "lib/index.js",
-  "types": "lib/index.d.ts",
-  "react-native": "index.ts",
-  "source": "index.ts",
+  "main": "lib/turbo/index.js",
+  "module": "lib/turbo/index.js",
+  "types": "lib/turbo/index.d.ts",
+  "react-native": "turbo/index.ts",
+  "source": "turbo/index.ts",
   "license": "MIT OR Apache-2.0",
   "exports": {
     ".": {
-      "types": "./lib/index.d.ts",
-      "default": "./lib/index.js"
+      "react-native": "./turbo/index.ts",
+      "types": "./lib/turbo/index.d.ts",
+      "default": "./lib/turbo/index.js"
     },
     "./creator": {
+      "react-native": "./src/NativeOutputDataCreator.ts",
       "types": "./lib/src/NativeOutputDataCreator.d.ts",
       "default": "./lib/src/NativeOutputDataCreator.js"
     }
@@ -53,11 +55,11 @@
   "files": [
     "lib/",
     "src/",
+    "turbo/",
     "cpp/",
     "android/",
     "ios/",
-    "index.ts",
-    "NativeCashuNative.ts",
+    "CashuFfi.xcframework/",
     "ubrn.config.yaml",
     "CashuNative.podspec"
   ],
@@ -66,5 +68,15 @@
     "build": "tsc",
     "test": "tsx --test test/*.test.ts",
     "bench": "tsx test/benchmark.ts"
+  },
+  "homepage": "https://github.com/cashubtc/cdk",
+  "author": "CDK Contributors",
+  "codegenConfig": {
+    "name": "RNNativeModuleSpec",
+    "type": "modules",
+    "jsSrcsDir": "turbo",
+    "android": {
+      "javaPackageName": "org.cashudevkit.crypto"
+    }
   }
 }

@@ -55,10 +55,48 @@ flowchart TD
   RS --> CORE["cashu crate"]
 ```
 
-Only `src/creator.ts`, `src/NativeOutputDataCreator.ts` and the tests are
-hand-written. Everything else under `src/generated/`, `cpp/`, `ios/`,
-`android/`, plus `index.ts`, `NativeCashuNative.ts` and the podspec, is emitted
-by `just binding-react-native` and is not committed.
+Only `src/creator.ts`, `src/NativeOutputDataCreator.ts`, the tests and the
+`example/` app are hand-written. Everything under `src/generated/`, `turbo/`,
+`cpp/`, `ios/`, `android/`, plus the podspec and the xcframework, is emitted by
+`just binding-react-native` and is not committed.
+
+`turbo/` exists because React Native's codegen scans `codegenConfig.jsSrcsDir`
+recursively. Pointed at the package root it walks `node_modules` and the
+example app and finds nothing; pointed at `turbo/` it finds the one spec.
+
+## Example app
+
+`example/` is a plain React Native app that wires cashu-ts to this package and
+shows the result. It is the proof the module links and runs, not just compiles.
+
+```sh
+just binding-react-native-ios      # build the Rust and the xcframework
+cd bindings/react-native/example
+npm install
+(cd ios && pod install)
+npm start                          # Metro, in one terminal
+npm run ios                        # in another
+```
+
+Measured on an iPhone 17 simulator, where Hermes is a good deal slower than
+Node: a 500-counter NUT-09 restore goes from 7071 ms to 68 ms, and the outputs
+are byte-identical to cashu-ts.
+
+### cashu-ts needs a TextDecoder polyfill on Hermes
+
+This is not specific to this package, but any React Native app using cashu-ts
+hits it. Hermes ships no `TextEncoder` or `TextDecoder`, and cashu-ts builds
+its decoder with `{ ignoreBOM: true, fatal: true }`, which the smaller
+polyfills silently ignore and then throw on. `@zxing/text-encoding` implements
+both options. Install it and assign the globals before anything imports
+cashu-ts, as `example/index.js` does:
+
+```js
+import { TextDecoder, TextEncoder } from '@zxing/text-encoding';
+
+globalThis.TextDecoder ??= TextDecoder;
+globalThis.TextEncoder ??= TextEncoder;
+```
 
 ## Working on it
 
@@ -85,6 +123,9 @@ Measured on an M-series laptop against cashu-ts 5.0.0-rc.10:
 |---|---|---|---|
 | NUT-09 restore, 500 counters | 772 ms | 68 ms | 11.3x |
 | Deterministic outputs for 1000 sat | 10.8 ms | 0.87 ms | 12.4x |
+
+On Hermes the gap is far wider, because only the JavaScript side slows down.
+The same restore on an iPhone 17 simulator: 7071 ms against 68 ms, **104x**.
 
 ### Developing against a local cashu-ts
 

@@ -1,4 +1,4 @@
-import * as native from '../index';
+import * as native from '../turbo/index';
 import { NativeOutputDataCreatorBase, type P2PKFallback } from './creator';
 
 export type { P2PKFallback, CashuNativeApi } from './creator';

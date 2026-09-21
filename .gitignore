@@ -41,6 +41,17 @@ bindings/react-native/android/src/main/java/
 bindings/react-native/android/src/main/jniLibs/
 bindings/react-native/CashuNative.podspec
 bindings/react-native/*.tgz
+bindings/react-native/*.xcframework/
+bindings/react-native/example/ios/Pods/
+bindings/react-native/example/ios/build/
+bindings/react-native/example/ios/Podfile.lock
+bindings/react-native/example/android/.gradle/
+bindings/react-native/example/android/app/build/
+bindings/react-native/example/android/build/
+bindings/react-native/example/android/local.properties
+bindings/react-native/example/vendor/
+bindings/react-native/example/ios/.xcode.env.local
+bindings/react-native/example/ios/*.xcworkspace/xcuserdata/
 
 # Mutation testing artifacts
 mutants.out/

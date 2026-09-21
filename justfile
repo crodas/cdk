@@ -1398,3 +1398,26 @@ binding-react-native-ios *ARGS="--release": _rn-install
 binding-react-native-android *ARGS="--release": _rn-install
   cd "{{justfile_directory()}}/bindings/react-native" && \
     ./node_modules/.bin/ubrn build android --config ubrn.config.yaml --and-generate {{ARGS}}
+
+# Install the example app's npm dependencies and CocoaPods if they are missing
+_rn-example-install: _rn-install
+  #!/usr/bin/env bash
+  set -euo pipefail
+  EX="{{justfile_directory()}}/bindings/react-native/example"
+  [ -d "$EX/node_modules" ] || (cd "$EX" && npm install)
+  [ -d "$EX/ios/Pods" ] || (cd "$EX/ios" && pod install)
+
+# Build the example app for an iOS simulator, proving the module links and runs
+test-react-native-ios SIM="iPhone 17": _rn-example-install
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  just binding-react-native-ios
+  cd bindings/react-native/example/ios
+  # `pod install` again: the Rust build regenerates the spec React Native's
+  # codegen reads, and the xcframework the podspec vendors.
+  pod install
+  xcodebuild -workspace CashuExample.xcworkspace -scheme CashuExample \
+    -configuration Debug -sdk iphonesimulator \
+    -destination "platform=iOS Simulator,name={{SIM}}" \
+    -derivedDataPath build

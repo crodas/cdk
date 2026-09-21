@@ -16,8 +16,7 @@
     "rootDir": "."
   },
   "include": [
-    "index.ts",
-    "NativeCashuNative.ts",
+    "turbo/**/*.ts",
     "src/**/*.ts",
     "test/**/*.ts",
     "types/*.d.ts"
