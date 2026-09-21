@@ -1,0 +1,14 @@
+[bindings.typescript]
+# Drop the generated `// @ts-nocheck` so `tsc` checks the bindings, and hand
+# `Vec<u8>` over as `Uint8Array` rather than `ArrayBuffer`, which is what
+# cashu-ts passes a seed as.
+strictTypeChecking = true
+strictByteArrays = true
+
+[bindings.kotlin]
+package_name = "org.cashudevkit.crypto"
+cdylib_name = "cashu_ffi"
+
+[bindings.swift]
+module_name = "CashuCrypto"
+cdylib_name = "cashu_ffi"

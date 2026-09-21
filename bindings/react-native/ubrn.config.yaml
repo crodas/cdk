@@ -1,0 +1,39 @@
+---
+# The Rust lives in this repository, so there is no `repo:`/`branch:` here and
+# `ubrn checkout` is never run. Both paths are relative, which is what keeps
+# them correct across the several git worktrees this repo is used from.
+rust:
+  directory: ../..
+  manifestPath: crates/cashu-ffi/Cargo.toml
+
+bindings:
+  cpp: cpp/generated
+  ts: src/generated
+
+# The generated entrypoint and its codegen spec sit at the package root; `src/`
+# holds only hand-written code. The entrypoint is what installs the Rust crate
+# into Hermes, so everything hand-written imports through it.
+turboModule:
+  cpp: cpp
+  ts: .
+  entrypoint: index.ts
+
+android:
+  directory: ./android
+  targets:
+    - arm64-v8a
+    - armeabi-v7a
+    - x86_64
+    - x86
+  apiLevel: 24
+  jniLibs: src/main/jniLibs
+  packageName: org.cashudevkit.crypto
+  useSharedLibrary: false
+
+ios:
+  directory: ./ios
+  targets:
+    - aarch64-apple-ios
+    - aarch64-apple-ios-sim
+    - x86_64-apple-ios
+  frameworkName: CashuFfi

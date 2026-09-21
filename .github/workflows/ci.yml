@@ -826,6 +826,33 @@ jobs:
       - name: Run Go tests
         run: nix develop --fallback -L .#bindings --command just test-go
 
+  react-native-binding-tests:
+    if: github.event_name != 'pull_request'
+    name: "React Native binding tests"
+    runs-on: self-hosted
+    timeout-minutes: 30
+    needs: warm-nix-cache
+    steps:
+      - name: checkout
+        uses: actions/checkout@v5
+      - uses: cachix/cachix-action@v17
+        with:
+          name: cashudevkit
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+        continue-on-error: true
+      # ubrn compiles its own CLI out of node_modules on first use, so cache the
+      # whole tree rather than just the packages.
+      - name: Cache the ubrn toolchain
+        uses: actions/cache@v4
+        with:
+          path: bindings/react-native/node_modules
+          key: ubrn-${{ runner.os }}-${{ hashFiles('bindings/react-native/package-lock.json') }}
+      - name: Generate the React Native bindings
+        run: nix develop --fallback -L .#bindings --command just binding-react-native
+      - name: Run the cashu-ts parity tests
+        run: nix develop --fallback -L .#bindings --command just test-react-native
+
   swift-binding-tests:
     if: github.event_name != 'pull_request'
     name: "Swift binding tests"

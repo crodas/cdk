@@ -1,0 +1,70 @@
+{
+  "name": "@cashu/cashu-native",
+  "version": "0.18.0",
+  "description": "Native cashu crypto for React Native, generated from the CDK Rust crates",
+  "main": "lib/index.js",
+  "module": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "react-native": "index.ts",
+  "source": "index.ts",
+  "license": "MIT OR Apache-2.0",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./creator": {
+      "types": "./lib/src/NativeOutputDataCreator.d.ts",
+      "default": "./lib/src/NativeOutputDataCreator.js"
+    }
+  },
+  "dependencies": {
+    "@ubjs/core": "0.31.0-5",
+    "uniffi-bindgen-react-native": "0.31.0-5"
+  },
+  "devDependencies": {
+    "@cashu/cashu-ts": "^5.0.0-rc.8",
+    "@ubjs/node": "0.31.0-5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "@cashu/cashu-ts": "^5.0.0-rc.8",
+    "react": "*",
+    "react-native": "*"
+  },
+  "peerDependenciesMeta": {
+    "@cashu/cashu-ts": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cashubtc/cdk.git",
+    "directory": "bindings/react-native"
+  },
+  "keywords": [
+    "react-native",
+    "cashu",
+    "ecash",
+    "uniffi",
+    "bitcoin"
+  ],
+  "files": [
+    "lib/",
+    "src/",
+    "cpp/",
+    "android/",
+    "ios/",
+    "index.ts",
+    "NativeCashuNative.ts",
+    "ubrn.config.yaml",
+    "CashuNative.podspec"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "tsx --test test/*.test.ts",
+    "bench": "tsx test/benchmark.ts"
+  }
+}

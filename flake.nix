@@ -1750,6 +1750,11 @@
                   pkgs.openssl
                   pkgs.jdk17
                   pkgs.go
+                  # The React Native bindings: ubrn is a Node shim that builds
+                  # its own CLI from source, and clang-format tidies the C++ it
+                  # emits.
+                  pkgs.nodejs_22
+                  pkgs.clang-tools
                 ];
                 nativeBuildInputs = [
                   pkgs.pkg-config

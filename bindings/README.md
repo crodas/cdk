@@ -52,6 +52,7 @@ own `uniffi.toml` controlling language-specific code generation.
 | **Swift** | `bindings/swift/` | Active | CI workflow | `just test-swift` |
 | **Kotlin** | `bindings/kotlin/` | Active | `just binding-kotlin` | `just test-kotlin` |
 | **Go** | `bindings/go/` | Active | `just binding-go` | `just test-go` |
+| **React Native** | `bindings/react-native/` | Active | `just binding-react-native` | `just test-react-native` |
 
 ### Dart
 
@@ -71,12 +72,38 @@ own `uniffi.toml` controlling language-specific code generation.
 - `Package.swift` is generated during the CI publish workflow
 - Swift sources are generated into `bindings/swift/Sources/Cdk/`
 
+### React Native
+
+The one target that does not follow the two-tier architecture above, and the
+one that does not wrap `cdk-ffi`.
+
+- **Package name:** `@cashu/cashu-native`
+- **Rust crate:** [`crates/cashu-ffi`](../crates/cashu-ffi), a narrow surface
+  over the `cashu` crate's crypto primitives rather than the `cdk` wallet
+- **Binding generator:** [uniffi-bindgen-react-native][ubrn] (`ubrn`)
+
+It wraps `cashu-ffi` because its consumer is [cashu-ts][cashu-ts], which has
+its own wallet and needs only the blinding and NUT-13 derivation that
+JavaScript is slow at. A wallet surface would mean sqlite and tokio in a mobile
+binary for no gain.
+
+There is no `bindings/react-native/rust` wrapper crate. That tier exists to
+give each language its own `uniffi.toml`, and ubrn has no such constraint: it
+reads the one next to the crate. A wrapper here would be a `pub use` file that
+doubles the link time across four Android ABIs.
+
+`crates/cashu-ffi` also pins `uniffi` to `=0.31.2` instead of the workspace's
+`0.30`, because ubrn needs 0.31 and `bindings/dart/rust` pins a `uniffi-dart`
+build that only exists for 0.30. The two versions never meet in one library.
+
+[ubrn]: https://github.com/jhugman/uniffi-bindgen-react-native
+[cashu-ts]: https://github.com/cashubtc/cashu-ts
+
 ## Planned targets
 
 | Language | Status | Notes |
 |----------|--------|-------|
 | **Python** | Configured | UniFFI config exists in `crates/cdk-ffi/uniffi.toml` |
-| **React Native** | Planned | — |
 
 Python already has UniFFI configuration in the core FFI crate. Adding a new
 language binding involves creating a `bindings/<lang>/` directory with a thin

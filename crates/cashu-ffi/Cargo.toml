@@ -1,0 +1,33 @@
+[package]
+name = "cashu-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "UniFFI bindings for the cashu crate protocol and crypto primitives"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+name = "cashu_ffi"
+
+[dependencies]
+bitcoin = { workspace = true }
+cashu = { workspace = true, default-features = false, features = ["wallet"] }
+thiserror = { workspace = true }
+zeroize = "1"
+# Pinned away from the workspace's 0.30: uniffi-bindgen-react-native needs 0.31,
+# and `bindings/dart/rust` pins a uniffi-dart build that only exists for 0.30.
+uniffi = { version = "=0.31.2", features = ["cli"] }
+
+[dev-dependencies]
+bip39 = { workspace = true }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[lints]
+workspace = true

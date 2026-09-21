@@ -798,6 +798,7 @@ release *ARGS:
 
   args=(
     "-p cashu"
+    "-p cashu-ffi"
     "-p cdk-prometheus"
     "-p cdk-http-client"
     "-p cdk-common"
@@ -1318,3 +1319,82 @@ test-swift:
   else
     DYLD_LIBRARY_PATH="$LIB_DIR" swift test
   fi
+
+# Install the React Native package's npm dependencies if they are missing
+_rn-install:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  RN="{{justfile_directory()}}/bindings/react-native"
+  [ -x "$RN/node_modules/.bin/ubrn" ] && exit 0
+  echo "==> installing npm dependencies for the React Native bindings"
+  (cd "$RN" && npm ci)
+
+# Generate the React Native bindings: TypeScript, JSI C++ and turbo-module glue
+binding-react-native *ARGS="--release": _rn-install
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  RN="bindings/react-native"
+  EXT=$(just _ffi-lib-ext)
+  if [[ "{{ARGS}}" == *"--debug"* ]]; then
+    cargo build --package cashu-ffi
+    LIB="target/debug/libcashu_ffi.$EXT"
+  else
+    cargo build {{ARGS}} --package cashu-ffi
+    LIB="target/release/libcashu_ffi.$EXT"
+  fi
+
+  echo "==> generating the JSI bindings"
+  # Library mode reads uniffi.toml from the crate directory, so --config is
+  # rejected here; crates/cashu-ffi/uniffi.toml is picked up automatically.
+  "$RN/node_modules/.bin/ubrn" generate jsi bindings "$LIB" \
+    --library --crate cashu_ffi \
+    --ts-dir "$RN/src/generated" --cpp-dir "$RN/cpp/generated"
+
+  echo "==> generating the turbo-module glue"
+  (cd "$RN" && ./node_modules/.bin/ubrn generate jsi turbo-module --config ubrn.config.yaml cashu_ffi)
+
+# Type-check the React Native package and run the cashu-ts parity tests on Node
+test-react-native *ARGS="--release": _rn-install
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  RN="bindings/react-native"
+  EXT=$(just _ffi-lib-ext)
+  # The parity tests run the same generated bindings React Native gets, through
+  # ubrn's N-API flavour, so they need no simulator. Release by default: a debug
+  # build of the crate is slower than cashu-ts, which makes the benchmark lie.
+  if [[ "{{ARGS}}" == *"--debug"* ]]; then
+    cargo build --package cashu-ffi
+    LIB="target/debug/libcashu_ffi.$EXT"
+  else
+    cargo build {{ARGS}} --package cashu-ffi
+    LIB="target/release/libcashu_ffi.$EXT"
+  fi
+
+  mkdir -p "$RN/test/generated"
+  cp "$LIB" "$RN/test/generated/"
+  "$RN/node_modules/.bin/ubrn" generate napi bindings "$LIB" \
+    --library --crate cashu_ffi \
+    --ts-dir "$RN/test/generated" --lib-colocated
+
+  cargo test --package cashu-ffi
+  (cd "$RN" && npm run typecheck && npm test)
+
+# Compare the native output construction against cashu-ts
+bench-react-native *ARGS="--release": _rn-install
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  just test-react-native {{ARGS}} > /dev/null
+  (cd "bindings/react-native" && npm run bench)
+
+# Build the Rust library for iOS and assemble the xcframework
+binding-react-native-ios *ARGS="--release": _rn-install
+  cd "{{justfile_directory()}}/bindings/react-native" && \
+    ./node_modules/.bin/ubrn build ios --config ubrn.config.yaml --and-generate {{ARGS}}
+
+# Build the Rust library for every Android ABI
+binding-react-native-android *ARGS="--release": _rn-install
+  cd "{{justfile_directory()}}/bindings/react-native" && \
+    ./node_modules/.bin/ubrn build android --config ubrn.config.yaml --and-generate {{ARGS}}

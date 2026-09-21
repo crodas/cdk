@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
+    "strict": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "lib",
+    "rootDir": "."
+  },
+  "include": [
+    "index.ts",
+    "NativeCashuNative.ts",
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "types/*.d.ts"
+  ],
+  "exclude": [
+    "lib",
+    "node_modules"
+  ]
+}
