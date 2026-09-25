@@ -73,7 +73,7 @@ print("Balance: \(balance.value) sats")
 
 ## Pre-built binaries
 
-The Swift package uses a pre-built `CashuDevKitFFI.xcframework` downloaded automatically via SPM from [GitHub releases](https://github.com/cashubtc/cdk-swift/releases).
+The Swift package uses a pre-built `CashuDevKitFFI.xcframework.zip`, committed at the root of the cdk-swift repository and resolved by SPM as a local binary target. The same archive is also attached to each [GitHub release](https://github.com/cashubtc/cdk-swift/releases).
 
 Supported platforms:
 

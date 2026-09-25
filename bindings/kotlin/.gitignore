@@ -1,7 +1,7 @@
-# Synced to the cdk-kotlin binding repo, which carries artifacts only. The
-# Android libraries are delivered through Maven Central, so they are staged on
-# disk for the Gradle publish and never committed.
-cdk-android/src/main/jniLibs/
+# Synced to the cdk-kotlin binding repo. The Android libraries under
+# cdk-android/src/main/jniLibs/ are committed on the release branch, so the
+# nightly tag points at a commit that contains them even though nightlies skip
+# the Maven Central publish.
 build/
 .gradle/
 local.properties

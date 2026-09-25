@@ -300,50 +300,21 @@ jobs:
           pattern: dart-native-*
           merge-multiple: true
 
-      - name: Compress release assets and record digests
+      - name: Organize prebuilt binaries
         run: |
-          set -euo pipefail
-          mkdir -p release-assets
+          mkdir -p cdk-dart/prebuilt
 
-          : > digests.txt
           for f in artifacts/*; do
             filename=$(basename "$f")
             for suffix in libcdk_ffi_dart.so libcdk_ffi_dart.dylib libcdk_ffi_dart.a cdk_ffi_dart.dll; do
-              [[ "$filename" == *"-${suffix}" ]] || continue
-              target="${filename%-${suffix}}"
-              # The digest covers the uncompressed library, so it stays
-              # comparable against a locally built or user-supplied one.
-              sha=$(sha256sum "$f" | cut -d' ' -f1)
-              printf '%s\t%s\t%s\n' "${target}/${suffix}" "${filename}.gz" "${sha}" >> digests.txt
-              gzip -9 -c "$f" > "release-assets/${filename}.gz"
-              break
+              if [[ "$filename" == *"-${suffix}" ]]; then
+                target="${filename%-${suffix}}"
+                mkdir -p "cdk-dart/prebuilt/${target}"
+                cp "$f" "cdk-dart/prebuilt/${target}/${suffix}"
+                break
+              fi
             done
           done
-
-          ls -lh release-assets/
-          cat digests.txt
-
-      - name: Generate prebuilt manifest
-        run: |
-          set -euo pipefail
-          # Lives at the package root, not under prebuilt/: git does not descend
-          # into an excluded directory, so a manifest inside it would never be
-          # committed.
-          jq -Rn \
-            --arg tag "${TAG}" \
-            --arg baseUrl "https://github.com/${{ vars.CDK_DART_REPO }}/releases/download/${TAG}/" \
-            '{
-               schema: 1,
-               tag: $tag,
-               baseUrl: $baseUrl,
-               assets: [
-                 inputs
-                 | split("\t")
-                 | {key: .[0], value: {asset: .[1], sha256: .[2]}}
-               ] | from_entries
-             }' digests.txt > cdk-dart/prebuilt_manifest.json
-
-          cat cdk-dart/prebuilt_manifest.json
 
       - name: Download generated bindings
         uses: actions/download-artifact@v8
@@ -358,7 +329,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "release: ${TAG} - add bindings and the prebuilt manifest"
+          git commit -m "release: ${TAG} - add bindings and prebuilt binaries"
 
       - name: Push release branch
         working-directory: cdk-dart
@@ -371,6 +342,29 @@ jobs:
           }
 
           git -c "http.extraheader=$(auth_header)" push origin "${RELEASE_BRANCH}"
+
+      - name: Create per-platform release archives
+        run: |
+          mkdir -p release-archives
+
+          # Copy source without prebuilt dir and .git
+          rsync -a --exclude='.git' --exclude='prebuilt' cdk-dart/ staging/
+
+          for dir in cdk-dart/prebuilt/*/; do
+            target=$(basename "$dir")
+            # Add only this platform's prebuilt
+            mkdir -p "staging/prebuilt/${target}"
+            cp -r "$dir"* "staging/prebuilt/${target}/"
+            # Archive
+            if [[ "$target" == *windows* ]]; then
+              (cd staging && zip -qr "../release-archives/${target}.zip" .)
+            else
+              tar -czf "release-archives/${target}.tar.gz" -C staging .
+            fi
+            # Clean up for next platform
+            rm -rf staging/prebuilt
+          done
+          ls -lh release-archives/
 
       - name: Create release on cdk-dart
         env:
@@ -393,7 +387,7 @@ jobs:
             --target "${COMMIT_SHA}" \
             --title "Release ${TAG}" \
             "${RELEASE_OPTIONS[@]}" \
-            release-assets/*
+            release-archives/*
 
       - name: Merge to default branch
         if: ${{ !inputs.nightly }}

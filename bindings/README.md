@@ -23,20 +23,22 @@ this checkout with `cargo --locked` against the root `Cargo.lock` and the
 release tag decides which tree is compiled, and it is chosen before the build
 starts.
 
-The binding repositories carry artifacts only. They receive generated sources,
-the platform project files and the prebuilt libraries, and they carry the
-GitHub release. They contain no Rust crate and nothing in them is buildable, so
-no binding release goes through crates.io.
+The binding repositories carry build artifacts, not sources. They receive
+generated bindings, the platform project files and the compiled libraries, and
+they carry the GitHub release. They contain no Rust crate and nothing in them is
+buildable, so no binding release goes through crates.io.
 
-Where the libraries themselves live differs by language, because each
-ecosystem's package manager decides:
+Every repository commits its compiled libraries, so whatever a tag points at
+contains everything that tag delivers. That matters because not every language
+has a second channel: Kotlin's release uploads no assets and nightlies skip
+Maven Central, so a nightly would otherwise deliver nothing at all.
 
-| Language | Native library delivered as |
-|---|---|
-| Swift | xcframework release asset, referenced by `Package.swift` with a sha256 |
-| Dart | per-target release asset, fetched and cached by `hook/build.dart` against `prebuilt_manifest.json` |
-| Kotlin | inside the Maven Central AAR |
-| Go | committed in the module tree, because cgo resolves it from the extracted module zip and Go has no build hooks |
+| Language | Committed at | Also published as |
+|---|---|---|
+| Swift | `CashuDevKitFFI.xcframework.zip` at the root, a local `binaryTarget(path:)` | a release asset |
+| Dart | `prebuilt/<target-triple>/` | per-platform release archives |
+| Kotlin | `cdk-android/src/main/jniLibs/<abi>/` | the Maven Central AAR |
+| Go | `bindings/cdkffi/native/<goos>_<goarch>/` | a release tarball |
 
 ## Architecture
 

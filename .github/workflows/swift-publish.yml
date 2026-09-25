@@ -95,18 +95,17 @@ jobs:
     needs: [validate-release-ref]
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve variables
+      # Fail here rather than deep in the assemble job, which derives the same
+      # value again to stamp the frameworks.
+      - name: Validate the framework bundle version
         run: |
-          RELEASE_VER="${TAG#v}"
-          BUNDLE_SHORT_VERSION="${RELEASE_VER%%[-+]*}"
+          BUNDLE_SHORT_VERSION="${TAG#v}"
+          BUNDLE_SHORT_VERSION="${BUNDLE_SHORT_VERSION%%[-+]*}"
 
           if [[ ! "${BUNDLE_SHORT_VERSION}" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
             echo "::error::Could not derive App Store-safe CFBundleShortVersionString from ${TAG}; got ${BUNDLE_SHORT_VERSION}"
             exit 1
           fi
-
-          echo "RELEASE_VER=${RELEASE_VER}" >> "$GITHUB_ENV"
-          echo "BUNDLE_SHORT_VERSION=${BUNDLE_SHORT_VERSION}" >> "$GITHUB_ENV"
 
       - name: Checkout monorepo
         uses: actions/checkout@v5
@@ -139,17 +138,6 @@ jobs:
           # The binding repo carries artifacts only. Nothing there is built, so
           # the Rust crate and its toolchain pin are removed rather than synced.
           rm -rf cdk-swift/rust cdk-swift/rust-toolchain.toml
-
-      - name: Update versions
-        run: |
-          echo "Setting release version to ${RELEASE_VER}, framework bundle version to ${BUNDLE_SHORT_VERSION}"
-
-          # Stamp framework Info.plist bundle versions for App Store validation.
-          sed -i \
-            -e "s|__CDK_SWIFT_FRAMEWORK_VERSION__|${BUNDLE_SHORT_VERSION}|g" \
-            cdk-swift/resources/Info-iOS.plist \
-            cdk-swift/resources/Info-iOSSimulator.plist \
-            cdk-swift/resources/Info-macOS.plist
 
       - name: Push to cdk-swift release branch
         working-directory: cdk-swift
@@ -384,9 +372,9 @@ jobs:
         working-directory: build/xcframework
         run: |
           zip -r CashuDevKitFFI.xcframework.zip CashuDevKitFFI.xcframework
-          CHECKSUM=$(shasum -a 256 CashuDevKitFFI.xcframework.zip | cut -d' ' -f1)
-          echo "XCFRAMEWORK_CHECKSUM=${CHECKSUM}" >> "$GITHUB_ENV"
-          echo "XCFramework checksum: ${CHECKSUM}"
+          # Logged for verifying a downloaded asset by hand. SPM no longer needs
+          # it: the archive is committed and resolved as a local binary target.
+          echo "XCFramework sha256: $(shasum -a 256 CashuDevKitFFI.xcframework.zip | cut -d' ' -f1)"
 
       - name: Upload XCFramework artifact
         uses: actions/upload-artifact@v7
@@ -430,11 +418,8 @@ jobs:
           name: swift-sources-generated
           path: cdk-swift/Sources/Cdk
 
-      - name: Compute checksum
-        run: |
-          CHECKSUM=$(sha256sum artifacts/CashuDevKitFFI.xcframework.zip | cut -d' ' -f1)
-          echo "XCFRAMEWORK_CHECKSUM=${CHECKSUM}" >> "$GITHUB_ENV"
-          echo "XCFramework checksum: ${CHECKSUM}"
+      - name: Stage the XCFramework in cdk-swift
+        run: cp artifacts/CashuDevKitFFI.xcframework.zip cdk-swift/
 
       - name: Generate Package.swift
         run: |
@@ -451,8 +436,7 @@ jobs:
               targets: [
                   .binaryTarget(
                       name: "CashuDevKitFFI",
-                      url: "https://github.com/${{ vars.CDK_SWIFT_REPO }}/releases/download/${TAG}/CashuDevKitFFI.xcframework.zip",
-                      checksum: "${XCFRAMEWORK_CHECKSUM}"
+                      path: "CashuDevKitFFI.xcframework.zip"
                   ),
                   .target(
                       name: "Cdk",
@@ -470,7 +454,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "release: ${TAG} — add Swift sources and Package.swift"
+          git commit -m "release: ${TAG} - add Swift sources, the XCFramework and Package.swift"
 
       - name: Push release branch
         working-directory: cdk-swift

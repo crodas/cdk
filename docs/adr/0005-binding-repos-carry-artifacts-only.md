@@ -1,4 +1,4 @@
-# Binding repositories carry artifacts only
+# Binding repositories carry build artifacts, not sources
 
 * Status: accepted
 * Authors: CDK Developers
@@ -91,9 +91,8 @@ prebuilt libraries. Nothing in them is buildable.
 
 * Bad, because Dart loses its build-from-source fallback, so prebuilt coverage
   becomes mandatory and a missing target is a hard error.
-* Bad, because Dart consumers now need network access on a project's first build
-  to fetch the library, and build hooks receive a filtered environment so that
-  fetch cannot be routed through a proxy.
+* Bad, because the compiled libraries have to travel some other way, and the
+  repositories carry them instead.
 
 ## Decision Outcome
 
@@ -105,10 +104,18 @@ The pin lives in the checkout. `<lang>-build-native` checks out the release tag
 and runs `cargo build --locked --profile release-ffi -p cdk-ffi-<lang>` against
 the workspace, resolving `cdk-ffi` through the ordinary path dependency.
 
-Dart's prebuilt libraries follow the model Swift already used: per-target release
-assets, verified against a `prebuilt_manifest.json` committed in the package and
-cached under `.dart_tool/`. `prebuilt_dir` and `force_build` user-defines cover
-restricted networks, since environment variables do not reach a build hook.
+Every repository commits its compiled libraries. Dart keeps `prebuilt/<triple>/`,
+Kotlin keeps `cdk-android/src/main/jniLibs/`, Go keeps
+`bindings/cdkffi/native/`, and Swift gains `CashuDevKitFFI.xcframework.zip` at
+its root, resolved by a local `binaryTarget(path:)` rather than a URL and
+checksum.
+
+The alternative, distributing them purely as release assets, was tried and
+rejected. It reads better on repository size but it puts the artifacts outside
+the tagged tree, and one gap proved the point: the Kotlin release uploads no
+assets and skips the Maven publish for nightlies, so gitignoring its libraries
+made a nightly produce nothing at all. Committing keeps the invariant simple:
+whatever a tag points at contains everything that tag delivers.
 
 ### Positive Consequences
 
@@ -116,19 +123,23 @@ restricted networks, since environment variables do not reach a build hook.
   after, or without the crates.io publish.
 * Release binaries and the generated bindings that call them always come from
   one tree.
-* Dart and Kotlin stop committing native libraries, so those repositories stop
-  growing by a full set of binaries per release.
+* Every tag in a binding repository is self-contained. Checking one out gives
+  the libraries, so a nightly works even though it skips Maven Central, and a
+  release cannot half-exist.
 
 ### Negative Consequences
 
-* Dart's prebuilt matrix is now load-bearing. A target or link mode with no asset
-  fails the build rather than falling back to a slow compile.
-* Dart consumers on restricted networks must pre-seed `prebuilt_dir`.
-* Go still commits its libraries, because cgo resolves them from the extracted
-  module zip and Go has no build hooks. That repository keeps growing.
-* History already written is unaffected. Reclaiming it would mean rewriting tags.
+* Every binding repository grows by a full set of binaries per release: roughly
+  157 MB for Dart, 136 MB for Swift before compression, 32 MB for Kotlin. This is
+  the accepted cost of the self-containment above.
+* `dart pub` clones git dependencies with `git clone --mirror`, so a Dart
+  consumer downloads that history in full.
+* Dart's prebuilt matrix is load-bearing. A target or link mode with no committed
+  library now fails the build, because the Rust crate it used to fall back to is
+  no longer synced.
 
 ## Links
 
-* `bindings/README.md` describes the resulting release flow.
+* `bindings/README.md` describes the resulting release flow and where each
+  language's libraries live.
 * `DEVELOPMENT.md` documents the `release-ffi` profile.

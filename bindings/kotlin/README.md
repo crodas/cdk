@@ -105,11 +105,12 @@ The published Android libraries are cross-compiled in the CDK monorepo's
 `.#kotlin-build` Nix devshell under the `release-ffi` profile, against the
 workspace `Cargo.lock`.
 
-The cdk-kotlin repository carries artifacts only: generated Kotlin sources and
-the Gradle projects, no Rust crate. Desktop JVM users build here in the
-monorepo, where the FFI crate and the lockfile live. The Android libraries are
-delivered through Maven Central rather than committed, so a cdk-kotlin checkout
-has no native libraries in it.
+The cdk-kotlin repository carries build artifacts, not sources: generated Kotlin
+sources, the Gradle projects and the Android libraries under
+`cdk-android/src/main/jniLibs/`, but no Rust crate. Desktop JVM users build here
+in the monorepo, where the FFI crate and the lockfile live. The libraries are
+committed as well as published to Maven Central, so a nightly tag, which skips
+the Maven publish, still carries them.
 
 ## CI/CD — Publishing Workflow
 

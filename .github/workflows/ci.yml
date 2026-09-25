@@ -764,14 +764,6 @@ jobs:
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           useDaemon: false
         continue-on-error: true
-      # A manifest here would make the hook fetch released binaries instead of
-      # building the tree under test, turning drift into a false green.
-      - name: No release manifest in the tree
-        run: |
-          if [ -e bindings/dart/prebuilt_manifest.json ]; then
-            echo "::error::bindings/dart/prebuilt_manifest.json is generated at release time and must not be committed"
-            exit 1
-          fi
       - name: Build native library and generate bindings
         run: |
           result=$(nix build -L .#dart-bindings --print-out-paths --no-link)

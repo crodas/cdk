@@ -1,5 +1,4 @@
-# Synced to the cdk-dart binding repo. Prebuilt libraries are release assets
-# fetched by hook/build.dart against prebuilt_manifest.json, never committed.
-prebuilt/
+# Synced to the cdk-dart binding repo. The prebuilt libraries under prebuilt/
+# are committed there; only local build output is ignored.
 .dart_tool/
 pubspec.lock

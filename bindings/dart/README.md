@@ -17,7 +17,6 @@ dependencies:
 ## Requirements
 
 - Dart SDK `^3.10.0`
-- Network access to `github.com` on the first build of a project, to fetch the native library
 
 ## Usage
 
@@ -27,14 +26,11 @@ import 'package:cdk/cdk.dart';
 
 ## Native library
 
-There is no compilation step and no Rust toolchain involved. The build hook
-fetches the native library for your target on the first build of a project,
-verifies it against the sha256 recorded in `prebuilt_manifest.json`, and caches
-it under `.dart_tool/`. Later builds reuse the cache and do no network work.
-
-The library is published as a release asset built from the CDK monorepo at the
-commit this version was tagged from, so the binary and the Dart bindings in this
-package always come from the same tree.
+There is no compilation step, no Rust toolchain and no network access involved.
+The native libraries are committed in this package under
+`prebuilt/<target-triple>/`, and the build hook copies the one matching your
+target. They are built from the CDK monorepo at the commit this version was
+tagged from, so the binary and the Dart bindings always come from one tree.
 
 Supported targets:
 
@@ -47,33 +43,9 @@ Supported targets:
 | iOS | aarch64 |
 
 Each target ships the flavour Dart asks for on that platform: dynamic
-everywhere except iOS, which is statically linked. A request for the other
-flavour fails with the triple and filename it wanted, rather than falling back
-to a long build.
-
-## Offline and restricted networks
-
-Build hooks receive a filtered environment, so `HTTP_PROXY` and friends do not
-reach this one and the download cannot be routed through a proxy. Where egress
-to `github.com` is unavailable, pre-seed the library and point the hook at it
-from the **consuming app's** `pubspec.yaml`:
-
-```yaml
-hooks:
-  user_defines:
-    cdk:
-      prebuilt_dir: third_party/cdk-prebuilt
-```
-
-The directory is laid out `<target-triple>/<library-file>`, matching the release
-asset names, so seeding it is one download per target you build for. Relative
-paths resolve against the pubspec that declares them.
-
-There is no build-from-source option here, because this package ships no Rust
-sources. `force_build: true` exists for the same reason `prebuilt_dir` does, but
-it only has an effect when the package is consumed as a path dependency on a CDK
-monorepo checkout, where `rust/` is present. Anywhere else the hook reports the
-triple and filename it could not find.
+everywhere except iOS, which is statically linked. A target or link mode with no
+committed library fails the build naming what it wanted, because this package
+ships no Rust sources to fall back to.
 
 ## CI/CD — Publishing Workflow
 
