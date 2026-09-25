@@ -17,7 +17,7 @@ dependencies:
 ## Requirements
 
 - Dart SDK `^3.10.0`
-- Rust toolchain (the native library is compiled from source via [native_toolchain_rust](https://pub.dev/packages/native_toolchain_rust))
+- Network access to `github.com` on the first build of a project, to fetch the native library
 
 ## Usage
 
@@ -25,25 +25,55 @@ dependencies:
 import 'package:cdk/cdk.dart';
 ```
 
-## Building
+## Native library
 
-The Rust native library is built automatically when you run `dart pub get` or `dart run`. No manual compilation step is needed.
+There is no compilation step and no Rust toolchain involved. The build hook
+fetches the native library for your target on the first build of a project,
+verifies it against the sha256 recorded in `prebuilt_manifest.json`, and caches
+it under `.dart_tool/`. Later builds reuse the cache and do no network work.
 
-If you're in a Nix environment, OpenSSL paths are detected automatically from `NIX_CFLAGS_COMPILE` and `NIX_LDFLAGS`.
-
-## Pre-built binaries
-
-Pre-built native libraries for all supported platforms are available as [GitHub release assets](https://github.com/cashubtc/cdk-dart/releases).
+The library is published as a release asset built from the CDK monorepo at the
+commit this version was tagged from, so the binary and the Dart bindings in this
+package always come from the same tree.
 
 Supported targets:
 
 | Platform | Architecture |
 |----------|-------------|
 | Linux | x86_64, aarch64 |
-| macOS | aarch64 |
+| macOS | aarch64, x86_64 |
 | Windows | x86_64 |
 | Android | aarch64, armv7, x86_64 |
 | iOS | aarch64 |
+
+Each target ships the flavour Dart asks for on that platform: dynamic
+everywhere except iOS, which is statically linked. A request for the other
+flavour fails with the triple and filename it wanted, rather than falling back
+to a long build.
+
+## Offline and restricted networks
+
+Build hooks receive a filtered environment, so `HTTP_PROXY` and friends do not
+reach this one and the download cannot be routed through a proxy. Where egress
+to `github.com` is unavailable, pre-seed the library and point the hook at it
+from the **consuming app's** `pubspec.yaml`:
+
+```yaml
+hooks:
+  user_defines:
+    cdk:
+      prebuilt_dir: third_party/cdk-prebuilt
+```
+
+The directory is laid out `<target-triple>/<library-file>`, matching the release
+asset names, so seeding it is one download per target you build for. Relative
+paths resolve against the pubspec that declares them.
+
+There is no build-from-source option here, because this package ships no Rust
+sources. `force_build: true` exists for the same reason `prebuilt_dir` does, but
+it only has an effect when the package is consumed as a path dependency on a CDK
+monorepo checkout, where `rust/` is present. Anywhere else the hook reports the
+triple and filename it could not find.
 
 ## CI/CD — Publishing Workflow
 

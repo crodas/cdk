@@ -16,6 +16,28 @@ bindings. This keeps bindings as first-class citizens alongside the Rust core:
 they evolve together, are tested together, and breakage is caught before it
 reaches downstream consumers.
 
+That extends to the released artifacts. The four wrapper crates are workspace
+members, so every native library and every generated binding is compiled from
+this checkout with `cargo --locked` against the root `Cargo.lock` and the
+`release-ffi` profile. There is no dependency pin anywhere in that build: the
+release tag decides which tree is compiled, and it is chosen before the build
+starts.
+
+The binding repositories carry artifacts only. They receive generated sources,
+the platform project files and the prebuilt libraries, and they carry the
+GitHub release. They contain no Rust crate and nothing in them is buildable, so
+no binding release goes through crates.io.
+
+Where the libraries themselves live differs by language, because each
+ecosystem's package manager decides:
+
+| Language | Native library delivered as |
+|---|---|
+| Swift | xcframework release asset, referenced by `Package.swift` with a sha256 |
+| Dart | per-target release asset, fetched and cached by `hook/build.dart` against `prebuilt_manifest.json` |
+| Kotlin | inside the Maven Central AAR |
+| Go | committed in the module tree, because cgo resolves it from the extracted module zip and Go has no build hooks |
+
 ## Architecture
 
 The bindings follow a two-tier architecture:
@@ -120,7 +142,10 @@ This runs the **FFI - Publish All Bindings** GitHub Actions workflow
 - Creates the corresponding releases in the separate binding repositories
 
 The `release` just recipe calls `ffi-release-all` automatically after publishing
-Rust crates.
+Rust crates, but the two are independent. Binding builds compile `cdk-ffi` from
+this repository at the release commit, so `ffi-release-all` needs only the tag
+and green CI on it. It can run before, after, or without the crates.io publish,
+and it can be re-run on its own if a language fails.
 
 All `ffi-release-*` recipes dispatch with `--ref v<VERSION>`, so GitHub loads
 the workflow definitions from the release tag. The unified workflow's relative
@@ -156,7 +181,8 @@ repository:
 
 Nightly tags include the UTC date and short source commit, for example
 `v0.18.0-nightly.20260801.g1a2b3c4`. The release notes link the full CDK source
-commit, and the generated Rust wrapper pins `cdk-ffi` to that exact commit.
+commit. Stable and nightly builds follow the same path, so a nightly is a real
+rehearsal of a release.
 
 The workflow checks each binding repository independently and skips a language
 when that CDK commit already has a nightly release. This also allows a later run

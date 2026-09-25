@@ -1,0 +1,7 @@
+# Synced to the cdk-kotlin binding repo, which carries artifacts only. The
+# Android libraries are delivered through Maven Central, so they are staged on
+# disk for the Gradle publish and never committed.
+cdk-android/src/main/jniLibs/
+build/
+.gradle/
+local.properties

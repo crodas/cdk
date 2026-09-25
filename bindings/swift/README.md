@@ -93,7 +93,9 @@ just test-swift
 
 The `swift-publish.yml` workflow (in the CDK monorepo) builds the XCFramework,
 generates Swift sources, syncs everything to `cdk-swift`, and creates a tagged
-release. The following secrets and variables must be configured in the **CDK
+release. Every Apple slice is compiled from the monorepo checkout against its
+`Cargo.lock`, so the framework never depends on a crates.io release of
+`cdk-ffi`. The following secrets and variables must be configured in the **CDK
 monorepo** repository settings (Settings > Secrets and variables > Actions).
 
 ### Secrets

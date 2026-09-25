@@ -45,6 +45,11 @@ libcdk_ffi*
 cdk_ffi.py
 pubspec.lock
 
+# Dart prebuilt manifest is generated at release time. If one landed here the
+# binding tests would fetch released binaries instead of building the tree they
+# are meant to be testing.
+bindings/dart/prebuilt_manifest.json
+
 # Kotlin bindings
 .gradle/
 !gradle/wrapper/gradle-wrapper.jar
