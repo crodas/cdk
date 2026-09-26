@@ -137,6 +137,9 @@ jobs:
     name: "go: Build ${{ matrix.target }}"
     needs: [validate-release-ref]
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -175,7 +178,6 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build cdk-ffi-go
-        shell: bash
         run: |
           cargo build --locked --profile release-ffi --package cdk-ffi-go \
             --target ${{ matrix.target }}
@@ -212,18 +214,16 @@ jobs:
           path: generated-bindings/
           if-no-files-found: error
 
-      - name: Strip debug symbols
-        shell: bash
+      - name: Strip debug symbols (MSVC keeps them in a separate .pdb)
+        if: "!contains(matrix.target, 'windows')"
         run: |
           FILE="target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}"
           case "${{ matrix.target }}" in
-            *windows*)  strip --strip-all "$FILE" ;;
             *apple*)    strip -S "$FILE" ;;
             *)          strip --strip-all "$FILE" ;;
           esac
 
       - name: Prepare artifact
-        shell: bash
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}" \

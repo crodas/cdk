@@ -165,6 +165,9 @@ jobs:
     name: "dart: Build ${{ matrix.target }}"
     needs: [validate-release-ref]
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -234,12 +237,11 @@ jobs:
           cross build --locked --profile release-ffi -p cdk-ffi-dart \
             --target ${{ matrix.target }}
 
-      - name: Strip debug symbols
-        shell: bash
+      - name: Strip debug symbols (MSVC keeps them in a separate .pdb)
+        if: "!contains(matrix.target, 'windows')"
         run: |
           FILE="target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}"
           case "${{ matrix.target }}" in
-            *windows*)  strip --strip-all "$FILE" ;;
             *apple*)    strip -S "$FILE" ;;
             *android*)  "$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-all "$FILE" ;;
             *)          strip --strip-all "$FILE" ;;
@@ -263,7 +265,6 @@ jobs:
           if-no-files-found: error
 
       - name: Prepare artifact
-        shell: bash
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}" \
