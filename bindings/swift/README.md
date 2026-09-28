@@ -83,7 +83,33 @@ Supported platforms:
 | iOS Simulator | arm64, x86_64 |
 | macOS | arm64, x86_64 |
 
+## Building from source
+
+The Rust library and the Swift sources come from the
+[CDK monorepo](https://github.com/cashubtc/cdk). This repository carries release
+artifacts only, so there is no Rust crate here to build. The shipped
+`CashuDevKitFFI.xcframework.zip` is assembled by the release workflow; a local
+build produces a dylib and a throwaway SPM package for testing.
+
+```bash
+git clone https://github.com/cashubtc/cdk
+cd cdk
+just binding-swift
+```
+
+Unlike the other bindings, this one needs no nix: only a Rust toolchain
+(`rustup`, which picks up the pinned version from `rust-toolchain.toml`), Xcode
+and [just](https://github.com/casey/just). It builds
+`target/release/libcdk_ffi.dylib` and writes a local SPM package, `Sources/` and
+`Package.swift`, at the monorepo root. Both are gitignored.
+
+The local recipe generates from the `cdk-ffi` crate and links the dylib directly,
+while the release builds `cdk-ffi-swift` and ships an XCFramework binary target,
+so a local build does not exercise the packaging the released package uses.
+
 ## Testing
+
+From the monorepo root, after `just binding-swift`:
 
 ```bash
 just test-swift

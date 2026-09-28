@@ -108,24 +108,30 @@ wrapper crate and the appropriate build tooling.
 
 ## Building and testing
 
-Prerequisites: Rust toolchain, and the target language SDK.
+Every binding builds from a clone of this monorepo; the publishing repositories
+carry artifacts only. Each language has one recipe that generates the bindings
+and builds the native library, and one that tests them.
 
 ```bash
 # Dart
-just binding-dart    # Generate bindings
-just test-dart       # Run tests
-
-# Swift (macOS only — build runs in CI via swift-publish workflow)
-just test-swift      # Run tests
-
-# Kotlin
-just binding-kotlin  # Generate bindings
-just test-kotlin     # Run tests
+just binding-dart    && just test-dart
 
 # Go
-just binding-go      # Generate bindings
-just test-go         # Run tests
+just binding-go      && just test-go
+
+# Kotlin
+just binding-kotlin  && just test-kotlin
+
+# Swift (macOS only)
+just binding-swift   && just test-swift
 ```
+
+Prerequisites: `just`, plus [nix](https://nixos.org/download) with flakes enabled
+for Dart, Go and Kotlin, whose `binding-*` recipes wrap
+`nix build .#<lang>-bindings` and get their Rust toolchain from nix. Swift is the
+exception: `binding-swift` is plain cargo and needs a rustup toolchain and Xcode
+instead. The test recipes additionally need that language's SDK on PATH, which
+`nix develop .#bindings` provides for Dart, Go and Kotlin.
 
 ## Releasing
 

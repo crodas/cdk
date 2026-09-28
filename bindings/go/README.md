@@ -47,17 +47,26 @@ CGO link flags are automatically selected per platform via build tags. No manual
 - Go 1.22+
 - `CGO_ENABLED=1`
 
-## Building from Source
+## Building from source
 
-Requires Rust and the [just](https://github.com/casey/just) command runner.
+The native library and the generated Go package are built in the
+[CDK monorepo](https://github.com/cashubtc/cdk). This repository carries release
+artifacts only, so there is no Rust crate here to build.
 
 ```bash
-# Generate Go bindings and build native library
+git clone https://github.com/cashubtc/cdk
+cd cdk
 just binding-go
-
-# Run tests
-just test-go
 ```
+
+`just binding-go` runs `nix build .#go-bindings`, writing the generated package
+to `target/bindings/go/` and the library to
+`target/release/libcdk_ffi_go.{so,dylib}`. It needs
+[nix](https://nixos.org/download) with flakes enabled and
+[just](https://github.com/casey/just). Nix supplies the Rust toolchain pinned in
+`rust-toolchain.toml`, so a separate rustup install is not required.
+
+Run the tests from the monorepo root with `just test-go`.
 
 ## CI/CD — Publishing Workflow
 

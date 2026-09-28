@@ -1288,6 +1288,9 @@ test-kotlin:
   cd "{{justfile_directory()}}/bindings/kotlin"
   ./gradlew -PcdkJvmOnly=true :cdk-jvm:test
 
+# Generate Swift bindings and the local SPM package
+binding-swift *ARGS="--release":
+  just ffi-generate-swift {{ARGS}}
 
 # Run Swift binding tests
 test-swift:
