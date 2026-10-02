@@ -505,6 +505,16 @@ pub struct MockMintConnector {
     pub check_state_response: Mutex<Option<Result<CheckStateResponse, Error>>>,
     /// Response for post_restore calls
     pub restore_response: Mutex<Option<Result<RestoreResponse, Error>>>,
+    /// Response for get_filters_info calls.
+    ///
+    /// Defaults to `FilterNotAvailable` when unset, matching a mint that does
+    /// not advertise filters.
+    pub filters_info_response: Mutex<Option<Result<crate::nuts::GetFiltersInfoResponse, Error>>>,
+    /// Responses for get_filters calls, staged per page.
+    pub filters_responses:
+        Mutex<std::collections::HashMap<u64, Result<crate::nuts::GetFiltersResponse, Error>>>,
+    /// Response for get_filters_pending calls.
+    pub filters_pending_response: Mutex<Option<Result<crate::nuts::PendingFilterResponse, Error>>>,
     /// Response for get_melt_quote_status calls
     pub melt_quote_status_response: Mutex<Option<Result<MeltQuoteBolt11Response<String>, Error>>>,
     /// Queue of responses for successive get_melt_quote_status calls.
@@ -584,6 +594,9 @@ impl MockMintConnector {
             mint_info: Mutex::new(mint_info),
             check_state_response: Mutex::new(None),
             restore_response: Mutex::new(None),
+            filters_info_response: Mutex::new(None),
+            filters_responses: Mutex::new(std::collections::HashMap::new()),
+            filters_pending_response: Mutex::new(None),
             melt_quote_status_response: Mutex::new(None),
             melt_quote_status_responses: Mutex::new(std::collections::VecDeque::new()),
             post_mint_response: Mutex::new(None),
@@ -614,6 +627,26 @@ impl MockMintConnector {
 
     pub fn set_check_state_response(&self, response: Result<CheckStateResponse, Error>) {
         *self.check_state_response.lock().unwrap() = Some(response);
+    }
+
+    /// Stage the response for the next get_filters_info call.
+    pub fn set_filters_info_response(
+        &self,
+        response: Result<crate::nuts::GetFiltersInfoResponse, Error>,
+    ) {
+        *self.filters_info_response.lock().unwrap() = Some(response);
+    }
+
+    /// Stage the response for the next get_filters call to `page`.
+    pub fn set_filters_response(
+        &self,
+        page: u64,
+        response: Result<crate::nuts::GetFiltersResponse, Error>,
+    ) {
+        self.filters_responses
+            .lock()
+            .unwrap()
+            .insert(page, response);
     }
 
     pub fn set_mint_keys_response(&self, response: Result<Vec<KeySet>, Error>) {
@@ -1059,15 +1092,27 @@ impl MintConnector for MockMintConnector {
     }
 
     async fn get_filters_info(&self) -> Result<crate::nuts::GetFiltersInfoResponse, Error> {
-        Err(Error::FilterNotAvailable)
+        self.filters_info_response
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or(Err(Error::FilterNotAvailable))
     }
 
-    async fn get_filters(&self, _page: u64) -> Result<crate::nuts::GetFiltersResponse, Error> {
-        Err(Error::FilterNotAvailable)
+    async fn get_filters(&self, page: u64) -> Result<crate::nuts::GetFiltersResponse, Error> {
+        self.filters_responses
+            .lock()
+            .unwrap()
+            .remove(&page)
+            .unwrap_or(Err(Error::FilterNotAvailable))
     }
 
     async fn get_filters_pending(&self) -> Result<crate::nuts::PendingFilterResponse, Error> {
-        Err(Error::FilterNotAvailable)
+        self.filters_pending_response
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or(Err(Error::FilterNotAvailable))
     }
 
     async fn get_auth_wallet(&self) -> Option<crate::wallet::AuthWallet> {

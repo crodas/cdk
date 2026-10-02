@@ -408,3 +408,6 @@ impl Wallet {
         Ok(matches)
     }
 }
+
+#[cfg(test)]
+mod tests;
