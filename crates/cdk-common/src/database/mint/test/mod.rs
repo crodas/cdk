@@ -19,12 +19,14 @@ mod mint;
 mod proofs;
 mod saga;
 mod signatures;
+mod state_filters;
 
 pub use self::keys::*;
 pub use self::mint::*;
 pub use self::proofs::*;
 pub use self::saga::*;
 pub use self::signatures::*;
+pub use self::state_filters::*;
 
 /// Generate standard keyset amounts as powers of 2
 #[inline]
@@ -428,6 +430,15 @@ macro_rules! mint_db_test {
             get_mint_quotes_by_ids,
             get_melt_quotes_by_request_lookup_id,
             lock_melt_quote_and_related,
+            set_state_filter_config_is_write_once,
+            get_state_filter_config_when_unset,
+            take_filter_elements_is_destructive,
+            take_filter_elements_is_scoped_to_its_epoch,
+            add_filter_is_immutable_once_built,
+            get_filters_first_epoch_is_inclusive,
+            get_filters_respects_limit_and_order,
+            latest_built_epoch_tracks_the_maximum,
+            get_filter_elements_does_not_remove_them,
         );
     };
     ($make_db_fn:ident, $($name:ident),+ $(,)?) => {
